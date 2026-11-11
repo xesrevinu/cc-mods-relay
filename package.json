@@ -1,0 +1,25 @@
+{
+  "name": "cc-mods-relay",
+  "version": "0.1.4",
+  "private": true,
+  "description": "Claude Code on an SSH host, with workspace tools executing on this machine.",
+  "bin": {
+    "cc-mods-relay": "dist/cc-mods-relay"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bun check src/index.ts",
+    "compile": "bun scripts/compile.ts",
+    "build:darwin-arm64": "bun build src/index.ts --compile --format esm --bytecode --minify --target=bun-darwin-arm64 --outfile dist/cc-mods-relay-darwin-arm64"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.4.0",
+    "@anthropic-ai/claude-agent-sdk": "0.3.319",
+    "@anthropic-ai/sdk": "1.6.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}

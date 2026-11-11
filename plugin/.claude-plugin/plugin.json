@@ -1,0 +1,5 @@
+{
+  "name": "studio-ws-executor",
+  "version": "0.1.0",
+  "description": "Run workspace file/shell tools (Read/Write/Edit/Glob/Grep/NotebookEdit/Bash/PowerShell) on the ACP client over WebSocket"
+}

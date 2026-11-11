@@ -1,0 +1,11 @@
+__pycache__/
+plugin/.claude-plugin/types/
+plugin/tsconfig.json
+
+
+.DS_Store
+.zed/
+node_modules
+dist
+scripts/e2e-live-tools.ts
+scripts/e2e-orient.ts
