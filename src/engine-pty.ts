@@ -106,7 +106,7 @@ export function buildClaudeCmd(
   appendSystemPromptFile?: string,
   extraFlags?: CcModsRelayFlags,
 ): string {
-  let cmd = `claude --session-id ${sessionId}`;
+  let cmd = `exec claude --session-id ${sessionId}`;
   if (permissionMode && permissionMode !== "default") cmd += ` --permission-mode ${permissionMode}`;
   if (effortLevel && effortLevel !== "default") cmd += ` --effort ${effortLevel}`;
   if (agent && agent !== "default" && isSafeAgentRef(agent)) cmd += ` --agent "${agent}"`;

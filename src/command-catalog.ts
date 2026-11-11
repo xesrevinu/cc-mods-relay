@@ -3,17 +3,21 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AvailableCommand } from "@agentclientprotocol/sdk/unstable";
 
+function cmd(name: string, description: string, hint?: string): AvailableCommand {
+  return hint ? { name, description, input: { hint } } : { name, description };
+}
+
+/**
+ * Slash commands we advertise. They are answered by the ACP agent (config
+ * options, usage_update, session snapshot) — not by waiting on a TUI turn.
+ * Project `.claude/commands` and skills are discovered separately.
+ */
 export const BUILTIN_COMMANDS: readonly AvailableCommand[] = [
-  { name: "clear", description: "Clear the conversation history and free up context" },
-  { name: "compact", description: "Summarize and compact the current conversation" },
-  { name: "config", description: "Open the settings / configuration panel" },
-  { name: "cost", description: "Show token usage and cost for the current session" },
-  { name: "help", description: "List available slash commands and usage help" },
-  { name: "init", description: "Initialize a CLAUDE.md with codebase documentation" },
-  { name: "memory", description: "Edit the project or user memory (CLAUDE.md) files" },
-  { name: "model", description: "Switch the active model for the session" },
-  { name: "resume", description: "Resume a previous conversation" },
-  { name: "review", description: "Review a pull request or the pending changes" },
+  cmd("context", "Show what is filling the current session context", "all"),
+  cmd("effort", "Set thinking intensity for this session", "low|medium|high|xhigh|max|auto"),
+  cmd("fast", "Toggle faster Opus output", "on|off"),
+  cmd("model", "Switch the model for this session", "model"),
+  cmd("usage", "Show token usage and cost for this session"),
 ];
 
 export interface DiscoverCommandsDeps {
@@ -218,8 +222,8 @@ export function discoverCommands(cwd: string, deps: DiscoverCommandsDeps = {}): 
     foldSource({ kind: "skills", dir: join(marketplacesDir, m, "skills") });
   }
 
-  for (const cmd of builtins) {
-    if (isSafeCommandName(cmd.name) && !byName.has(cmd.name)) byName.set(cmd.name, cmd);
+  for (const item of builtins) {
+    if (isSafeCommandName(item.name) && !byName.has(item.name)) byName.set(item.name, item);
   }
 
   return sortByName([...byName.values()]);

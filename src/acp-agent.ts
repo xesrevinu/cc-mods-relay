@@ -115,7 +115,15 @@ import type { SubagentWatcher } from "./subagent-watcher.js";
 import { classifyDiffSource, diffToolCallUpdate } from "./diff-source.js";
 import { guardEvent } from "./billing/entrypoint-guard.js";
 import type { WatchedMessage } from "./billing/entrypoint-guard.js";
-import { usageUpdatesFor, type UsageCarrier } from "./usage.js";
+import {
+  addUsage,
+  contextTokensUsed,
+  EMPTY_USAGE,
+  usageUpdatesFor,
+  type AccumulatedUsage,
+  type UsageCarrier,
+} from "./usage.js";
+import { dispatchSlash, isAdvertisedSlash, parseSlashPrompt, type SlashSessionView } from "./slash.js";
 import { createTurnResolver } from "./end-of-turn.js";
 import type { DetectorSchedule, EndOfTurnDetector } from "./end-of-turn.js";
 import { parseCcModsRelayMeta, sendPrompt, type CcModsRelayFlags } from "./engine-pty.js";
@@ -129,6 +137,7 @@ import {
   MODEL_ID_CONTEXT_WINDOWS,
   modelSelectorDescription,
   DEFAULT_MODEL_INFO,
+  REASONING_EFFORT_LEVELS,
   resolveCatalogValueFromModelId,
   isFastModeCapableModel,
   classifyFastModeSignal,
@@ -196,13 +205,6 @@ export interface Logger {
   error: (...args: any[]) => void;
 }
 
-type AccumulatedUsage = {
-  inputTokens: number;
-  outputTokens: number;
-  cachedReadTokens: number;
-  cachedWriteTokens: number;
-};
-
 export const DEFAULT_CONTEXT_WINDOW = 200000;
 
 type Session = {
@@ -218,6 +220,8 @@ type Session = {
   engine?: SessionEngine;
   cancelled: boolean;
   cwd: string;
+  /** Working directory the ACP client passed to session/new (may differ from TUI cwd). */
+  clientCwd: string;
   additionalDirectories?: string[];
   mcpConfigFile?: string;
   mcpServers?: NewSessionRequest["mcpServers"];
@@ -229,6 +233,8 @@ type Session = {
   sessionFingerprint: string;
   settingsManager: SettingsManager;
   accumulatedUsage: AccumulatedUsage;
+  lastContextUsed: number;
+  lastCostUsd?: number;
   modes: SessionModeState;
   modelInfos: ModelInfo[];
   allowBypass?: boolean;
@@ -274,6 +280,10 @@ export interface StartEngineArgs {
   sessionId?: string;
   cwd: string;
   resume?: boolean;
+  /** Source session to `--resume` when `fork` is set. */
+  resumeFrom?: string;
+  /** Spawn `claude --resume SOURCE --fork-session --session-id NEW`. */
+  fork?: boolean;
   baseEnv?: Record<string, string | undefined>;
   sessions?: Map<string, SessionEngine>;
   onEvent?: (sessionId: string) => void;
@@ -354,6 +364,13 @@ const REPLAY_ONLY_NOOP_PTY = {
   kill() {},
 } as unknown as EngineTerminal;
 
+export type StoredSessionInfo = {
+  sessionId: string;
+  cwd?: string;
+  summary?: string;
+  lastModified: number;
+};
+
 export interface AgentDeps {
   startEngine?: StartEngine;
   getMessages?: GetMessages;
@@ -374,6 +391,8 @@ export interface AgentDeps {
     sessionId: string,
     options?: { dir?: string },
   ) => Promise<{ summary: string; lastModified?: number } | undefined>;
+  listStoredSessions?: (opts: { dir?: string }) => Promise<StoredSessionInfo[]>;
+  deleteStoredSession?: (sessionId: string) => Promise<void>;
   fastModeProbe?: FastModeProbe;
   modelCatalogSource?: SupportedModelsSource;
 }
@@ -391,6 +410,57 @@ export async function defaultStartEngine(args: StartEngineArgs): Promise<Started
       engine: undefined,
       cwd,
       transcriptPath,
+    };
+  }
+
+  if (args.fork && args.resumeFrom && args.sessionId) {
+    const handle = spawnResumePty({
+      sessionId: args.resumeFrom,
+      forkedSessionId: args.sessionId,
+      cwd: args.cwd,
+      baseEnv: args.baseEnv,
+      spawn: args.spawn,
+      permissionMode: args.permissionMode,
+      effortLevel: args.effortLevel,
+      agent: args.agent,
+      additionalDirectories: args.additionalDirectories,
+      mcpConfigFile: args.mcpConfigFile,
+      disallowedTools: args.disallowedTools,
+      appendSystemPromptFile: args.appendSystemPromptFile,
+      extraFlags: args.extraFlags,
+    });
+    const engine = new SessionEngine({ handle, watcher: undefined, sessions: args.sessions });
+    const ac = new AbortController();
+    engine.setPendingDiscovery(ac);
+    void (async () => {
+      try {
+        const { transcriptPath, cwd } = await resolveWatchTarget(args.sessionId!, {
+          watchdogMs: Infinity,
+          ...args.locateOptions,
+          signal: ac.signal,
+        });
+        const watcher = createJsonlWatcher({
+          sessionId: args.sessionId!,
+          transcriptPath,
+          dir: cwd ?? args.cwd,
+          onEvent: () => args.onEvent?.(args.sessionId!),
+        });
+        engine.watcher = watcher;
+        args.onEvent?.(args.sessionId!);
+      } catch (err) {
+        if ((err as { name?: string } | undefined)?.name === "AbortError") return;
+        console.error(
+          `[acp-agent] fork-session transcript discovery failed for ${args.sessionId}:`,
+          err,
+        );
+      }
+    })();
+    return {
+      sessionId: args.sessionId,
+      pty: handle.pty,
+      watcher: undefined,
+      engine,
+      cwd: args.cwd,
     };
   }
 
@@ -654,17 +724,19 @@ export function sessionAllowsBypass(permissions: Settings["permissions"] | undef
   return ALLOW_BYPASS && permissions?.disableBypassPermissionsMode !== "disable";
 }
 
-const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+const LOCAL_ONLY_COMMANDS = new Set(["/heapdump", "/extra-usage"]);
 
 const REPLAY_HIDDEN_COMMANDS = new Set([
   ...LOCAL_ONLY_COMMANDS,
   "/compact",
   "/model",
   "/status",
-  "/usage",
   "/effort",
   "/fast",
 ]);
+
+/** Local TUI commands whose stdout is useful in an ACP client. */
+const ACP_STATUS_COMMANDS = new Set(["/usage", "/context"]);
 
 const LOCAL_COMMAND_MARKERS = [
   "command-name",
@@ -714,19 +786,37 @@ function hasMarkerTag(text: string, tag: string): boolean {
   return markerTagText(text, tag) !== undefined;
 }
 
+function commandNameFromMarkers(text: string): string | undefined {
+  const commandName = markerTagText(text, "command-name")?.trim();
+  if (!commandName?.startsWith("/")) return undefined;
+  return commandName.split(" ", 1)[0];
+}
+
+function statusCommandOutputText(text: string): string | null {
+  const commandName = commandNameFromMarkers(text);
+  if (!commandName || !ACP_STATUS_COMMANDS.has(commandName)) return null;
+  const stdout = markerTagText(text, "local-command-stdout") ?? "";
+  const stderr = markerTagText(text, "local-command-stderr") ?? "";
+  const body = [stdout, stderr].filter((part) => part.trim()).join("\n");
+  return body.trim() ? body : null;
+}
+
 function commandInvocationFromMarkerOnlyText(text: string): string | null {
   if (hasMarkerTag(text, "local-command-stdout") || hasMarkerTag(text, "local-command-stderr")) {
     return null;
   }
-  const commandName = markerTagText(text, "command-name")?.trim();
-  if (!commandName?.startsWith("/")) return null;
-  if (REPLAY_HIDDEN_COMMANDS.has(commandName.split(" ", 1)[0])) return null;
+  const commandName = commandNameFromMarkers(text);
+  if (!commandName) return null;
+  if (REPLAY_HIDDEN_COMMANDS.has(commandName)) return null;
 
+  const rawName = markerTagText(text, "command-name")?.trim() ?? commandName;
   const commandArgs = markerTagText(text, "command-args")?.trim();
-  return commandArgs ? `${commandName} ${commandArgs}` : commandName;
+  return commandArgs ? `${rawName} ${commandArgs}` : rawName;
 }
 
 function stripLocalCommandMetadataText(text: string): string | null {
+  const status = statusCommandOutputText(text);
+  if (status !== null) return status;
   const stripped = stripMarkerTags(text);
   if (stripped.trim() !== "") return stripped;
   return commandInvocationFromMarkerOnlyText(text);
@@ -757,6 +847,26 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
   }
   if (kept.length === 0) return null;
   return kept;
+}
+
+export function statusCommandOutput(content: unknown): string | null {
+  if (typeof content === "string") return statusCommandOutputText(content);
+  if (!Array.isArray(content)) return null;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      "type" in block &&
+      (block as { type: unknown }).type === "text" &&
+      "text" in block &&
+      typeof (block as { text: unknown }).text === "string"
+    ) {
+      const status = statusCommandOutputText((block as { text: string }).text);
+      if (status) parts.push(status);
+    }
+  }
+  return parts.length ? parts.join("\n") : null;
 }
 
 export function isLocalCommandMetadata(content: unknown): boolean {
@@ -968,6 +1078,8 @@ export class ClaudeAcpAgent {
     sessionId: string,
     options?: { dir?: string },
   ) => Promise<{ summary: string; lastModified?: number } | undefined>;
+  private readonly listStoredSessions: (opts: { dir?: string }) => Promise<StoredSessionInfo[]>;
+  private readonly deleteStoredSession: (sessionId: string) => Promise<void>;
   private readonly fastModeProbe: FastModeProbe;
   private readonly modelCatalogSource: SupportedModelsSource | undefined;
   private readonly engines: Map<string, SessionEngine> = new Map();
@@ -1015,6 +1127,9 @@ export class ClaudeAcpAgent {
     this.discoverAgents = deps.discoverAgents ?? discoverAgents;
     this.discoverCommands = deps.discoverCommands ?? discoverCommands;
     this.getSessionInfo = deps.getSessionInfo ?? getSessionInfo;
+    this.listStoredSessions = deps.listStoredSessions ?? ((opts) => listSessions(opts));
+    this.deleteStoredSession =
+      deps.deleteStoredSession ?? ((sessionId) => deleteSessionIfStored(sessionId, deleteSession));
     this.unsubMod = onModEvent((event) => {
       void this.handleModEvent(event).catch((error) => this.logger.error("[mod-live]", error));
     });
@@ -1179,11 +1294,16 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    const source = this.sessions[params.sessionId];
+    const cwd = params.cwd || source?.cwd;
+    if (!cwd) {
+      throw RequestError.resourceNotFound(params.sessionId);
+    }
     const response = await this.createSession(
       {
-        cwd: params.cwd,
-        mcpServers: params.mcpServers ?? [],
-        additionalDirectories: params.additionalDirectories,
+        cwd,
+        mcpServers: params.mcpServers ?? source?.mcpServers ?? [],
+        additionalDirectories: params.additionalDirectories ?? source?.additionalDirectories,
         _meta: params._meta,
       },
       {
@@ -1219,20 +1339,46 @@ export class ClaudeAcpAgent {
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
-    const sdk_sessions = await listSessions({ dir: params.cwd ?? undefined });
-    const sessions = [];
+    const cwdFilter = params.cwd ?? undefined;
+    const byId = new Map<string, ListSessionsResponse["sessions"][number]>();
 
-    for (const session of sdk_sessions) {
-      if (!session.cwd) continue;
-      sessions.push({
-        sessionId: session.sessionId,
-        cwd: session.cwd,
-        title: sanitizeTitle(session.summary),
-        updatedAt: new Date(session.lastModified).toISOString(),
+    for (const [sessionId, session] of Object.entries(this.sessions)) {
+      if (cwdFilter && session.clientCwd !== cwdFilter && session.cwd !== cwdFilter) continue;
+      byId.set(sessionId, {
+        sessionId,
+        cwd: session.clientCwd || session.cwd,
+        ...(session.additionalDirectories && session.additionalDirectories.length > 0
+          ? { additionalDirectories: session.additionalDirectories }
+          : {}),
+        ...(session.lastEmittedTitle ? { title: session.lastEmittedTitle } : {}),
+        updatedAt: new Date().toISOString(),
       });
     }
+
+    try {
+      const stored = await this.listStoredSessions({ dir: cwdFilter });
+      for (const session of stored) {
+        if (!session.cwd) continue;
+        if (cwdFilter && session.cwd !== cwdFilter) continue;
+        const existing = byId.get(session.sessionId);
+        const title = session.summary ? sanitizeTitle(session.summary) : undefined;
+        if (existing) {
+          if (!existing.title && title) existing.title = title;
+          continue;
+        }
+        byId.set(session.sessionId, {
+          sessionId: session.sessionId,
+          cwd: session.cwd,
+          ...(title ? { title } : {}),
+          updatedAt: new Date(session.lastModified).toISOString(),
+        });
+      }
+    } catch (err) {
+      this.logger.error("[acp-agent] listSessions stored lookup failed:", err);
+    }
+
     return {
-      sessions,
+      sessions: [...byId.values()],
     };
   }
 
@@ -1266,6 +1412,15 @@ export class ClaudeAcpAgent {
     const turnTempImagePaths: string[] = [];
     sessionRecord.turnTempImagePaths = turnTempImagePaths;
     const payload = promptToClaude(params, this.logger, turnTempImagePaths);
+    const slash = parseSlashPrompt(payload);
+    if (slash && isAdvertisedSlash(slash.name)) {
+      try {
+        return await this.replyToSlash(params.sessionId, sessionRecord, slash.name, slash.args);
+      } finally {
+        cleanupMaterializedImages(sessionRecord.turnTempImagePaths);
+        sessionRecord.turnTempImagePaths = undefined;
+      }
+    }
 
     const outgoing = payload;
 
@@ -1301,6 +1456,85 @@ export class ClaudeAcpAgent {
       sessionRecord.subagentWatcher = undefined;
       this.flushPendingControlInjections(params.sessionId, sessionRecord);
     }
+  }
+
+  private slashView(session: Session): SlashSessionView {
+    const modelOpt = session.configOptions.find((o) => o.id === "model");
+    const effortOpt = session.configOptions.find((o) => o.id === "effort");
+    const models =
+      modelOpt && "options" in modelOpt && Array.isArray(modelOpt.options)
+        ? modelOpt.options.flatMap((group) =>
+            "options" in group ? group.options.map((o) => o.value) : [group.value],
+          )
+        : [];
+    const effortLevels =
+      effortOpt && "options" in effortOpt && Array.isArray(effortOpt.options)
+        ? effortOpt.options.flatMap((group) =>
+            "options" in group ? group.options.map((o) => o.value) : [group.value],
+          )
+        : [];
+    return {
+      cwd: session.cwd,
+      model: this.currentModel(session),
+      mode: session.modes.currentModeId,
+      effort: this.currentEffort(session) ?? "default",
+      fast: session.fastModeOn ?? false,
+      models,
+      effortLevels,
+      contextUsed: session.lastContextUsed,
+      contextSize: session.contextWindowSize,
+      usage: session.accumulatedUsage,
+      costUsd: session.lastCostUsd,
+    };
+  }
+
+  private async replyToSlash(
+    sessionId: string,
+    session: Session,
+    name: string,
+    args: string,
+  ): Promise<PromptResponse> {
+    const result = dispatchSlash(name, args, this.slashView(session));
+    if (result.kind === "config") {
+      try {
+        await this.setSessionConfigOption({
+          sessionId,
+          configId: result.configId,
+          value: result.value,
+        });
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text },
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+    }
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: result.text },
+      },
+    });
+    if (name === "usage" || name === "context") {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          used: session.lastContextUsed,
+          size: session.contextWindowSize,
+          ...(typeof session.lastCostUsd === "number"
+            ? { cost: { amount: session.lastCostUsd, currency: "USD" } }
+            : {}),
+        },
+      });
+    }
+    return { stopReason: "end_turn" };
   }
 
   private async emitSessionTitleUpdate(sessionId: string): Promise<void> {
@@ -1360,9 +1594,12 @@ export class ClaudeAcpAgent {
     session.subagentWatcher = undefined;
     session.settingsManager.dispose();
     if (session.engine) {
-      session.engine.cleanup();
       session.engine.kill();
     } else {
+      try {
+        session.pty.kill();
+      } catch {
+      }
       session.watcher?.stop();
     }
     if (session.gate) {
@@ -1396,7 +1633,7 @@ export class ClaudeAcpAgent {
     if (this.sessions[params.sessionId]) {
       await this.teardownSession(params.sessionId);
     }
-    await deleteSessionIfStored(params.sessionId, deleteSession);
+    await this.deleteStoredSession(params.sessionId);
     return {};
   }
 
@@ -1419,11 +1656,7 @@ export class ClaudeAcpAgent {
     if (!session) {
       throw new Error("Session not found");
     }
-    if (params.configId === FAST_MODE_CONFIG_ID && typeof params.value === "boolean") {
-      const option = session.configOptions.find((o) => o.id === FAST_MODE_CONFIG_ID);
-      if (!option) {
-        throw new Error(`Unknown config option: ${params.configId}`);
-      }
+    if (params.configId === FAST_MODE_CONFIG_ID) {
       const enabled = resolveFastModeEnabled(params.value);
       this.applyFastModeChange(session, enabled);
       session.configOptions = session.configOptions.map((o) =>
@@ -1527,8 +1760,6 @@ export class ClaudeAcpAgent {
       this.applyEffortChange(session, resolvedValue);
     } else if (params.configId === "agent") {
       await this.applyAgentChange(params.sessionId, session, resolvedValue);
-    } else if (params.configId === FAST_MODE_CONFIG_ID) {
-      this.applyFastModeChange(session, resolveFastModeEnabled(resolvedValue));
     } else if (params.configId === ULTRACODE_CONFIG_ID) {
       await this.applyUltracodeChange(
         params.sessionId,
@@ -1713,7 +1944,6 @@ export class ClaudeAcpAgent {
         if (oldAppend) await removeAppendSystemPromptFile(oldAppend);
       }
       if (fresh) {
-        oldEngine?.cleanup();
         oldEngine?.kill();
       }
       const started = await this.startEngine({
@@ -1738,7 +1968,6 @@ export class ClaudeAcpAgent {
         onEvent: (sid) => void this.pumpUpdates(sid),
       });
       if (!fresh) {
-        oldEngine?.cleanup();
         oldEngine?.kill();
       }
       session.pty = started.pty;
@@ -1993,11 +2222,17 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const session = this.sessions[sessionId];
     const source = turn.message as { message?: { role?: string; content?: unknown } };
-    const role = source.message?.role;
+    let role = source.message?.role;
     let content: unknown = source.message?.content;
     if (role === "user") {
-      content = stripLocalCommandMetadata(content);
-      if (content === null) return;
+      const status = statusCommandOutput(content);
+      if (status !== null) {
+        role = "assistant";
+        content = status;
+      } else {
+        content = stripLocalCommandMetadata(content);
+        if (content === null) return;
+      }
     }
 
     const turnToolUseResult = (turn.message as { toolUseResult?: unknown }).toolUseResult;
@@ -2051,16 +2286,25 @@ export class ClaudeAcpAgent {
     }
 
     if (session && !session.usageDisabled) {
-      const carrier = (turn.message as { message?: unknown }).message ?? {};
-      const realModel = (carrier as { model?: unknown }).model;
+      const turnRecord = turn.message as { total_cost_usd?: number; message?: unknown };
+      const carrier = {
+        ...((turnRecord.message ?? {}) as UsageCarrier),
+        ...(typeof turnRecord.total_cost_usd === "number"
+          ? { total_cost_usd: turnRecord.total_cost_usd }
+          : {}),
+      };
+      const realModel = carrier.model;
       if (typeof realModel === "string" && realModel.length > 0) {
         session.contextWindowSize =
           inferContextWindowFromModelId(realModel) ?? session.contextWindowSize;
       }
-      for (const usageUpdate of usageUpdatesFor(carrier as unknown as UsageCarrier, {
+      session.accumulatedUsage = addUsage(session.accumulatedUsage, carrier.usage);
+      if (typeof carrier.total_cost_usd === "number") session.lastCostUsd = carrier.total_cost_usd;
+      for (const usageUpdate of usageUpdatesFor(carrier, {
         usageUpdate: this.usageUpdate,
         contextWindowSize: session.contextWindowSize,
       })) {
+        session.lastContextUsed = usageUpdate.used;
         try {
           await this.client.sessionUpdate({
             sessionId,
@@ -2222,7 +2466,20 @@ export class ClaudeAcpAgent {
       tools: session.modTools,
       cwd: session.cwd,
       supportsTerminal: (this.clientCapabilities?._meta as { terminal_output?: boolean } | undefined)?.terminal_output === true,
+      contextWindowSize: session.contextWindowSize,
     });
+    if (event.type === "usage") {
+      const counts = {
+        input_tokens: typeof event.inputTokens === "number" ? event.inputTokens : null,
+        output_tokens: typeof event.outputTokens === "number" ? event.outputTokens : null,
+        cache_read_input_tokens: typeof event.cachedReadTokens === "number" ? event.cachedReadTokens : null,
+        cache_creation_input_tokens:
+          typeof event.cachedWriteTokens === "number" ? event.cachedWriteTokens : null,
+      };
+      session.accumulatedUsage = addUsage(session.accumulatedUsage, counts);
+      const used = contextTokensUsed(counts);
+      if (used !== undefined) session.lastContextUsed = used;
+    }
     if (kind === "turn_started") {
       session.liveFromMod = true;
       session.turnDetector?.noteActivity();
@@ -2296,14 +2553,13 @@ export class ClaudeAcpAgent {
 
     session.interacted = true;
     if (session.liveFromMod || modChannelConnected()) {
+      if (!session.gate) return;
       const messages = await readOrderedMessages(sessionId, session.cwd, {
         getMessages: this.getMessages,
       });
       const fed = messages.slice(session.detectorCursor ?? 0);
       session.detectorCursor = messages.length;
-      if (session.gate) {
-        for (const m of fed) registerGateToolUses(m, session.gate);
-      }
+      for (const m of fed) registerGateToolUses(m, session.gate);
       session.lastMessages = messages;
       return;
     }
@@ -2340,7 +2596,11 @@ export class ClaudeAcpAgent {
     const fed = messages.slice(session.detectorCursor ?? 0);
     session.detectorCursor = messages.length;
     if (session.turnDetector) {
-      for (const m of fed) session.turnDetector.observe(m as never);
+      for (const m of fed) {
+        session.turnDetector.observe(m as never);
+        const content = (m as { message?: { content?: unknown } }).message?.content;
+        if (statusCommandOutput(content)) session.turnDetector.finish("end_turn");
+      }
     }
 
     if (session.gate) {
@@ -2706,7 +2966,9 @@ export class ClaudeAcpAgent {
       started = await this.startEngine({
         sessionId: isResume || creationOpts.forkSession ? requestedSessionId : undefined,
         cwd: tuiCwd,
-        resume: isResume || !!creationOpts.forkSession,
+        resume: isResume,
+        fork: !!creationOpts.forkSession,
+        resumeFrom: creationOpts.forkSession ? creationOpts.resume : undefined,
         replayOnly: creationOpts.replayOnly,
         sessions: this.engines,
         onEvent: (sid) => void this.pumpUpdates(sid),
@@ -2728,7 +2990,7 @@ export class ClaudeAcpAgent {
         await removeAppendSystemPromptFile(appendSystemPromptFile);
       }
       if (creationOpts.resume && error instanceof Error) {
-        throw RequestError.resourceNotFound(requestedSessionId);
+        throw RequestError.resourceNotFound(creationOpts.resume);
       }
       throw error;
     }
@@ -2797,6 +3059,7 @@ export class ClaudeAcpAgent {
       engine: started.engine,
       cancelled: false,
       cwd: runtimeCwd,
+      clientCwd: params.cwd,
       additionalDirectories: additionalDirs,
       mcpConfigFile,
       mcpServers: params.mcpServers,
@@ -2807,12 +3070,8 @@ export class ClaudeAcpAgent {
       disallowedTools,
       sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
+      accumulatedUsage: { ...EMPTY_USAGE },
+      lastContextUsed: 0,
       modes,
       modelInfos: liveModelCatalog,
       allowBypass,
@@ -2935,36 +3194,36 @@ function buildConfigOptions(
   }
 
   const currentModelInfo = modelInfos.find((m) => m.value === currentModelId);
-  const supportedLevels = currentModelInfo?.supportsEffort
-    ? (currentModelInfo.supportedEffortLevels ?? [])
-    : [];
+  const supportedLevels = (
+    currentModelInfo?.supportsEffort
+      ? (currentModelInfo.supportedEffortLevels ?? REASONING_EFFORT_LEVELS)
+      : REASONING_EFFORT_LEVELS
+  ) as string[];
 
-  if (supportedLevels.length > 0) {
-    const effortOptions = [
-      { value: "default", name: "Default" },
-      ...supportedLevels.map((level) => ({
-        value: level,
-        name: level
-          .split(/[_-]/)
-          .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
-          .join(" "),
-      })),
-    ];
+  const effortOptions = [
+    { value: "default", name: "Default" },
+    ...supportedLevels.map((level) => ({
+      value: level,
+      name: level
+        .split(/[_-]/)
+        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+        .join(" "),
+    })),
+  ];
 
-    const includes = (l: string) => l === "default" || (supportedLevels as string[]).includes(l);
-    const validEffort =
-      currentEffortLevel && includes(currentEffortLevel) ? currentEffortLevel : "default";
+  const includes = (l: string) => l === "default" || supportedLevels.includes(l);
+  const validEffort =
+    currentEffortLevel && includes(currentEffortLevel) ? currentEffortLevel : "default";
 
-    options.push({
-      id: "effort",
-      name: "Effort",
-      description: "Available effort levels for this model",
-      category: "thought_level",
-      type: "select",
-      currentValue: validEffort,
-      options: effortOptions,
-    });
-  }
+  options.push({
+    id: "effort",
+    name: "Effort",
+    description: "Thinking intensity: how much reasoning the model applies",
+    category: "thought_level",
+    type: "select",
+    currentValue: validEffort,
+    options: effortOptions,
+  });
 
   if (isUltracodeCapableModel(currentModelInfo)) {
     options.push(

@@ -15,7 +15,7 @@ export interface JsonlWatcherOptions {
   sessionId: string;
   transcriptPath: string;
   dir?: string;
-  onEvent: (message: SessionMessage) => void;
+  onEvent: (message?: SessionMessage) => void;
   getMessages?: GetMessages;
   tail?: (path: string, opts: TailOptions) => TranscriptTail;
   debounceMs?: number;
@@ -32,69 +32,38 @@ function defaultSchedule(fn: () => void, ms: number): () => void {
   return () => clearTimeout(handle);
 }
 
+/**
+ * Tail the host JSONL for new bytes and wake the agent. Parsing the whole
+ * transcript is pumpUpdates' job (and is skipped once Mods is live).
+ */
 export function createJsonlWatcher(opts: JsonlWatcherOptions): JsonlWatcher {
   const {
-    sessionId,
     transcriptPath,
-    dir,
     onEvent,
-    getMessages,
     tail = tailTranscript,
     debounceMs = DEFAULT_WATCHER_DEBOUNCE_MS,
     schedule = defaultSchedule,
   } = opts;
 
-  const readMessages: GetMessages = getMessages ?? defaultGetMessages;
-
-  const seen = new Set<string>();
-
   let stopped = false;
-  let reading = false;
-  let pendingReread = false;
   let cancelDebounce: (() => void) | undefined;
 
-  const runReread = async (): Promise<void> => {
+  const notify = (): void => {
     if (stopped) return;
-    if (reading) {
-      pendingReread = true;
-      return;
-    }
-    reading = true;
-    try {
-      do {
-        pendingReread = false;
-        let messages: SessionMessage[];
-        try {
-          messages = await readMessages(sessionId, { dir });
-        } catch {
-          continue;
-        }
-        if (stopped) return;
-        for (const message of messages) {
-          const { uuid } = message;
-          if (typeof uuid === "string") {
-            if (seen.has(uuid)) continue;
-            seen.add(uuid);
-          }
-          onEvent(message);
-        }
-      } while (pendingReread && !stopped);
-    } finally {
-      reading = false;
-    }
+    onEvent();
   };
 
-  const scheduleReread = (): void => {
+  const scheduleNotify = (): void => {
     if (stopped) return;
     cancelDebounce?.();
     cancelDebounce = schedule(() => {
       cancelDebounce = undefined;
-      void runReread();
+      notify();
     }, debounceMs);
   };
 
   const transcriptTail = tail(transcriptPath, {
-    onRecord: () => scheduleReread(),
+    onRecord: () => scheduleNotify(),
   });
 
   return {
@@ -102,26 +71,17 @@ export function createJsonlWatcher(opts: JsonlWatcherOptions): JsonlWatcher {
       if (stopped) return;
       cancelDebounce?.();
       cancelDebounce = undefined;
-      void runReread();
+      notify();
     },
     stop(): void {
       if (stopped) return;
       stopped = true;
       cancelDebounce?.();
       cancelDebounce = undefined;
-      pendingReread = false;
       try {
         transcriptTail.stop();
       } catch {
       }
     },
   };
-}
-
-async function defaultGetMessages(
-  sessionId: string,
-  opts?: { dir?: string },
-): Promise<SessionMessage[]> {
-  const sdk = await import("@anthropic-ai/claude-agent-sdk");
-  return sdk.getSessionMessages(sessionId, opts) as Promise<SessionMessage[]>;
 }

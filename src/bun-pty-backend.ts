@@ -1,7 +1,9 @@
 import type { EngineTerminal, TerminalExitEvent, TerminalSpawn } from "./terminal-backend.js";
+import { registerTuiReaper, signalPidTree } from "./tui-lifetime.js";
 
 const COLS = 120;
 const ROWS = 40;
+const KILL_ESCALATE_MS = 500;
 
 /** Bun 1.4+ `spawn({ terminal })` PTY. No node-pty, no script(1). */
 export function createBunPtySpawn(): TerminalSpawn {
@@ -10,10 +12,12 @@ export function createBunPtySpawn(): TerminalSpawn {
     const exitListeners = new Set<(event: TerminalExitEvent) => void>();
     const decoder = new TextDecoder();
     let exited = false;
+    let escalate: ReturnType<typeof setTimeout> | undefined;
 
     const proc = Bun.spawn([file, ...args], {
       cwd: options.cwd,
       env: options.env,
+      ...(process.platform !== "win32" ? { detached: true } : {}),
       terminal: {
         cols: options.cols ?? COLS,
         rows: options.rows ?? ROWS,
@@ -25,16 +29,39 @@ export function createBunPtySpawn(): TerminalSpawn {
       },
     });
 
-    void proc.exited.then((exitCode) => {
+    const reap = (signal: NodeJS.Signals): void => {
+      try {
+        proc.kill(signal);
+      } catch {
+      }
+      signalPidTree(proc.pid, signal);
+      if (signal === "SIGKILL") {
+        try {
+          proc.terminal?.close();
+        } catch {
+        }
+      }
+    };
+
+    const unregister = registerTuiReaper(() => reap("SIGKILL"));
+
+    const markExit = (exitCode: number): void => {
+      if (exited) return;
       exited = true;
-      const event = { exitCode: exitCode ?? 0 };
+      if (escalate !== undefined) {
+        clearTimeout(escalate);
+        escalate = undefined;
+      }
+      unregister();
+      const event: TerminalExitEvent = { exitCode };
       for (const listener of exitListeners) listener(event);
       try {
         proc.terminal?.close();
       } catch {
-        /* already closed */
       }
-    });
+    };
+
+    void proc.exited.then((exitCode) => markExit(exitCode ?? 0));
 
     const handle: EngineTerminal = {
       pid: proc.pid,
@@ -43,14 +70,36 @@ export function createBunPtySpawn(): TerminalSpawn {
       },
       onData(listener) {
         dataListeners.add(listener);
-        return { dispose: () => { dataListeners.delete(listener); } };
+        return {
+          dispose: () => {
+            dataListeners.delete(listener);
+          },
+        };
       },
       onExit(listener) {
+        if (exited) queueMicrotask(() => listener({ exitCode: 0 }));
         exitListeners.add(listener);
-        return { dispose: () => { exitListeners.delete(listener); } };
+        return {
+          dispose: () => {
+            exitListeners.delete(listener);
+          },
+        };
       },
-      kill() {
-        proc.kill();
+      kill(signal?: string) {
+        if (exited) {
+          try {
+            proc.terminal?.close();
+          } catch {
+          }
+          return;
+        }
+        const first = signal === "SIGKILL" || signal === "SIGTERM" ? (signal as NodeJS.Signals) : "SIGTERM";
+        reap(first);
+        if (first === "SIGKILL") return;
+        escalate = setTimeout(() => {
+          escalate = undefined;
+          if (!exited) reap("SIGKILL");
+        }, KILL_ESCALATE_MS);
       },
       resize(cols, rows) {
         proc.terminal?.resize(cols, rows);

@@ -11,6 +11,7 @@ import {
 import { appendSystemPromptFileFlag, disallowedToolsFlag } from "./local-tool-forward.js";
 import type { PtyEngineHandle } from "./engine-pty.js";
 import { isSafeAgentRef } from "./agent-catalog.js";
+import { isSessionId } from "./session-delete.js";
 
 export interface SessionWatcher {
   stop(): void;
@@ -90,9 +91,13 @@ export class SessionEngine {
     this.pty.write("\x1b");
   }
 
-  kill(): void {
-    if (this.disposed) return;
-    this.pty.kill();
+  /** Always reap the TUI, even if cleanup already ran (onExit). */
+  kill(signal?: string): void {
+    try {
+      this.pty.kill(signal);
+    } catch {
+    }
+    this.cleanup();
   }
 
   cleanup(info?: { exitCode?: number; signal?: number }): void {
@@ -128,6 +133,11 @@ export class SessionEngine {
 
 const RESUME_PTY_NAME = "xterm-256color";
 
+export type ResumeLaunchOpts = {
+  /** When set, `claude --resume SOURCE --fork-session --session-id NEW`. */
+  forkSessionId?: string;
+};
+
 export function buildResumeArgv(
   sessionId: string,
   permissionMode?: string,
@@ -138,6 +148,7 @@ export function buildResumeArgv(
   disallowedTools?: string[],
   appendSystemPromptFile?: string,
   extraFlags?: CcModsRelayFlags,
+  launch?: ResumeLaunchOpts,
 ): [string, string] {
   const pm =
     permissionMode && permissionMode !== "default" ? ` --permission-mode ${permissionMode}` : "";
@@ -148,7 +159,14 @@ export function buildResumeArgv(
   const denied = disallowedToolsFlag(disallowedTools);
   const append = appendSystemPromptFileFlag(appendSystemPromptFile);
   const flags = `${pm}${ef}${ag}${dirs}${mcp}${denied}${append}${extraClaudeFlags(extraFlags)}`;
-  return ["-c", `claude --resume "${sessionId}"${flags} || claude${flags}`];
+  const forkId = launch?.forkSessionId;
+  if (forkId) {
+    if (!isSessionId(forkId)) {
+      throw new Error(`engine-lifecycle: fork session id is not a UUID: ${JSON.stringify(forkId)}`);
+    }
+    return ["-c", `exec claude --resume "${sessionId}" --fork-session --session-id "${forkId}"${flags}`];
+  }
+  return ["-c", `claude --resume "${sessionId}"${flags} || exec claude${flags}`];
 }
 
 export interface SpawnResumeOptions {
@@ -164,6 +182,8 @@ export interface SpawnResumeOptions {
   disallowedTools?: string[];
   appendSystemPromptFile?: string;
   extraFlags?: CcModsRelayFlags;
+  /** ACP session id for a `--fork-session` spawn (distinct from the source `sessionId`). */
+  forkedSessionId?: string;
 }
 
 export function spawnResumePty(opts: SpawnResumeOptions): PtyEngineHandle {
@@ -180,6 +200,7 @@ export function spawnResumePty(opts: SpawnResumeOptions): PtyEngineHandle {
     opts.disallowedTools,
     opts.appendSystemPromptFile,
     opts.extraFlags,
+    opts.forkedSessionId ? { forkSessionId: opts.forkedSessionId } : undefined,
   );
   const env = buildSanitizedEnv(baseEnv);
 
@@ -193,7 +214,7 @@ export function spawnResumePty(opts: SpawnResumeOptions): PtyEngineHandle {
     env: env as { [key: string]: string },
   });
 
-  return { sessionId, pty: p };
+  return { sessionId: opts.forkedSessionId ?? sessionId, pty: p };
 }
 
 export interface CreateSessionEngineOptions {

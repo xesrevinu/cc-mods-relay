@@ -10,6 +10,7 @@ import { liveDiffEnabled } from "./live-diff-env.js";
 import { liveSubagentWatchEnabled } from "./live-subagent-env.js";
 import { bindModChannel, startModChannel } from "./mod-channel.js";
 import { resolveTerminalBackendName } from "./terminal-backend.js";
+import { installTuiExitHooks, reapAllTuis } from "./tui-lifetime.js";
 
 export async function ensureHerdr(session: string) {
   if (resolveTerminalBackendName() === "bun-pty") return;
@@ -42,6 +43,7 @@ export async function runAgent(pluginDir: string) {
   const channel = startModChannel();
   bindModChannel(channel);
   process.env.CC_MODS_SOCKET = channel.path;
+  installTuiExitHooks();
   await ensureHerdr(herdrSession);
   const startEngine = await stackedEngine(pluginDir, herdrSession);
 
@@ -60,8 +62,13 @@ export async function runAgent(pluginDir: string) {
     fastModeProbe: process.env.FAST_MODE_FORCE === "1" ? () => true : process.env.FAST_MODE_LIVE === "1" ? driveFastModeProbe : undefined,
   });
 
+  let shuttingDown = false;
   async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
     await agent.dispose().catch((error) => console.error(error));
+    await Bun.sleep(400);
+    reapAllTuis();
     channel.stop();
     process.exit(0);
   }

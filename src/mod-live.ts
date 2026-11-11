@@ -30,6 +30,7 @@ export async function applyModEvent(
     tools: Map<string, Started>;
     cwd: string;
     supportsTerminal: boolean;
+    contextWindowSize?: number;
   },
 ): Promise<"turn_started" | "turn_completed" | undefined> {
   if (event.type === "chunk" && typeof event.text === "string") {
@@ -150,12 +151,18 @@ export async function applyModEvent(
   }
 
   if (event.type === "usage") {
-    const update = toUsageUpdate({
-      usage: {
-        input_tokens: typeof event.inputTokens === "number" ? event.inputTokens : null,
-        output_tokens: typeof event.outputTokens === "number" ? event.outputTokens : null,
+    const update = toUsageUpdate(
+      {
+        usage: {
+          input_tokens: typeof event.inputTokens === "number" ? event.inputTokens : null,
+          output_tokens: typeof event.outputTokens === "number" ? event.outputTokens : null,
+          cache_read_input_tokens: typeof event.cachedReadTokens === "number" ? event.cachedReadTokens : null,
+          cache_creation_input_tokens:
+            typeof event.cachedWriteTokens === "number" ? event.cachedWriteTokens : null,
+        },
       },
-    });
+      { contextWindowSize: ctx.contextWindowSize },
+    );
     if (update) await ctx.client.sessionUpdate({ sessionId, update });
     return;
   }

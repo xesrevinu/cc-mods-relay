@@ -16,6 +16,7 @@ import type {
   TerminalSpawn,
   TerminalSpawnOptions,
 } from "./terminal-backend.js";
+import { registerTuiReaper, signalPidTree } from "./tui-lifetime.js";
 
 export type HerdrCliRunner = (argv: string[]) => { stdout: string; stderr: string; status: number | null };
 
@@ -96,6 +97,24 @@ export function buildLaunchScript(cmd: string, env: Record<string, string | unde
   lines.push(`exec ${envCmd} /bin/sh -c ${shellQuote(cmd)}`);
   lines.push("");
   return lines.join("\n");
+}
+
+function collectPids(info: unknown, into: Set<number>): void {
+  if (info == null) return;
+  if (typeof info === "number") {
+    if (Number.isInteger(info) && info > 1 && info !== process.pid) into.add(info);
+    return;
+  }
+  if (typeof info !== "object") return;
+  if (Array.isArray(info)) {
+    for (const item of info) collectPids(item, into);
+    return;
+  }
+  const row = info as Record<string, unknown>;
+  for (const key of ["pid", "process_id", "pgid"]) collectPids(row[key], into);
+  for (const value of Object.values(row)) {
+    if (value && typeof value === "object") collectPids(value, into);
+  }
 }
 
 function keyForControlByte(ch: string): string[] | null {
@@ -260,10 +279,26 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
 
     const dataListeners = new Set<(data: string) => void>();
     const exitListeners = new Set<(event: TerminalExitEvent) => void>();
+    const seenPids = new Set<number>();
     let exited = false;
     let exitEvent: TerminalExitEvent = { exitCode: 0 };
     let killed = false;
     let lastRead = "";
+    let tuiPid = 0;
+    let poll: ReturnType<typeof setInterval> | undefined;
+    let watch: ReturnType<typeof setInterval> | undefined;
+    let unregister = (): void => {};
+
+    const stopTimers = (): void => {
+      if (poll !== undefined) {
+        clearInterval(poll);
+        poll = undefined;
+      }
+      if (watch !== undefined) {
+        clearInterval(watch);
+        watch = undefined;
+      }
+    };
 
     const readPane = (): string => {
       try {
@@ -287,53 +322,80 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
       }
     };
 
-    const poll = setInterval(() => {
-      if (exited) return;
-      const snap = readPane();
-      if (snap && snap !== lastRead) {
-        let delta = snap;
-        if (snap.startsWith(lastRead)) delta = snap.slice(lastRead.length);
-        lastRead = snap;
-        if (delta) for (const l of dataListeners) l(delta);
-      }
-    }, pollMs);
+    const startPanePoll = (): void => {
+      if (poll !== undefined || exited) return;
+      poll = setInterval(() => {
+        if (exited || dataListeners.size === 0) return;
+        const snap = readPane();
+        if (snap && snap !== lastRead) {
+          let delta = snap;
+          if (snap.startsWith(lastRead)) delta = snap.slice(lastRead.length);
+          lastRead = snap;
+          if (delta) for (const l of dataListeners) l(delta);
+        }
+      }, pollMs);
+    };
 
     let seenClaude = false;
-    const watch = setInterval(() => {
+    watch = setInterval(() => {
       if (exited) return;
       try {
-        const info = herdr("pane", "process-info", "--pane", paneId) as {
-          result?: { process_info?: { foreground_processes?: { name?: string; cmdline?: string }[] } };
-        };
-        const procs = info.result?.process_info?.foreground_processes || [];
+        const info = herdr("pane", "process-info", "--pane", paneId);
+        collectPids(info, seenPids);
+        const procs =
+          (info as { result?: { process_info?: { foreground_processes?: { name?: string; cmdline?: string }[] } } })
+            .result?.process_info?.foreground_processes || [];
         const hasClaude = procs.some(
           (p) => (p.name || "").includes("claude") || /\bclaude\b/.test(p.cmdline || ""),
         );
-        if (hasClaude) seenClaude = true;
-        else if (seenClaude) {
-          clearInterval(watch);
-          clearInterval(poll);
-          markExit({ exitCode: 0 });
+        if (hasClaude) {
+          seenClaude = true;
+          const first = [...seenPids][0];
+          if (first) tuiPid = first;
+        } else if (seenClaude) {
+          markExit({ exitCode: killed ? 1 : 0 });
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("pane_not_found")) {
-          clearInterval(watch);
-          clearInterval(poll);
           markExit({ exitCode: killed ? 1 : 0 });
         }
       }
     }, pollMs);
 
+    function reapForeground(signal: NodeJS.Signals): void {
+      for (const pid of seenPids) signalPidTree(pid, signal);
+    }
+
     function markExit(ev: TerminalExitEvent): void {
       if (exited) return;
       exited = true;
       exitEvent = ev;
+      stopTimers();
+      unregister();
       for (const l of exitListeners) l(ev);
     }
 
+    const killTui = (signal?: string): void => {
+      if (exited) return;
+      killed = true;
+      const first = signal === "SIGKILL" ? "SIGKILL" : "SIGTERM";
+      try {
+        herdr("pane", "send-keys", paneId, "ctrl+c");
+      } catch {
+      }
+      reapForeground(first);
+      closeOwnSurface();
+      if (first !== "SIGKILL") reapForeground("SIGKILL");
+      markExit({ exitCode: 1 });
+    };
+
+    unregister = registerTuiReaper(() => killTui("SIGKILL"));
+
     const handle: EngineTerminal = {
-      pid: process.pid,
+      get pid() {
+        return tuiPid;
+      },
       write(data: string): void {
         if (exited) return;
         if (data.length === 1) {
@@ -357,9 +419,14 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
       },
       onData(listener: (data: string) => void): TerminalDisposable {
         dataListeners.add(listener);
+        startPanePoll();
         return {
           dispose() {
             dataListeners.delete(listener);
+            if (dataListeners.size === 0 && poll !== undefined) {
+              clearInterval(poll);
+              poll = undefined;
+            }
           },
         };
       },
@@ -374,13 +441,8 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
           },
         };
       },
-      kill(_signal?: string): void {
-        if (exited) return;
-        killed = true;
-        closeOwnSurface();
-        clearInterval(poll);
-        clearInterval(watch);
-        markExit({ exitCode: 1 });
+      kill(signal?: string): void {
+        killTui(signal);
       },
       resize(_cols: number, _rows: number): void {
       },
