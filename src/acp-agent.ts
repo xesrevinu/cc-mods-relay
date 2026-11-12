@@ -385,6 +385,14 @@ type Session = {
   /** Mid-turn `x.ai/interject` texts to skip as duplicate user_message_chunk. */
   pendingInterjectTexts?: string[];
   permissionAbort?: AbortController;
+  /** Overlapping `session/prompt` RPCs waiting for the in-flight turn to finish. */
+  queuedPrompts?: QueuedPrompt[];
+};
+
+type QueuedPrompt = {
+  params: PromptRequest;
+  resolve: (response: PromptResponse) => void;
+  reject: (error: unknown) => void;
 };
 
 export interface StartedEngine {
@@ -1179,6 +1187,11 @@ function promptIdFromMeta(meta: unknown): string | undefined {
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
+function isSendNowMeta(meta: unknown): boolean {
+  if (!meta || typeof meta !== "object") return false;
+  return (meta as { sendNow?: unknown }).sendNow === true;
+}
+
 function deriveSubagentLabel(
   messages: SessionMessage[],
   parentId: string | null,
@@ -1689,13 +1702,54 @@ export class ClaudeAcpAgent {
     }
 
     sessionRecord.hadUserPrompt = true;
-    sessionRecord.cancelled = false;
-    sessionRecord.currentPromptId = promptIdFromMeta(params._meta);
-    try {
-      return await this.runPrompt(params, sessionRecord);
-    } finally {
-      sessionRecord.currentPromptId = undefined;
+    if (this.turnInFlight(sessionRecord)) {
+      if (isSendNowMeta(params._meta)) {
+        return this.steerIntoTurn(params, sessionRecord);
+      }
+      return this.enqueuePrompt(params, sessionRecord);
     }
+    return this.executePrompt(params, sessionRecord);
+  }
+
+  private turnInFlight(session: Session): boolean {
+    return session.turnDetector !== undefined || session.turnCancel !== undefined;
+  }
+
+  private enqueuePrompt(params: PromptRequest, session: Session): Promise<PromptResponse> {
+    return new Promise((resolve, reject) => {
+      session.queuedPrompts ??= [];
+      session.queuedPrompts.push({ params, resolve, reject });
+    });
+  }
+
+  private async executePrompt(params: PromptRequest, session: Session): Promise<PromptResponse> {
+    session.cancelled = false;
+    session.currentPromptId = promptIdFromMeta(params._meta);
+    try {
+      return await this.runPrompt(params, session);
+    } finally {
+      session.currentPromptId = undefined;
+      this.drainQueuedPrompt(session);
+    }
+  }
+
+  private drainQueuedPrompt(session: Session): void {
+    const next = session.queuedPrompts?.shift();
+    if (!next || this.turnInFlight(session)) return;
+    void this.executePrompt(next.params, session).then(next.resolve, next.reject);
+  }
+
+  private steerIntoTurn(params: PromptRequest, session: Session): PromptResponse {
+    const turnTemp = session.turnTempImagePaths ?? [];
+    session.turnTempImagePaths = turnTemp;
+    const outgoing = promptToClaude(params, this.logger, turnTemp);
+    if (!outgoing.trim()) {
+      throw RequestError.invalidParams(undefined, "steer text is required");
+    }
+    session.pendingInterjectTexts ??= [];
+    session.pendingInterjectTexts.push(outgoing);
+    sendPrompt(session.pty, outgoing, this.schedule, "steer");
+    return { stopReason: "end_turn" };
   }
 
   private async runPrompt(params: PromptRequest, sessionRecord: Session): Promise<PromptResponse> {
@@ -1933,6 +1987,11 @@ export class ClaudeAcpAgent {
     if (!session) {
       return;
     }
+    const queued = session.queuedPrompts ?? [];
+    session.queuedPrompts = [];
+    for (const item of queued) {
+      item.reject(RequestError.resourceNotFound(sessionId));
+    }
     await this.cancel({ sessionId });
     cleanupMaterializedImages(session.turnTempImagePaths);
     session.turnTempImagePaths = undefined;
@@ -2019,7 +2078,7 @@ export class ClaudeAcpAgent {
 
     session.pendingInterjectTexts ??= [];
     session.pendingInterjectTexts.push(outgoing);
-    sendPrompt(session.pty, outgoing, this.schedule);
+    sendPrompt(session.pty, outgoing, this.schedule, "steer");
     return grokExtSuccess({ status: "queued" });
   }
 
@@ -2973,17 +3032,35 @@ export class ClaudeAcpAgent {
     const session = this.sessions[sessionId];
     if (!session) return;
     if (event.type === "permission_request" && typeof event.requestId === "string") {
-      await this.bridgePermission(sessionId, event);
+      const holdId = `perm:${event.requestId}`;
+      session.turnDetector?.hold(holdId);
+      try {
+        await this.bridgePermission(sessionId, event);
+      } finally {
+        session.turnDetector?.release(holdId);
+      }
       return;
     }
     if (event.type === "ask_question" && typeof event.requestId === "string") {
-      await this.bridgeQuestion(sessionId, event);
+      const holdId = `ask:${event.requestId}`;
+      session.turnDetector?.hold(holdId);
+      try {
+        await this.bridgeQuestion(sessionId, event);
+      } finally {
+        session.turnDetector?.release(holdId);
+      }
       return;
     }
     if (event.type === "plugin_error") {
       this.logger.error("[mod-live] plugin error:", event.message ?? event);
       return;
     }
+    // Mods is the live path: JSONL is not observed for EOT while the plugin is
+    // connected, so every live event must keep the stall watchdog from firing.
+    const toolUseId = typeof event.toolUseId === "string" ? event.toolUseId : undefined;
+    if (event.type === "tool_started" && toolUseId) session.turnDetector?.hold(toolUseId);
+    else if (event.type === "tool_finished" && toolUseId) session.turnDetector?.release(toolUseId);
+    else session.turnDetector?.noteActivity();
     if (event.type === "tool_started" || event.type === "tool_finished") {
       debug(`mod ${event.type}`, {
         toolUseId: event.toolUseId,
@@ -3102,13 +3179,21 @@ export class ClaudeAcpAgent {
 
     session.interacted = true;
     if (session.liveFromMod || modChannelConnected()) {
-      if (!session.gate) return;
       const messages = await readOrderedMessages(sessionId, session.cwd, {
         getMessages: this.getMessages,
       });
       const fed = messages.slice(session.detectorCursor ?? 0);
       session.detectorCursor = messages.length;
-      for (const m of fed) registerGateToolUses(m, session.gate);
+      if (session.turnDetector) {
+        for (const m of fed) {
+          session.turnDetector.observe(m as never);
+          const content = (m as { message?: { content?: unknown } }).message?.content;
+          if (statusCommandOutput(content)) session.turnDetector.finish("end_turn");
+        }
+      }
+      if (session.gate) {
+        for (const m of fed) registerGateToolUses(m, session.gate);
+      }
       session.lastMessages = messages;
       await this.emitCompactionSignals(sessionId, session, messages, true);
       return;

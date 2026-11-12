@@ -788,14 +788,69 @@ test("x.ai/interject injects into the live Claude TUI turn", async () => {
     interjectionId: undefined,
     content: undefined,
   });
+  const escapesBefore = writes.filter((w) => w === "\x1b").length;
   const queued = await agent.handleGrokInterject({
     sessionId: created.sessionId,
     text: "steer left",
   });
   expect(queued).toEqual({ result: { status: "queued" } });
   expect(writes.join("")).toContain("steer left");
+  expect(writes.filter((w) => w === "\x1b").length).toBe(escapesBefore);
+  expect(agent.sessions[created.sessionId]?.turnCancel).toBeDefined();
   await agent.cancel({ sessionId: created.sessionId });
   expect(await pending).toEqual({ stopReason: "cancelled" });
+});
+
+test("session/prompt while a turn is running waits for that turn to finish", async () => {
+  const writes: string[] = [];
+  const { agent, cwd } = harness({ immediate: true, writes });
+  live.push(agent);
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  const created = await agent.newSession({ cwd, mcpServers: [] });
+  const first = agent.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: "text", text: "first-turn" }],
+  });
+  await waitForTurn(agent, created.sessionId);
+  const second = agent.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: "text", text: "queued-later" }],
+  });
+  await flush();
+  expect(writes.join("")).toContain("first-turn");
+  expect(writes.join("")).not.toContain("queued-later");
+  agent.sessions[created.sessionId]?.turnDetector?.finish("end_turn");
+  expect(await first).toEqual({ stopReason: "end_turn" });
+  await flush();
+  await waitForTurn(agent, created.sessionId);
+  expect(writes.join("")).toContain("queued-later");
+  agent.sessions[created.sessionId]?.turnDetector?.finish("end_turn");
+  expect(await second).toEqual({ stopReason: "end_turn" });
+});
+
+test("sendNow mid-turn steers without cancelling the running prompt", async () => {
+  const writes: string[] = [];
+  const { agent, cwd } = harness({ immediate: true, writes });
+  live.push(agent);
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  const created = await agent.newSession({ cwd, mcpServers: [] });
+  const first = agent.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: "text", text: "first-turn" }],
+  });
+  await waitForTurn(agent, created.sessionId);
+  const escapesBefore = writes.filter((w) => w === "\x1b").length;
+  const steered = await agent.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: "text", text: "steer-now" }],
+    _meta: { sendNow: true },
+  });
+  expect(steered).toEqual({ stopReason: "end_turn" });
+  expect(writes.join("")).toContain("steer-now");
+  expect(writes.filter((w) => w === "\x1b").length).toBe(escapesBefore);
+  expect(agent.sessions[created.sessionId]?.turnCancel).toBeDefined();
+  agent.sessions[created.sessionId]?.turnDetector?.finish("end_turn");
+  expect(await first).toEqual({ stopReason: "end_turn" });
 });
 
 test("interject without an in-flight turn is rejected", async () => {
@@ -963,5 +1018,48 @@ test("initialize does not advertise the relay package name", async () => {
   const init = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
   expect(init.agentInfo?.name).toBe("claude");
   expect(init.agentInfo?.title).toBe("Claude");
+});
+
+test("Mods tool events hold the stall watchdog instead of letting a live turn expire", async () => {
+  const { agent, cwd } = harness();
+  live.push(agent);
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  const created = await agent.newSession({ cwd, mcpServers: [] });
+  const session = agent.sessions[created.sessionId];
+  const held: string[] = [];
+  const released: string[] = [];
+  let notes = 0;
+  session.turnDetector = {
+    beginTurn() {},
+    observe() {},
+    noteActivity() {
+      notes += 1;
+    },
+    hold(id) {
+      held.push(id);
+    },
+    release(id) {
+      released.push(id);
+    },
+    markCancelled() {},
+    stop() {},
+    finish() {},
+  };
+  await agent.handleModEvent({
+    type: "tool_started",
+    toolUseId: "t1",
+    tool: "Read",
+    input: { file_path: "/tmp/a" },
+  });
+  expect(held).toEqual(["t1"]);
+  await agent.handleModEvent({
+    type: "tool_finished",
+    toolUseId: "t1",
+    tool: "Read",
+    result: "ok",
+  });
+  expect(released).toEqual(["t1"]);
+  await agent.handleModEvent({ type: "chunk", text: "hello", kind: "assistant" });
+  expect(notes).toBeGreaterThan(0);
 });
 

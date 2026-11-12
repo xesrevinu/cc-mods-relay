@@ -148,6 +148,9 @@ export interface EndOfTurnDetector {
   beginTurn(): void;
   observe(event: StopReasonEvent): void;
   noteActivity(): void;
+  /** In-flight work (Mods tool, Task/Agent) keeps the stall watchdog from firing. */
+  hold(id: string): void;
+  release(id: string): void;
   markCancelled(): void;
   stop(): void;
   /** Mods `turn.complete` — settle now, without waiting for a JSONL stop_reason. */
@@ -261,6 +264,16 @@ export function createEndOfTurnDetector(opts: EndOfTurnDetectorOptions): EndOfTu
     },
     noteActivity(): void {
       if (stopped || cancelled) return;
+      if (cancelWatchdog !== undefined) armWatchdog();
+    },
+    hold(id: string): void {
+      if (stopped || cancelled || !id) return;
+      openTaskIds.add(id);
+      if (cancelWatchdog !== undefined) armWatchdog();
+    },
+    release(id: string): void {
+      if (stopped || cancelled || !id) return;
+      openTaskIds.delete(id);
       if (cancelWatchdog !== undefined) armWatchdog();
     },
     markCancelled(): void {

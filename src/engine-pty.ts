@@ -259,12 +259,21 @@ export const CLEAR_INPUT_KEY = "\x15";
 
 export const CLEAR_INPUT_DELAY_MS = 60;
 
+/** `submit` is an idle prompt. `steer` is a mid-turn follow-up — never Escape, which cancels Claude. */
+export type SendPromptMode = "submit" | "steer";
+
 export function sendPrompt(
   p: EngineTerminal,
   text: string,
   schedule: (fn: () => void, ms: number) => void = (fn, ms) => setTimeout(fn, ms),
+  mode: SendPromptMode = "submit",
 ): void {
   const payload = text.includes("\n") ? `\x1b[200~${text}\x1b[201~` : text;
+  if (mode === "steer") {
+    p.write(payload);
+    schedule(() => p.write("\r"), SUBMISSION_DELAY_MS);
+    return;
+  }
   p.write("\x1b");
   schedule(() => p.write(CLEAR_INPUT_KEY), CLEAR_INPUT_DELAY_MS);
   schedule(() => p.write(payload), CLEAR_INPUT_DELAY_MS * 2);
