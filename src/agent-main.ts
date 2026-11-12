@@ -11,6 +11,7 @@ import { liveSubagentWatchEnabled } from "./live-subagent-env.js";
 import { bindModChannel, startModChannel } from "./mod-channel.js";
 import { resolveTerminalBackendName } from "./terminal-backend.js";
 import { installTuiExitHooks, reapAllTuis } from "./tui-lifetime.js";
+import { reapOrphanHerdrWorkspaces, reapOrphanPluginProcesses } from "./tui-reap.js";
 
 export async function ensureHerdr(session: string) {
   if (resolveTerminalBackendName() === "bun-pty") return;
@@ -45,6 +46,10 @@ export async function runAgent(pluginDir: string) {
   process.env.CC_MODS_SOCKET = channel.path;
   installTuiExitHooks();
   await ensureHerdr(herdrSession);
+  if (resolveTerminalBackendName() !== "bun-pty") {
+    reapOrphanHerdrWorkspaces({ herdrSession });
+  }
+  reapOrphanPluginProcesses(pluginDir);
   const startEngine = await stackedEngine(pluginDir, herdrSession);
 
   await applyManagedPolicyEnv();
@@ -75,5 +80,8 @@ export async function runAgent(pluginDir: string) {
   connection.closed.then(shutdown);
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+  // sshd sends SIGHUP when the ACP tunnel drops. Without a handler, Bun
+  // exits before dispose/reapers run and herdr panes leak (PPID=1).
+  if (process.platform !== "win32") process.on("SIGHUP", shutdown);
   process.stdin.resume();
 }

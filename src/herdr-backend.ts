@@ -16,7 +16,8 @@ import type {
   TerminalSpawn,
   TerminalSpawnOptions,
 } from "./terminal-backend.js";
-import { registerTuiReaper, signalPidTree } from "./tui-lifetime.js";
+import { pidAlive, registerTuiReaper, signalPidTree } from "./tui-lifetime.js";
+import { stampWorkspace, unstampWorkspace } from "./tui-reap.js";
 
 export type HerdrCliRunner = (argv: string[]) => { stdout: string; stderr: string; status: number | null };
 
@@ -180,16 +181,21 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
     let tabId = "";
     let paneId = "";
     const closeOwnSurface = (): void => {
-      if (workspaceId) {
+      const ws = workspaceId;
+      const tab = tabId;
+      workspaceId = "";
+      tabId = "";
+      if (ws) {
+        unstampWorkspace(herdrSession, ws);
         try {
-          herdr("workspace", "close", workspaceId);
+          herdr("workspace", "close", ws);
           return;
         } catch {
         }
       }
-      if (tabId) {
+      if (tab) {
         try {
-          herdr("tab", "close", tabId);
+          herdr("tab", "close", tab);
         } catch {
         }
       }
@@ -220,6 +226,7 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
       if (!workspaceId || !tabId || !paneId) {
         throw new Error(`herdr-backend: workspace create missing ids: ${JSON.stringify(created)}`);
       }
+      if (!factoryOpts.runCli) stampWorkspace(herdrSession, { workspaceId, paneId, tabId });
 
       herdr("pane", "run", paneId, "/bin/sh", scriptPath);
 
@@ -352,7 +359,9 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
           seenClaude = true;
           const first = [...seenPids][0];
           if (first) tuiPid = first;
-        } else if (seenClaude) {
+        } else if (seenClaude && ![...seenPids].some((pid) => pidAlive(pid))) {
+          // Foreground may be bun/ws-client while claude is still alive.
+          // Only treat the pane as gone when every pid we saw is dead.
           markExit({ exitCode: killed ? 1 : 0 });
         }
       } catch (err) {
@@ -373,6 +382,10 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
       exitEvent = ev;
       stopTimers();
       unregister();
+      if (!killed) {
+        reapForeground("SIGKILL");
+        closeOwnSurface();
+      }
       for (const l of exitListeners) l(ev);
     }
 
@@ -385,8 +398,8 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
       } catch {
       }
       reapForeground(first);
-      closeOwnSurface();
       if (first !== "SIGKILL") reapForeground("SIGKILL");
+      closeOwnSurface();
       markExit({ exitCode: 1 });
     };
 

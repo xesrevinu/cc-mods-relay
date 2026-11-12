@@ -1,3 +1,14 @@
+/** True if `kill(pid, 0)` succeeds. */
+export function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Kill a process and, on POSIX, its process group. Never throw. */
 export function signalPidTree(pid: number, signal: NodeJS.Signals): void {
   if (!Number.isInteger(pid) || pid <= 1) return;
