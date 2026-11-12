@@ -12,7 +12,7 @@ import {
 test("orphanPluginPids keeps a TUI with a live parent and reaps PPID 1", () => {
   const plugin = "/tmp/cc-mods-plugin";
   const rows = parsePs(`
-    10 1 herdr --session cc-mods-relay server
+    10 1 herdr --session claude server
     20 10 -sh
     21 20 claude --plugin-dir ${plugin} --session-id live
     22 21 bun ${plugin}/hooks/ws-client.js

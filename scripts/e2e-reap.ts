@@ -70,7 +70,7 @@ function linesMatching(raw: string, re: RegExp): string[] {
 async function snap(): Promise<Snap> {
   const ps = await remote("ps -axo pid,ppid,etime,command");
   const raw = ps.out;
-  const list = await remote("herdr --session cc-mods-relay workspace list");
+  const list = await remote("herdr --session claude workspace list");
   let workspaces: string[] = [];
   const start = list.out.indexOf("{");
   if (start >= 0) {
@@ -90,7 +90,7 @@ async function snap(): Promise<Snap> {
   }
   return {
     raw,
-    herdr: linesMatching(raw, /herdr --session cc-mods/),
+    herdr: linesMatching(raw, /herdr --session claude\b/),
     agents: linesMatching(raw, /bun .*\/.cc-mods-relay\/agent\.js/),
     claudes: linesMatching(raw, /claude --plugin-dir .*\/\.cc-mods-relay\/plugin/),
     ws: linesMatching(raw, /ws-client\.js/),
@@ -136,7 +136,7 @@ async function forceClean(): Promise<void> {
     .filter((n) => n > 1);
   for (const id of s.workspaces) {
     const wid = id.split(/\s+/)[0];
-    if (wid && wid !== "?") await remote(`herdr --session cc-mods-relay workspace close ${wid}`);
+    if (wid && wid !== "?") await remote(`herdr --session claude workspace close ${wid}`);
   }
   if (pids.length) await remote(`kill -KILL ${pids.join(" ")} || true`);
   await Bun.sleep(400);
@@ -413,7 +413,7 @@ async function main(): Promise<void> {
   const end = await snap();
   console.error(`[final]\n${fmt(end)}`);
   if (end.herdr.length) {
-    await remote("herdr --session cc-mods-relay server stop || true");
+    await remote("herdr --session claude server stop || true");
   }
   if (failed.length) process.exitCode = 1;
 }

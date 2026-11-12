@@ -1,4 +1,5 @@
 import { BUILTIN_COMMANDS } from "./command-catalog.js";
+import { formatResetAt, type PlanUsageView } from "./plan-usage.js";
 import type { AccumulatedUsage } from "./usage.js";
 
 export type ParsedSlash = { name: string; args: string };
@@ -34,12 +35,15 @@ export type SlashSessionView = {
   additionalDirectories: string[];
   startedAtMs?: number;
   nowMs?: number;
+  timeZone?: string;
+  plan?: PlanUsageView;
 };
 
 export type SlashResult =
   | { kind: "config"; configId: "model" | "effort" | "fast"; value: string; text: string }
   | { kind: "status"; text: string }
-  | { kind: "error"; text: string };
+  | { kind: "error"; text: string }
+  | { kind: "rename"; title: string };
 
 function formatCount(n: number): string {
   return n.toLocaleString("en-US");
@@ -69,8 +73,12 @@ export function occupancyPercent(used: number, size: number): number {
 }
 
 export function occupancyBar(used: number, size: number, width = BAR_WIDTH): string {
-  const pct = occupancyPercent(used, size);
-  const filled = size > 0 ? Math.round((pct / 100) * width) : 0;
+  return percentBar(occupancyPercent(used, size), width);
+}
+
+export function percentBar(pct: number, width = BAR_WIDTH): string {
+  const clamped = Number.isFinite(pct) ? Math.min(100, Math.max(0, pct)) : 0;
+  const filled = Math.round((clamped / 100) * width);
   return `${"█".repeat(filled)}${"░".repeat(Math.max(0, width - filled))}`;
 }
 
@@ -115,10 +123,54 @@ function namedList(items: string[], empty: string): string[] {
   return items.map((item) => `  ${item}`);
 }
 
+function planWindowLines(session: SlashSessionView): string[] {
+  const windows = session.plan?.windows ?? [];
+  if (windows.length === 0) {
+    return [
+      "Current session",
+      `  ${occupancyBar(session.contextUsed, session.contextSize)}  ${formatPercent(session.contextUsed, session.contextSize)} used`,
+    ];
+  }
+  const now = typeof session.nowMs === "number" ? new Date(session.nowMs) : undefined;
+  const lines: string[] = [];
+  for (const window of windows) {
+    if (lines.length > 0) lines.push("");
+    lines.push(window.label);
+    lines.push(`  ${percentBar(window.utilization)}  ${Math.round(window.utilization)}% used`);
+    const reset = formatResetAt(window.resetsAt, { now, timeZone: session.timeZone });
+    if (reset) lines.push(`  ${reset}`);
+  }
+  return lines;
+}
+
+function planContributorLines(plan: PlanUsageView | undefined): string[] {
+  if (!plan) return [];
+  const contributors = plan.contributors ?? [];
+  const mcpServers = plan.mcpServers ?? [];
+  if (contributors.length === 0 && mcpServers.length === 0) return [];
+  const lines = [
+    "",
+    "What's contributing to your limits usage?",
+    "Approximate · sessions on this machine only",
+    "Last 24h · shares overlap",
+  ];
+  for (const item of contributors) {
+    const detail = item.detail ? ` · ${item.detail}` : "";
+    lines.push(`${Math.round(item.pct)}%  ${item.title}${detail}`);
+  }
+  if (mcpServers.length > 0) {
+    lines.push("MCP servers");
+    for (const server of mcpServers) {
+      lines.push(`  ${server.name} ${Math.round(server.pct)}%`);
+    }
+  }
+  return lines;
+}
+
 export function formatUsage(session: SlashSessionView): string {
   const lines = [
     "Session",
-    `  ${padLabel("Total cost:")}${typeof session.costUsd === "number" ? formatUsd(session.costUsd) : "n/a"}`,
+    `  ${padLabel("Total cost:")}${formatUsd(session.costUsd ?? 0)}`,
   ];
   if (typeof session.startedAtMs === "number") {
     const now = session.nowMs ?? Date.now();
@@ -128,8 +180,8 @@ export function formatUsage(session: SlashSessionView): string {
     `  ${padLabel("Usage:")}${tokenBuckets(session.usage)}`,
     `  ${padLabel("Context:")}${contextLine(session.contextUsed, session.contextSize)}`,
     "",
-    "Current session",
-    `  ${occupancyBar(session.contextUsed, session.contextSize)}  ${formatPercent(session.contextUsed, session.contextSize)} used`,
+    ...planWindowLines(session),
+    ...planContributorLines(session.plan),
     "",
     `${session.modelDisplayName}`,
     `${session.model} · ${session.mode} · effort ${session.effort} · fast ${session.fast ? "on" : "off"}`,
@@ -200,6 +252,13 @@ export function dispatchSlash(name: string, args: string, session: SlashSessionV
         return { kind: "error", text: "fast expects on or off" };
       }
       return { kind: "config", configId: "fast", value: args, text: `fast: ${args}` };
+    }
+    case "rename": {
+      if (!args) return { kind: "error", text: "Usage: /rename <title>" };
+      if (args === "--auto" || args.startsWith("--auto ")) {
+        return { kind: "error", text: "/rename --auto is not supported" };
+      }
+      return { kind: "rename", title: args };
     }
     default:
       return { kind: "error", text: `Unsupported command /${name}` };

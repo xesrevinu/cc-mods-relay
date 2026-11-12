@@ -2,6 +2,7 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pidAlive, signalPidTree } from "./tui-lifetime.js";
+import { HERDR_WORKSPACE_LABEL } from "./herdr-names.js";
 
 export type HerdrCliRunner = (argv: string[]) => { stdout: string; stderr: string; status: number | null };
 
@@ -12,7 +13,7 @@ export type TuiStamp = { workspaceId: string; paneId?: string; tabId?: string };
 export type PsRow = { pid: number; ppid: number; command: string };
 
 export function tuiStampRoot(session: string, root = tmpdir()): string {
-  return join(root, "cc-mods-relay-tui", session);
+  return join(root, "claude-tui", session);
 }
 
 export function stampWorkspace(session: string, stamp: TuiStamp, pid = process.pid, root = tmpdir()): void {
@@ -153,7 +154,7 @@ export function reapOrphanHerdrWorkspaces(opts: {
   for (const ws of listed?.result?.workspaces ?? []) {
     const id = ws.workspace_id;
     if (!id || !SAFE_ID.test(id) || liveIds.has(id)) continue;
-    if ((ws.label || "") !== "claude-tui") continue;
+    if ((ws.label || "") !== HERDR_WORKSPACE_LABEL) continue;
     if (orphanStamps.some((s) => s.workspaceId === id)) continue;
     orphanStamps.push({ workspaceId: id, paneId: paneByWs.get(id) });
   }

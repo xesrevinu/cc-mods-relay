@@ -159,6 +159,9 @@ export function buildResumeArgv(
   const denied = disallowedToolsFlag(disallowedTools);
   const append = appendSystemPromptFileFlag(appendSystemPromptFile);
   const flags = `${pm}${ef}${ag}${dirs}${mcp}${denied}${append}${extraClaudeFlags(extraFlags)}`;
+  if (!isSessionId(sessionId)) {
+    throw new Error(`engine-lifecycle: resume session id is not a UUID: ${JSON.stringify(sessionId)}`);
+  }
   const forkId = launch?.forkSessionId;
   if (forkId) {
     if (!isSessionId(forkId)) {
@@ -166,7 +169,7 @@ export function buildResumeArgv(
     }
     return ["-c", `exec claude --resume "${sessionId}" --fork-session --session-id "${forkId}"${flags}`];
   }
-  return ["-c", `claude --resume "${sessionId}"${flags} || exec claude${flags}`];
+  return ["-c", `exec claude --resume "${sessionId}"${flags}`];
 }
 
 export interface SpawnResumeOptions {

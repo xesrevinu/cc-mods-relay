@@ -215,6 +215,16 @@ function defaultReadSlice(path: string, fromByte: number): string {
   }
 }
 
+export function readFileTail(path: string, maxBytes = 512 * 1024): string {
+  try {
+    const size = statSync(path).size;
+    const from = Math.max(0, size - maxBytes);
+    return defaultReadSlice(path, from);
+  } catch {
+    return "";
+  }
+}
+
 export function tailTranscript(path: string, opts: TailOptions): TranscriptTail {
   const watchFn = opts.watch ?? defaultWatch;
   const readSlice = opts.readSlice ?? defaultReadSlice;

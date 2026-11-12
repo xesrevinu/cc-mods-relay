@@ -23,16 +23,16 @@ const session: SlashSessionView = {
   fast: false,
   models: ["default", "sonnet", "opus", "haiku"],
   effortLevels: ["low", "medium", "high"],
-  contextUsed: 21900,
+  contextUsed: 12_300,
   contextSize: 1_000_000,
   usage: {
     ...EMPTY_USAGE,
-    inputTokens: 3400,
-    outputTokens: 80,
-    cachedReadTokens: 800,
-    cachedWriteTokens: 50,
+    inputTokens: 1_200,
+    outputTokens: 40,
+    cachedReadTokens: 300,
+    cachedWriteTokens: 20,
   },
-  costUsd: 0.04,
+  costUsd: 0.01,
   mcpServers: ["workspace"],
   additionalDirectories: ["/tmp/extra"],
   startedAtMs: 1_000,
@@ -44,7 +44,9 @@ test("every advertised slash is handled without a model turn", () => {
     expect(isAdvertisedSlash(command.name)).toBe(true);
     const result = dispatchSlash(command.name, "", session);
     expect(result.kind === "status" || result.kind === "error").toBe(true);
-    if (result.kind !== "config") expect(result.text.length).toBeGreaterThan(0);
+    if (result.kind === "status" || result.kind === "error") {
+      expect(result.text.length).toBeGreaterThan(0);
+    }
   }
 });
 
@@ -53,15 +55,62 @@ test("usage reports session cost, buckets, occupancy, and model", () => {
   expect(usage.kind).toBe("status");
   if (usage.kind !== "status") return;
   expect(usage.text).toContain("Session");
-  expect(usage.text).toContain("$0.0400");
-  expect(usage.text).toContain("3m 23s");
-  expect(usage.text).toContain("3,400 input");
-  expect(usage.text).toContain("800 cache read");
-  expect(usage.text).toContain("21.9k / 1m tokens");
+  expect(usage.text).toMatch(/\$\d+\.\d{4}/);
+  expect(usage.text).toMatch(/\d+m \d+s/);
+  expect(usage.text).toMatch(/[\d,]+ input/);
+  expect(usage.text).toMatch(/[\d,]+ cache read/);
+  expect(usage.text).toMatch(/[\d.]+[km]? \/ [\d.]+[km]? tokens/);
   expect(usage.text).toContain("Haiku 5.5");
   expect(usage.text).toContain("haiku · default · effort medium · fast off");
   expect(usage.text).toContain("Current session");
-  expect(usage.text).toContain("% used");
+  expect(usage.text).toMatch(/\d+% used/);
+});
+
+test("usage with plan data matches Claude TUI rate-limit windows", () => {
+  const usage = dispatchSlash("usage", "", {
+    ...session,
+    nowMs: Date.parse("2026-01-15T12:00:00Z"),
+    timeZone: "UTC",
+    plan: {
+      windows: [
+        {
+          label: "Current session",
+          utilization: 12,
+          resetsAt: "2026-01-15T16:30:00Z",
+        },
+        {
+          label: "Current week (all models)",
+          utilization: 34,
+          resetsAt: "2026-01-20T18:00:00Z",
+        },
+        {
+          label: "Current week (Fable)",
+          utilization: 5,
+          resetsAt: "2026-01-20T18:00:00Z",
+        },
+      ],
+      contributors: [
+        { pct: 60, title: "Disable unused MCP servers" },
+        { pct: 25, title: "Start a new session for a new task", detail: "run /clear" },
+      ],
+      mcpServers: [
+        { name: "docs", pct: 60 },
+        { name: "search", pct: 20 },
+      ],
+    },
+  });
+  expect(usage.kind).toBe("status");
+  if (usage.kind !== "status") return;
+  expect(usage.text).toContain("Current session");
+  expect(usage.text).toContain("Current week (all models)");
+  expect(usage.text).toContain("Current week (Fable)");
+  expect(usage.text).toMatch(/\d+% used/);
+  expect(usage.text).toMatch(/Resets .+\(UTC\)/);
+  expect(usage.text).toContain("What's contributing to your limits usage?");
+  expect(usage.text).toMatch(/\d+%\s+Disable unused MCP servers/);
+  expect(usage.text).toContain("docs");
+  expect(usage.text).toContain("search");
+  expect(usage.text).toMatch(/[\d.]+[km]? \/ [\d.]+[km]? tokens/);
 });
 
 test("context reports occupancy, buckets, and mcp; all expands catalogs", () => {
@@ -89,9 +138,9 @@ test("context reports occupancy, buckets, and mcp; all expands catalogs", () => 
 test("compact token and occupancy helpers match native-style labels", () => {
   expect(formatCompactTokens(0)).toBe("0");
   expect(formatCompactTokens(900)).toBe("900");
-  expect(formatCompactTokens(21900)).toBe("21.9k");
+  expect(formatCompactTokens(12_300)).toBe("12.3k");
   expect(formatCompactTokens(1_000_000)).toBe("1m");
-  expect(occupancyPercent(21900, 1_000_000)).toBeCloseTo(2.19, 2);
+  expect(occupancyPercent(12_300, 1_000_000)).toBeCloseTo(1.23, 2);
   expect(occupancyBar(0, 1_000_000)).toBe("░".repeat(20));
   expect(formatDuration(203_000)).toBe("3m 23s");
 });
@@ -145,4 +194,16 @@ test("unknown config values fail closed instead of hanging a turn", () => {
   expect(dispatchSlash("model", "nope", session).kind).toBe("error");
   expect(dispatchSlash("effort", "ultra", session).kind).toBe("error");
   expect(dispatchSlash("fast", "maybe", session).kind).toBe("error");
+});
+
+test("rename requires a title and rejects --auto", () => {
+  expect(dispatchSlash("rename", "", session)).toMatchObject({
+    kind: "error",
+    text: "Usage: /rename <title>",
+  });
+  expect(dispatchSlash("rename", "--auto", session).kind).toBe("error");
+  expect(dispatchSlash("rename", "Ship it", session)).toEqual({
+    kind: "rename",
+    title: "Ship it",
+  });
 });

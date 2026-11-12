@@ -18,6 +18,7 @@ import type {
 } from "./terminal-backend.js";
 import { pidAlive, registerTuiReaper, signalPidTree } from "./tui-lifetime.js";
 import { stampWorkspace, unstampWorkspace } from "./tui-reap.js";
+import { HERDR_WORKSPACE_LABEL } from "./herdr-names.js";
 
 export type HerdrCliRunner = (argv: string[]) => { stdout: string; stderr: string; status: number | null };
 
@@ -126,6 +127,18 @@ function keyForControlByte(ch: string): string[] | null {
   return null;
 }
 
+export function tuiResumeFailed(snap: string): string | undefined {
+  const patterns = [
+    "No conversation found",
+    "Could not find session",
+    "Session not found",
+    "Unable to resume",
+    "Failed to resume",
+  ];
+  const hit = patterns.find((p) => snap.includes(p));
+  return hit ? `claude resume/fork failed (${hit}): ${snap.slice(-400)}` : undefined;
+}
+
 export function tuiInputReady(snap: string): boolean {
   if (
     snap.includes("Quick safety check") ||
@@ -207,7 +220,7 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
         "--cwd",
         cwd,
         "--label",
-        "claude-tui",
+        HERDR_WORKSPACE_LABEL,
         "--no-focus",
         // herdr `pane run` types into the pane shell. Mini's login zsh hits an
         // interactive compinit prompt; /bin/sh does not.
@@ -242,6 +255,8 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
       let lastSnap = "";
       while (Date.now() < deadline) {
         lastSnap = readReady();
+        const resumeErr = tuiResumeFailed(lastSnap);
+        if (resumeErr) throw new Error(`herdr-backend: ${resumeErr}`);
         if (tuiInputReady(lastSnap)) break;
         if (!dismissedTheme && (lastSnap.includes("Let's get started") || lastSnap.includes("Choose the text style"))) {
           try { herdr("pane", "send-keys", paneId, "enter"); } catch { /* pane gone */ }

@@ -5,9 +5,14 @@ import type { EngineTerminal } from "../src/terminal-backend.js";
 const SOURCE = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const FORK = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-test("resume falls back to a fresh claude if the source session is missing", () => {
+test("resume keeps the same session id and does not spawn a fresh claude", () => {
   const [, cmd] = buildResumeArgv(SOURCE);
-  expect(cmd).toBe(`claude --resume "${SOURCE}" || exec claude`);
+  expect(cmd).toBe(`exec claude --resume "${SOURCE}"`);
+  expect(cmd).not.toContain("||");
+});
+
+test("resume rejects a session id that is not a UUID", () => {
+  expect(() => buildResumeArgv("not-a-uuid")).toThrow(/not a UUID/);
 });
 
 test("fork resumes the source session under a new session id", () => {

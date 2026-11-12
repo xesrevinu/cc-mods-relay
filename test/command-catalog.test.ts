@@ -9,7 +9,14 @@ function names(commands: readonly { name: string }[]): string[] {
 }
 
 test("ACP builtins are session config plus usage and context", () => {
-  expect(names(BUILTIN_COMMANDS).sort()).toEqual(["context", "effort", "fast", "model", "usage"]);
+  expect(names(BUILTIN_COMMANDS).sort()).toEqual([
+    "context",
+    "effort",
+    "fast",
+    "model",
+    "rename",
+    "usage",
+  ]);
   expect(BUILTIN_COMMANDS.find((c) => c.name === "effort")?.input?.hint).toContain("low");
   for (const name of [
     "compact",

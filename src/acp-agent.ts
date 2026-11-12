@@ -37,6 +37,8 @@ import {
   DeleteSessionResponse,
   LogoutRequest,
   LogoutResponse,
+  SetSessionTitleRequest,
+  SetSessionTitleResponse,
   TerminalHandle,
   TerminalOutputResponse,
   WriteTextFileRequest,
@@ -52,6 +54,7 @@ import {
   deleteSession,
   getSessionInfo,
   listSessions,
+  renameSession,
   ModelInfo,
   Options,
   PermissionMode,
@@ -89,7 +92,7 @@ import { createSessionEngine, spawnResumePty, SessionEngine } from "./engine-lif
 import type { SessionWatcher } from "./engine-lifecycle.js";
 import { createJsonlWatcher } from "./engine-watcher.js";
 import type { JsonlWatcher, GetMessages, SessionMessage } from "./engine-watcher.js";
-import { resolveWatchTarget } from "./jsonl.js";
+import { findTranscript, readFileTail, resolveWatchTarget } from "./jsonl.js";
 import type { LocateOptions } from "./jsonl.js";
 import { linearizeTurns, readOrderedMessages, defaultGetMessages } from "./linearize.js";
 import { createDiffEnrichedReader } from "./diff-enriched-reader.js";
@@ -97,6 +100,17 @@ import { backgroundTaskEnds, type BackgroundTaskEnd } from "./background-task-en
 import { readTranscriptPermissionMode } from "./resumed-permission-mode.js";
 import type { DiffEnrichedReaderOptions } from "./diff-enriched-reader.js";
 import { withPrecompactHistory, type PrecompactHistoryOptions } from "./compacted-history.js";
+import {
+  clientSupportsCompaction,
+  compactEventFromMessage,
+  compactPercentage,
+  grokAutoCompactCancelled,
+  grokAutoCompactCompleted,
+  grokAutoCompactStarted,
+  grokCompactionSummary,
+  isCompactSummaryMessage,
+  type CompactEvent,
+} from "./compaction.js";
 import {
   sourceSubagentRows,
   defaultListSubagents,
@@ -124,6 +138,12 @@ import {
   type UsageCarrier,
 } from "./usage.js";
 import { dispatchSlash, isAdvertisedSlash, parseSlashPrompt, type SlashSessionView } from "./slash.js";
+import { fetchPlanUsage, type PlanUsageSource, type PlanUsageView } from "./plan-usage.js";
+import {
+  grokContextFromSnapshot,
+  scanContextUsageFromJsonl,
+  type ContextUsageSnapshot,
+} from "./context-info.js";
 import { createTurnResolver } from "./end-of-turn.js";
 import type { DetectorSchedule, EndOfTurnDetector } from "./end-of-turn.js";
 import { parseCcModsRelayMeta, sendPrompt, type CcModsRelayFlags } from "./engine-pty.js";
@@ -177,6 +197,13 @@ import {
 
 import { materializeImage, cleanupMaterializedImages } from "./image-input.js";
 import { deleteSessionIfStored } from "./session-delete.js";
+import {
+  extraFlagsWithModel,
+  parseSessionCreateMeta,
+  withDeniedAskUserQuestion,
+} from "./session-create-meta.js";
+
+export { permissionModeFromClientMeta } from "./session-create-meta.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -198,6 +225,81 @@ function isoLastModified(lastModified: number | undefined): string | undefined {
   if (lastModified === undefined || !Number.isFinite(lastModified)) return undefined;
   const at = new Date(lastModified);
   return Number.isNaN(at.getTime()) ? undefined : at.toISOString();
+}
+
+export type GrokSessionRenameParams = {
+  sessionId: string;
+  title: string;
+  cwd?: string;
+  resetToAuto?: boolean;
+};
+
+export function parseGrokSessionRename(params: unknown): GrokSessionRenameParams {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "session rename params required");
+  }
+  const p = params as Record<string, unknown>;
+  const sessionId =
+    (typeof p.sessionId === "string" && p.sessionId) ||
+    (typeof p.session_id === "string" && p.session_id) ||
+    "";
+  const title =
+    (typeof p.title === "string" && p.title) ||
+    (typeof p.name === "string" && p.name) ||
+    "";
+  const cwd = typeof p.cwd === "string" ? p.cwd : undefined;
+  const resetToAuto = p.resetToAuto === true || p.reset_to_auto === true;
+  return { sessionId, title, cwd, resetToAuto };
+}
+
+export type GrokSessionIdParams = { sessionId: string };
+
+export type GrokInterjectParams = {
+  sessionId: string;
+  text: string;
+  interjectionId?: string;
+  content?: PromptRequest["prompt"];
+};
+
+export function parseGrokInterject(params: unknown): GrokInterjectParams {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "interject params required");
+  }
+  const p = params as Record<string, unknown>;
+  const sessionId =
+    (typeof p.sessionId === "string" && p.sessionId) ||
+    (typeof p.session_id === "string" && p.session_id) ||
+    "";
+  if (!sessionId) throw RequestError.invalidParams(undefined, "sessionId is required");
+  const text =
+    (typeof p.text === "string" && p.text) ||
+    (typeof p.message === "string" && p.message) ||
+    "";
+  const interjectionId =
+    (typeof p.interjectionId === "string" && p.interjectionId) ||
+    (typeof p.interjection_id === "string" && p.interjection_id) ||
+    undefined;
+  const content = Array.isArray(p.content) ? (p.content as PromptRequest["prompt"]) : undefined;
+  return { sessionId, text, interjectionId, content };
+}
+
+export function parseGrokSessionId(params: unknown): GrokSessionIdParams {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "sessionId is required");
+  }
+  const p = params as Record<string, unknown>;
+  const sessionId =
+    (typeof p.sessionId === "string" && p.sessionId) ||
+    (typeof p.session_id === "string" && p.session_id) ||
+    "";
+  if (!sessionId) throw RequestError.invalidParams(undefined, "sessionId is required");
+  return { sessionId };
+}
+
+const USD_TICKS_PER_USD = 10_000_000_000;
+
+function grokExtSuccess<T>(result: T): { result: T } {
+  return { result };
 }
 
 export interface Logger {
@@ -263,11 +365,26 @@ type Session = {
   gate?: SessionGate;
   subagentWatcher?: SubagentWatcher;
   lastMessages?: SessionMessage[];
+  lastContextSnapshot?: ContextUsageSnapshot;
   turnTempImagePaths?: string[];
   liveFromMod?: boolean;
   modTools?: Map<string, { tool: string; input: Record<string, unknown> }>;
   /** ACP client `PromptRequest._meta.promptId`, echoed on `session/update`. */
   currentPromptId?: string;
+  /** Source session id when this session was created by `session/fork`. */
+  forkedFrom?: string;
+  /** Replayable parent turns the child JSONL is expected to inherit. */
+  forkInheritCount?: number;
+  /** How this live session was created. Unused `new` sessions are discarded on close/exit. */
+  origin: "new" | "resume" | "fork";
+  /** True once the ACP client sent `session/prompt` (including slash commands). */
+  hadUserPrompt: boolean;
+  /** JSONL uuids already projected as compaction UI. */
+  emittedCompaction?: Set<string>;
+  compactionLive?: { id: string; tokensBefore?: number; startedAt: number };
+  /** Mid-turn `x.ai/interject` texts to skip as duplicate user_message_chunk. */
+  pendingInterjectTexts?: string[];
+  permissionAbort?: AbortController;
 };
 
 export interface StartedEngine {
@@ -396,8 +513,24 @@ export interface AgentDeps {
   ) => Promise<{ summary: string; lastModified?: number } | undefined>;
   listStoredSessions?: (opts: { dir?: string }) => Promise<StoredSessionInfo[]>;
   deleteStoredSession?: (sessionId: string) => Promise<void>;
+  renameStoredSession?: (
+    sessionId: string,
+    title: string,
+    options?: { dir?: string },
+  ) => Promise<void>;
   fastModeProbe?: FastModeProbe;
   modelCatalogSource?: SupportedModelsSource;
+  getPlanUsage?: PlanUsageSource;
+  /** How long `session/load` waits for a forked child JSONL to inherit parent turns. */
+  forkHistoryWaitMs?: number;
+}
+
+async function defaultGetPlanUsage(): Promise<PlanUsageView | undefined> {
+  try {
+    return await fetchPlanUsage();
+  } catch {
+    return undefined;
+  }
 }
 
 export async function defaultStartEngine(args: StartEngineArgs): Promise<StartedEngine> {
@@ -536,7 +669,7 @@ export async function defaultStartEngine(args: StartEngineArgs): Promise<Started
     baseEnv: args.baseEnv,
     sessions: args.sessions,
     spawn: args.spawn,
-    sessionId: args.inPlaceRespawn ? args.sessionId : undefined,
+    sessionId: args.sessionId,
     permissionMode: args.permissionMode,
     effortLevel: args.effortLevel,
     agent: args.agent,
@@ -603,6 +736,25 @@ function computeSessionFingerprint(params: {
   return JSON.stringify({ cwd: params.cwd, mcpServers: servers, additionalDirectories: dirs });
 }
 
+function sessionMatchesCwd(
+  clientCwd: string,
+  tuiCwd: string | undefined,
+  ...candidates: Array<string | undefined>
+): boolean {
+  return candidates.some((cwd) => cwd === clientCwd || (tuiCwd !== undefined && cwd === tuiCwd));
+}
+
+function listedSessionCwd(
+  clientCwd: string | undefined,
+  tuiCwd: string | undefined,
+  storedCwd: string | undefined,
+): string | undefined {
+  if (clientCwd && (!storedCwd || storedCwd === clientCwd || storedCwd === tuiCwd)) {
+    return clientCwd;
+  }
+  return storedCwd;
+}
+
 type BackgroundTerminal =
   | {
       handle: EngineTerminal;
@@ -632,6 +784,12 @@ export type NewSessionMeta = {
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
   };
   additionalRoots?: string[];
+  yoloMode?: boolean;
+  autoMode?: boolean;
+  modelId?: string;
+  sessionId?: string;
+  askUserQuestion?: boolean;
+  agentProfile?: string;
 };
 
 type GatewayAuthMeta = {
@@ -736,10 +894,28 @@ const REPLAY_HIDDEN_COMMANDS = new Set([
   "/status",
   "/effort",
   "/fast",
+  "/context",
 ]);
 
 /** Local TUI commands whose stdout is useful in an ACP client. */
-const ACP_STATUS_COMMANDS = new Set(["/usage", "/context"]);
+const ACP_STATUS_COMMANDS = new Set(["/usage"]);
+
+const FORK_HISTORY_WAIT_MS = 8_000;
+const FORK_HISTORY_POLL_MS = 80;
+
+function replayableTurnCount(messages: SessionMessage[]): number {
+  return linearizeTurns(messages).length;
+}
+
+function sessionOrigin(opts: { resume?: string; forkSession?: boolean }): "new" | "resume" | "fork" {
+  if (opts.forkSession) return "fork";
+  if (opts.resume) return "resume";
+  return "new";
+}
+
+function isUnusedBlankSession(session: Session): boolean {
+  return session.origin === "new" && !session.hadUserPrompt && !session.lastEmittedTitle;
+}
 
 const LOCAL_COMMAND_MARKERS = [
   "command-name",
@@ -880,11 +1056,15 @@ const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
   manual: "default",
+  ask: "default",
   acceptedits: "acceptEdits",
   dontask: "dontAsk",
   plan: "plan",
   bypasspermissions: "bypassPermissions",
   bypass: "bypassPermissions",
+  "always-approve": "bypassPermissions",
+  alwaysapprove: "bypassPermissions",
+  yolo: "bypassPermissions",
 };
 
 export function resolvePermissionMode(
@@ -1032,6 +1212,7 @@ export interface AcpClient {
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>;
   writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
   createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse>;
+  extNotify?(method: string, params: unknown): Promise<void>;
 }
 
 export class ClientConnection implements AcpClient {
@@ -1055,6 +1236,10 @@ export class ClientConnection implements AcpClient {
 
   createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
     return this.ctx.request(methods.client.elicitation.create, params);
+  }
+
+  extNotify(method: string, params: unknown): Promise<void> {
+    return this.ctx.notify(method, params);
   }
 }
 
@@ -1089,8 +1274,16 @@ export class ClaudeAcpAgent {
   ) => Promise<{ summary: string; lastModified?: number } | undefined>;
   private readonly listStoredSessions: (opts: { dir?: string }) => Promise<StoredSessionInfo[]>;
   private readonly deleteStoredSession: (sessionId: string) => Promise<void>;
+  private readonly renameStoredSession: (
+    sessionId: string,
+    title: string,
+    options?: { dir?: string },
+  ) => Promise<void>;
   private readonly fastModeProbe: FastModeProbe;
   private readonly modelCatalogSource: SupportedModelsSource | undefined;
+  private readonly getPlanUsage: PlanUsageSource;
+  private readonly locateTranscriptFiles: (sessionId: string) => string[];
+  private readonly forkHistoryWaitMs: number;
   private readonly engines: Map<string, SessionEngine> = new Map();
   private readonly unsubMod: () => void;
 
@@ -1106,6 +1299,9 @@ export class ClaudeAcpAgent {
     this.startEngine = deps.startEngine ?? defaultStartEngine;
     this.fastModeProbe = deps.fastModeProbe ?? defaultFastModeProbe;
     this.modelCatalogSource = deps.modelCatalogSource;
+    this.getPlanUsage = deps.getPlanUsage ?? defaultGetPlanUsage;
+    this.locateTranscriptFiles = deps.findTranscript ?? findTranscript;
+    this.forkHistoryWaitMs = deps.forkHistoryWaitMs ?? FORK_HISTORY_WAIT_MS;
     this.getMessages =
       (deps.liveDiff ?? false)
         ? createDiffEnrichedReader(deps.getMessages ?? defaultGetMessages, {
@@ -1139,6 +1335,8 @@ export class ClaudeAcpAgent {
     this.listStoredSessions = deps.listStoredSessions ?? ((opts) => listSessions(opts));
     this.deleteStoredSession =
       deps.deleteStoredSession ?? ((sessionId) => deleteSessionIfStored(sessionId, deleteSession));
+    this.renameStoredSession =
+      deps.renameStoredSession ?? ((sessionId, title, options) => renameSession(sessionId, title, options));
     this.unsubMod = onModEvent((event) => {
       void this.handleModEvent(event).catch((error) => this.logger.error("[mod-live]", error));
     });
@@ -1151,7 +1349,22 @@ export class ClaudeAcpAgent {
       readTextFile: (p) => client.readTextFile(p),
       writeTextFile: (p) => client.writeTextFile(p),
       createElicitation: (p) => client.createElicitation(p),
+      extNotify: client.extNotify
+        ? (method, params) => client.extNotify!(method, params)
+        : undefined,
     };
+  }
+
+  /** Host TUI cwd for an ACP client cwd. Session JSONL is keyed by this path. */
+  private tuiCwdFor(clientCwd: string): string {
+    const pluginDir = process.env.CC_MODS_PLUGIN_DIR;
+    return resolveTuiCwd(
+      clientCwd,
+      workspaceOnClient({
+        fs: this.clientCapabilities?.fs,
+        environmentFile: Boolean(pluginDir && existsSync(path.join(pluginDir, ENVIRONMENT_FILE))),
+      }),
+    );
   }
 
   private stampAndForwardSessionUpdate(
@@ -1301,11 +1514,12 @@ export class ClaudeAcpAgent {
           fork: {},
           list: {},
           resume: {},
+          title: {},
         },
       },
       agentInfo: {
-        name: packageJson.name,
-        title: "Claude Agent TUI",
+        name: "claude",
+        title: "Claude",
         version: packageJson.version,
       },
       authMethods: [
@@ -1327,8 +1541,11 @@ export class ClaudeAcpAgent {
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     const source = this.sessions[params.sessionId];
-    const cwd = params.cwd || source?.cwd;
+    const cwd = params.cwd || source?.clientCwd || source?.cwd;
     if (!cwd) {
+      throw RequestError.resourceNotFound(params.sessionId);
+    }
+    if (!source && !(await this.storedSessionExists(params.sessionId, cwd))) {
       throw RequestError.resourceNotFound(params.sessionId);
     }
     const response = await this.createSession(
@@ -1343,6 +1560,17 @@ export class ClaudeAcpAgent {
         forkSession: true,
       },
     );
+    const child = this.sessions[response.sessionId];
+    if (child) {
+      child.forkedFrom = params.sessionId;
+      try {
+        const parentMessages = await this.readSessionMessages(params.sessionId, child.cwd);
+        child.forkInheritCount = replayableTurnCount(parentMessages);
+        if (source) source.lastMessages = parentMessages;
+      } catch (error) {
+        this.logger.error("[acp-agent] fork parent history lookup failed:", error);
+      }
+    }
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
     }, 0);
@@ -1351,6 +1579,10 @@ export class ClaudeAcpAgent {
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     const result = await this.getOrCreateSession(params);
+    const session = this.sessions[params.sessionId];
+    if (session && session.emitted.size === 0 && session.forkedFrom) {
+      await this.replaySessionHistory(params.sessionId);
+    }
 
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
@@ -1361,7 +1593,7 @@ export class ClaudeAcpAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const result = await this.getOrCreateSession(params, { replayOnly: true });
 
-    await this.replaySessionHistory(params.sessionId);
+    await this.replaySessionHistory(params.sessionId, { force: true });
 
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
@@ -1372,10 +1604,13 @@ export class ClaudeAcpAgent {
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     const cwdFilter = params.cwd ?? undefined;
+    const tuiCwd = cwdFilter ? this.tuiCwdFor(cwdFilter) : undefined;
     const byId = new Map<string, ListSessionsResponse["sessions"][number]>();
 
     for (const [sessionId, session] of Object.entries(this.sessions)) {
-      if (cwdFilter && session.clientCwd !== cwdFilter && session.cwd !== cwdFilter) continue;
+      if (cwdFilter && !sessionMatchesCwd(cwdFilter, tuiCwd, session.clientCwd, session.cwd)) {
+        continue;
+      }
       byId.set(sessionId, {
         sessionId,
         cwd: session.clientCwd || session.cwd,
@@ -1388,22 +1623,34 @@ export class ClaudeAcpAgent {
     }
 
     try {
-      const stored = await this.listStoredSessions({ dir: cwdFilter });
-      for (const session of stored) {
-        if (!session.cwd) continue;
-        if (cwdFilter && session.cwd !== cwdFilter) continue;
-        const existing = byId.get(session.sessionId);
-        const title = session.summary ? sanitizeTitle(session.summary) : undefined;
-        if (existing) {
-          if (!existing.title && title) existing.title = title;
-          continue;
+      const dirs = new Set<string | undefined>();
+      if (cwdFilter) {
+        dirs.add(tuiCwd);
+        dirs.add(cwdFilter);
+      } else {
+        dirs.add(undefined);
+      }
+      for (const dir of dirs) {
+        const stored = await this.listStoredSessions({ dir });
+        for (const session of stored) {
+          if (cwdFilter && session.cwd && !sessionMatchesCwd(cwdFilter, tuiCwd, session.cwd)) {
+            continue;
+          }
+          const listedCwd = listedSessionCwd(cwdFilter, tuiCwd, session.cwd);
+          if (!listedCwd) continue;
+          const existing = byId.get(session.sessionId);
+          const title = session.summary ? sanitizeTitle(session.summary) : undefined;
+          if (existing) {
+            if (!existing.title && title) existing.title = title;
+            continue;
+          }
+          byId.set(session.sessionId, {
+            sessionId: session.sessionId,
+            cwd: listedCwd,
+            ...(title ? { title } : {}),
+            updatedAt: new Date(session.lastModified).toISOString(),
+          });
         }
-        byId.set(session.sessionId, {
-          sessionId: session.sessionId,
-          cwd: session.cwd,
-          ...(title ? { title } : {}),
-          updatedAt: new Date(session.lastModified).toISOString(),
-        });
       }
     } catch (err) {
       this.logger.error("[acp-agent] listSessions stored lookup failed:", err);
@@ -1441,6 +1688,8 @@ export class ClaudeAcpAgent {
       );
     }
 
+    sessionRecord.hadUserPrompt = true;
+    sessionRecord.cancelled = false;
     sessionRecord.currentPromptId = promptIdFromMeta(params._meta);
     try {
       return await this.runPrompt(params, sessionRecord);
@@ -1536,13 +1785,46 @@ export class ClaudeAcpAgent {
     };
   }
 
+  private async loadPlanUsage(): Promise<PlanUsageView | undefined> {
+    try {
+      return await this.getPlanUsage();
+    } catch (error) {
+      this.logger.error("[acp-agent] plan usage fetch failed:", error);
+      return undefined;
+    }
+  }
+
   private async replyToSlash(
     sessionId: string,
     session: Session,
     name: string,
     args: string,
   ): Promise<PromptResponse> {
-    const result = dispatchSlash(name, args, this.slashView(session));
+    const view = this.slashView(session);
+    if (name === "usage") view.plan = await this.loadPlanUsage();
+    const result = dispatchSlash(name, args, view);
+    if (result.kind === "rename") {
+      try {
+        const title = await this.applySessionTitle(sessionId, result.title);
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `renamed: ${title}` },
+          },
+        });
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text },
+          },
+        });
+      }
+      return { stopReason: "end_turn" };
+    }
     if (result.kind === "config") {
       try {
         await this.setSessionConfigOption({
@@ -1615,6 +1897,22 @@ export class ClaudeAcpAgent {
     const hadInFlightTurn = sessionRecord.turnCancel !== undefined;
     sessionRecord.cancelled = true;
     sessionRecord.turnCancel?.();
+    sessionRecord.permissionAbort?.abort();
+
+    if (sessionRecord.compactionLive) {
+      await this.publishGrokExt(grokAutoCompactCancelled(params.sessionId));
+      if (clientSupportsCompaction(this.clientCapabilities)) {
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "compaction_update",
+            compactionId: sessionRecord.compactionLive.id,
+            status: "cancelled",
+          },
+        });
+      }
+      sessionRecord.compactionLive = undefined;
+    }
 
     if (!hadInFlightTurn) {
       return;
@@ -1666,14 +1964,154 @@ export class ClaudeAcpAgent {
   async dispose(): Promise<void> {
     this.unsubMod();
     this.gatewayAuthRequest = undefined;
+    const unused = Object.entries(this.sessions)
+      .filter(([, session]) => isUnusedBlankSession(session))
+      .map(([sessionId]) => sessionId);
     await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
+    await Promise.all(unused.map((sessionId) => this.deleteStoredSession(sessionId)));
+  }
+
+  async setSessionTitle(params: SetSessionTitleRequest): Promise<SetSessionTitleResponse> {
+    const session = this.sessions[params.sessionId];
+    const title = await this.applySessionTitle(params.sessionId, params.title, {
+      dir: session?.cwd,
+    });
+    return { title };
+  }
+
+  async handleGrokSessionRename(params: GrokSessionRenameParams): Promise<Record<string, never>> {
+    if (params.resetToAuto) {
+      throw RequestError.invalidParams(undefined, "resetToAuto is not supported");
+    }
+    if (!params.sessionId) {
+      throw RequestError.invalidParams(undefined, "sessionId is required");
+    }
+    const session = this.sessions[params.sessionId];
+    const dir = session?.cwd ?? (params.cwd ? this.tuiCwdFor(params.cwd) : undefined);
+    await this.applySessionTitle(params.sessionId, params.title, { dir });
+    return {};
+  }
+
+  async handleGrokInterject(params: GrokInterjectParams): Promise<{ result: { status: string } }> {
+    const session = this.sessions[params.sessionId];
+    if (!session) throw RequestError.resourceNotFound(params.sessionId);
+    if (!session.turnDetector && !session.turnCancel) {
+      throw RequestError.invalidParams(undefined, "no turn in progress");
+    }
+    if (session.engine?.isDisposed) {
+      throw RequestError.invalidParams(undefined, "session engine disposed");
+    }
+
+    const turnTemp = session.turnTempImagePaths ?? [];
+    session.turnTempImagePaths = turnTemp;
+    const promptBlocks: PromptRequest["prompt"] =
+      params.content && params.content.length > 0
+        ? params.content
+        : [{ type: "text", text: params.text }];
+    const outgoing = promptToClaude(
+      { sessionId: params.sessionId, prompt: promptBlocks },
+      this.logger,
+      turnTemp,
+    );
+    if (!outgoing.trim()) {
+      throw RequestError.invalidParams(undefined, "interject text is required");
+    }
+
+    session.pendingInterjectTexts ??= [];
+    session.pendingInterjectTexts.push(outgoing);
+    sendPrompt(session.pty, outgoing, this.schedule);
+    return grokExtSuccess({ status: "queued" });
+  }
+
+  async handleGrokSessionInfo(params: GrokSessionIdParams): Promise<{ result: Record<string, unknown> }> {
+    const session = this.sessions[params.sessionId];
+    if (!session) throw RequestError.resourceNotFound(params.sessionId);
+    await this.refreshContextSnapshot(params.sessionId, session);
+    const model = this.currentModel(session);
+    const modelDisplayName =
+      session.modelInfos.find((info) => info.value === model)?.displayName ?? model;
+    return grokExtSuccess(grokSessionInfo(params.sessionId, session, model, modelDisplayName));
+  }
+
+  private async refreshContextSnapshot(sessionId: string, session: Session): Promise<void> {
+    const existing = this.lookupContextSnapshot(sessionId, session);
+    if (existing) this.applyContextSnapshot(session, existing);
+    if (!session.engine || session.engine.isDisposed) return;
+    if (session.turnDetector) return;
+    const beforeKey = existing ? JSON.stringify(existing) : "";
+    sendPrompt(session.pty, "/context", this.schedule);
+    const deadline = Date.now() + (existing ? 1_500 : 8_000);
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => this.schedule(resolve, 80));
+      const snap = latestContextUsageFromTranscript(sessionId);
+      if (snap && JSON.stringify(snap) !== beforeKey) {
+        this.applyContextSnapshot(session, snap);
+        return;
+      }
+    }
+  }
+
+  private lookupContextSnapshot(
+    sessionId: string,
+    session: Session,
+  ): ContextUsageSnapshot | undefined {
+    return (
+      session.lastContextSnapshot ??
+      (latestContextUsage(session.lastMessages) as ContextUsageSnapshot | undefined) ??
+      latestContextUsageFromTranscript(sessionId)
+    );
+  }
+
+  private applyContextSnapshot(session: Session, snap: ContextUsageSnapshot): void {
+    session.lastContextSnapshot = snap;
+    const used = typeof snap.total_tokens === "number" ? snap.total_tokens : undefined;
+    if (typeof used === "number" && used > 0) session.lastContextUsed = used;
+    const size = typeof snap.raw_max_tokens === "number" ? snap.raw_max_tokens : undefined;
+    if (typeof size === "number" && size > 0) session.contextWindowSize = size;
+  }
+
+  async handleGrokSessionUsage(params: GrokSessionIdParams): Promise<{ usage: Record<string, unknown> }> {
+    const session = this.sessions[params.sessionId];
+    if (!session) throw RequestError.resourceNotFound(params.sessionId);
+    return { usage: grokPromptUsage(session) };
+  }
+
+  private async applySessionTitle(
+    sessionId: string,
+    rawTitle: string,
+    options?: { dir?: string },
+  ): Promise<string> {
+    const title = sanitizeTitle(rawTitle);
+    if (!title) {
+      throw RequestError.invalidParams(undefined, "title must not be blank");
+    }
+    const session = this.sessions[sessionId];
+    try {
+      await this.renameStoredSession(sessionId, title, options?.dir ? { dir: options.dir } : undefined);
+    } catch (error) {
+      if (!session) {
+        throw RequestError.resourceNotFound(sessionId);
+      }
+      this.logger.error("[acp-agent] renameSession persist failed:", error);
+    }
+    if (session && title !== session.lastEmittedTitle) {
+      session.lastEmittedTitle = title;
+      await this.client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: "session_info_update", title },
+      });
+    }
+    return title;
   }
 
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
+    const discard = isUnusedBlankSession(session);
     await this.teardownSession(params.sessionId);
+    if (discard) await this.deleteStoredSession(params.sessionId);
     return {};
   }
 
@@ -2005,7 +2443,7 @@ export class ClaudeAcpAgent {
         mcpConfigFile: session.mcpConfigFile,
         disallowedTools: session.disallowedTools,
         appendSystemPromptFile: session.appendSystemPromptFile,
-        extraFlags: this.relayFlags,
+        extraFlags: extraFlagsWithModel(this.relayFlags, this.currentModel(session)),
         additionalDirectories: workspaceOnClient({
           fs: this.clientCapabilities?.fs,
           environmentFile: Boolean(process.env.CC_MODS_PLUGIN_DIR && existsSync(path.join(process.env.CC_MODS_PLUGIN_DIR, ENVIRONMENT_FILE))),
@@ -2250,15 +2688,58 @@ export class ClaudeAcpAgent {
     });
   }
 
-  private async replaySessionHistory(sessionId: string): Promise<void> {
-    const session = this.sessions[sessionId];
-    if (!session) return;
-    const messages = await withPrecompactHistory(
+  private async readSessionMessages(sessionId: string, dir: string | undefined): Promise<SessionMessage[]> {
+    return withPrecompactHistory(
       sessionId,
-      await readOrderedMessages(sessionId, session.cwd, { getMessages: this.getMessages }),
+      await readOrderedMessages(sessionId, dir, { getMessages: this.getMessages }),
       this.precompactOptions,
     );
+  }
 
+  private async wait(ms: number): Promise<void> {
+    if (ms <= 0) return;
+    await new Promise<void>((resolve) => this.schedule(resolve, ms));
+  }
+
+  private async readReplayMessages(sessionId: string, session: Session): Promise<SessionMessage[]> {
+    let messages = await this.readSessionMessages(sessionId, session.cwd);
+    if (!session.forkedFrom) return messages;
+
+    const needed = session.forkInheritCount ?? 0;
+    if (needed > 0 && replayableTurnCount(messages) < needed && this.forkHistoryWaitMs > 0) {
+      const deadline = Date.now() + this.forkHistoryWaitMs;
+      while (Date.now() < deadline && replayableTurnCount(messages) < needed) {
+        await this.wait(FORK_HISTORY_POLL_MS);
+        messages = await this.readSessionMessages(sessionId, session.cwd);
+      }
+    }
+
+    if (replayableTurnCount(messages) > 0) return messages;
+
+    const parent = this.sessions[session.forkedFrom];
+    if (parent?.lastMessages && replayableTurnCount(parent.lastMessages) > 0) {
+      return withPrecompactHistory(session.forkedFrom, parent.lastMessages, this.precompactOptions);
+    }
+    try {
+      return await this.readSessionMessages(session.forkedFrom, session.cwd);
+    } catch (error) {
+      this.logger.error("[acp-agent] fork history fallback failed:", error);
+      return messages;
+    }
+  }
+
+  private async replaySessionHistory(
+    sessionId: string,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    if (opts.force) {
+      session.emitted.clear();
+      session.emittedNested.clear();
+    }
+    const messages = await this.readReplayMessages(sessionId, session);
+    session.lastMessages = messages;
     await this.emitLinearizedWithNested(sessionId, session, messages);
   }
 
@@ -2269,9 +2750,13 @@ export class ClaudeAcpAgent {
     live: boolean = false,
   ): Promise<void> {
     const session = this.sessions[sessionId];
+    if (isCompactSummaryMessage(turn.message)) return;
     const source = turn.message as { message?: { role?: string; content?: unknown } };
     let role = source.message?.role;
     let content: unknown = source.message?.content;
+    if (role === "user" && session && consumePendingInterject(session, content)) {
+      return;
+    }
     if (role === "user") {
       const status = statusCommandOutput(content);
       if (status !== null) {
@@ -2543,32 +3028,48 @@ export class ClaudeAcpAgent {
     const tool = typeof event.tool === "string" ? event.tool : "tool";
     const input = (event.input && typeof event.input === "object" ? event.input : {}) as Record<string, unknown>;
     const toolCallId = typeof event.toolUseId === "string" ? event.toolUseId : requestId;
-    const info = toolInfoFromToolUse({ id: toolCallId, name: tool, input }, false, this.sessions[sessionId]?.cwd);
+    const session = this.sessions[sessionId];
+    const info = toolInfoFromToolUse({ id: toolCallId, name: tool, input }, false, session?.cwd);
     let decision: PermissionDecision = "reject";
+    if (!session) {
+      answerPermission(requestId, decision);
+      return;
+    }
+    const abort = new AbortController();
+    session.permissionAbort = abort;
     try {
-      const res = await this.client.requestPermission({
-        sessionId,
-        toolCall: {
-          toolCallId,
-          title: info.title,
-          kind: info.kind,
-          rawInput: input,
-        },
-        options: [
-          { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-          { optionId: "allow-with-updates", name: "Always allow", kind: "allow_always" },
-          { optionId: "reject", name: "Reject", kind: "reject_once" },
-        ],
-      });
-      const optionId = res.outcome.outcome === "selected" ? res.outcome.optionId : undefined;
-      decision =
-        optionId === "allow-once" || optionId === "allow"
-          ? "allow_once"
-          : optionId === "allow-with-updates"
-            ? "allow_with_updates"
-            : "reject";
+      if (abort.signal.aborted) {
+        decision = "reject";
+      } else {
+        const res = await Promise.race([
+          this.client.requestPermission({
+            sessionId,
+            toolCall: {
+              toolCallId,
+              title: info.title,
+              kind: info.kind,
+              rawInput: input,
+            },
+            options: [
+              { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+              { optionId: "allow-with-updates", name: "Always allow", kind: "allow_always" },
+              { optionId: "reject", name: "Reject", kind: "reject_once" },
+            ],
+          }),
+          abortedPermission(abort.signal),
+        ]);
+        const optionId = res.outcome.outcome === "selected" ? res.outcome.optionId : undefined;
+        decision =
+          optionId === "allow-once" || optionId === "allow"
+            ? "allow_once"
+            : optionId === "allow-with-updates"
+              ? "allow_with_updates"
+              : "reject";
+      }
     } catch (err) {
       this.logger.error("[mod-live] request_permission failed:", err);
+    } finally {
+      if (session.permissionAbort === abort) session.permissionAbort = undefined;
     }
     answerPermission(requestId, decision);
   }
@@ -2609,6 +3110,7 @@ export class ClaudeAcpAgent {
       session.detectorCursor = messages.length;
       for (const m of fed) registerGateToolUses(m, session.gate);
       session.lastMessages = messages;
+      await this.emitCompactionSignals(sessionId, session, messages, true);
       return;
     }
 
@@ -2726,6 +3228,111 @@ export class ClaudeAcpAgent {
     }
   }
 
+  private async emitCompactionSignals(
+    sessionId: string,
+    session: Session,
+    messages: SessionMessage[],
+    live: boolean,
+  ): Promise<void> {
+    session.emittedCompaction ??= new Set();
+    for (const message of messages) {
+      const event = compactEventFromMessage(message);
+      if (!event) continue;
+      if (session.emittedCompaction.has(event.uuid)) continue;
+      session.emittedCompaction.add(event.uuid);
+      await this.publishCompactEvent(sessionId, session, event, live);
+    }
+  }
+
+  private async publishCompactEvent(
+    sessionId: string,
+    session: Session,
+    event: CompactEvent,
+    live: boolean,
+  ): Promise<void> {
+    const window = session.contextWindowSize || DEFAULT_CONTEXT_WINDOW;
+    if (event.kind === "boundary") {
+      const tokensUsed = event.tokensBefore ?? session.lastContextUsed;
+      const tokensAfter = event.tokensAfter ?? session.lastContextUsed;
+      const percentage = compactPercentage(tokensUsed, window);
+      session.compactionLive = {
+        id: event.uuid,
+        tokensBefore: event.tokensBefore,
+        startedAt: Date.now(),
+      };
+      if (live) {
+        await this.publishGrokExt(
+          grokAutoCompactStarted({
+            sessionId,
+            tokensUsed,
+            contextWindow: window,
+            percentage,
+            reason:
+              event.trigger === "manual"
+                ? "Manual compact"
+                : `Context window ${percentage}% full`,
+          }),
+        );
+      }
+      await this.publishGrokExt(
+        grokAutoCompactCompleted({
+          sessionId,
+          tokensBefore: event.tokensBefore,
+          tokensAfter,
+          summaryPreview: undefined,
+        }),
+      );
+      if (event.tokensAfter !== undefined) session.lastContextUsed = event.tokensAfter;
+      if (clientSupportsCompaction(this.clientCapabilities)) {
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "compaction_update",
+            compactionId: event.uuid,
+            status: live ? "in_progress" : "completed",
+          },
+        });
+      }
+      return;
+    }
+
+    const compactionId = session.compactionLive?.id ?? event.uuid;
+    const hadBoundary = session.compactionLive !== undefined;
+    session.compactionLive = undefined;
+    if (!hadBoundary) {
+      await this.publishGrokExt(
+        grokAutoCompactCompleted({
+          sessionId,
+          tokensAfter: session.lastContextUsed,
+          summaryPreview: event.text.slice(0, 100) || undefined,
+        }),
+      );
+    }
+    await this.publishGrokExt(grokCompactionSummary(sessionId, event.text));
+    if (clientSupportsCompaction(this.clientCapabilities)) {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "compaction_update",
+          compactionId,
+          status: "completed",
+          summary: [{ type: "text", text: event.text }],
+        },
+      });
+    }
+  }
+
+  private async publishGrokExt(note: {
+    method: string;
+    params: Record<string, unknown>;
+  }): Promise<void> {
+    try {
+      await this.client.extNotify?.(note.method, note.params);
+    } catch (err) {
+      this.logger.error("[acp-agent] ext notify failed:", err);
+    }
+  }
+
   private async emitLinearizedWithNested(
     sessionId: string,
     session: Session,
@@ -2738,6 +3345,8 @@ export class ClaudeAcpAgent {
       getSubagentMessages: this.getSubagentMessages,
     });
     const forLinearize = subagentRows.length ? messages.concat(subagentRows) : messages;
+
+    await this.emitCompactionSignals(sessionId, session, forLinearize, live);
 
     for (const turn of linearizeTurns(forLinearize)) {
       if (!(turn.uuid && session.emitted.has(turn.uuid))) {
@@ -2882,6 +3491,16 @@ export class ClaudeAcpAgent {
     }
   }
 
+  private async storedSessionExists(sessionId: string, cwd: string): Promise<boolean> {
+    if (this.locateTranscriptFiles(sessionId).length > 0) return true;
+    try {
+      const info = await this.getSessionInfo(sessionId, { dir: this.tuiCwdFor(cwd) });
+      return Boolean(info);
+    } catch {
+      return false;
+    }
+  }
+
   private async getOrCreateSession(
     params: {
       sessionId: string;
@@ -2895,7 +3514,7 @@ export class ClaudeAcpAgent {
     const existingSession = this.sessions[params.sessionId];
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
-      if (fingerprint === existingSession.sessionFingerprint) {
+      if (opts.replayOnly || fingerprint === existingSession.sessionFingerprint) {
         return {
           sessionId: params.sessionId,
           modes: existingSession.modes,
@@ -2990,11 +3609,27 @@ export class ClaudeAcpAgent {
     await settingsManager.initialize();
 
     const allowBypass = sessionAllowsBypass(settingsManager.getSettings().permissions);
-    const seededMode = resolvePermissionMode(
-      settingsManager.getSettings().permissions?.defaultMode,
-      this.logger,
+    const liveModelCatalog = await resolveModelCatalog(this.logger, this.modelCatalogSource);
+    const agents = this.discoverAgents(params.cwd);
+    const seed = parseSessionCreateMeta(params._meta, {
       allowBypass,
-    );
+      catalog: liveModelCatalog,
+      agents,
+    });
+    if (!isResume && !creationOpts.forkSession && seed.preferredSessionId) {
+      requestedSessionId = seed.preferredSessionId;
+    }
+    disallowedTools = withDeniedAskUserQuestion(disallowedTools, seed.denyAskUserQuestion);
+    const settingsMode = settingsManager.getSettings().permissions?.defaultMode;
+    const seededMode =
+      seed.permissionMode ??
+      (settingsMode !== undefined
+        ? resolvePermissionMode(settingsMode, this.logger, allowBypass)
+        : allowBypass
+          ? "bypassPermissions"
+          : "default");
+    const extraFlags = extraFlagsWithModel(this.relayFlags, seed.model);
+    const seededModel = seed.model ?? DEFAULT_MODEL_INFO.value;
 
     const taskState: TaskState = new Map();
 
@@ -3012,7 +3647,7 @@ export class ClaudeAcpAgent {
     let started: StartedEngine;
     try {
       started = await this.startEngine({
-        sessionId: isResume || creationOpts.forkSession ? requestedSessionId : undefined,
+        sessionId: requestedSessionId,
         cwd: tuiCwd,
         resume: isResume,
         fork: !!creationOpts.forkSession,
@@ -3026,7 +3661,8 @@ export class ClaudeAcpAgent {
         mcpConfigFile,
         disallowedTools,
         appendSystemPromptFile,
-        extraFlags: this.relayFlags,
+        extraFlags,
+        agent: seed.agent,
       });
     } catch (error) {
       settingsManager.dispose();
@@ -3036,6 +3672,10 @@ export class ClaudeAcpAgent {
       }
       if (appendSystemPromptFile) {
         await removeAppendSystemPromptFile(appendSystemPromptFile);
+      }
+      if (creationOpts.forkSession) {
+        this.logger.error("[acp-agent] fork spawn failed:", error);
+        throw error;
       }
       if (creationOpts.resume && error instanceof Error) {
         throw RequestError.resourceNotFound(creationOpts.resume);
@@ -3068,7 +3708,6 @@ export class ClaudeAcpAgent {
       started.pty.onExit(() => void boundGate.teardown());
     }
 
-    const liveModelCatalog = await resolveModelCatalog(this.logger, this.modelCatalogSource);
     const availableModes = buildAvailableModes(DEFAULT_MODEL_INFO, allowBypass);
     let currentModeId = seededMode;
     if (creationOpts.replayOnly && started.transcriptPath) {
@@ -3081,14 +3720,13 @@ export class ClaudeAcpAgent {
       currentModeId,
       availableModes,
     };
-    const agents = this.discoverAgents(params.cwd);
     const configOptions = buildConfigOptions(
       modes,
-      DEFAULT_MODEL_INFO.value,
+      seededModel,
       liveModelCatalog,
       settingsManager.getSettings().effortLevel,
       agents,
-      undefined,
+      seed.agent,
       false,
       false,
       clientSupportsBooleanConfigOptions(this.clientCapabilities),
@@ -3127,9 +3765,11 @@ export class ClaudeAcpAgent {
       agents,
       configOptions,
       contextWindowSize:
-        inferContextWindowFromModel(DEFAULT_MODEL_INFO.value) ?? DEFAULT_CONTEXT_WINDOW,
+        inferContextWindowFromModel(seededModel) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
       gate,
+      origin: sessionOrigin(creationOpts),
+      hadUserPrompt: false,
     };
 
     void this.refreshFastMode(startedSessionId, this.sessions[startedSessionId]);
@@ -3512,6 +4152,8 @@ export function toAcpNotifications(
     return [{ sessionId, update }];
   }
 
+  if (!Array.isArray(content)) return [];
+
   const toolUseResult =
     options?.toolUseResult !== undefined &&
     content.filter((c) => typeof c === "object" && c !== null && c.type === "tool_result")
@@ -3795,7 +4437,16 @@ export function runAcp(deps?: AgentDeps) {
       methods.agent.authenticate,
       async (ctx) => (await agent.authenticate(ctx.params)) ?? {},
     )
-    .onRequest(methods.agent.session.prompt, (ctx) => agent.prompt(ctx.params))
+    .onRequest(methods.agent.session.prompt, (ctx) => {
+      const abort = () => {
+        void agent.cancel({ sessionId: ctx.params.sessionId });
+      };
+      if (ctx.signal.aborted) abort();
+      else ctx.signal.addEventListener("abort", abort, { once: true });
+      return agent.prompt(ctx.params).finally(() => {
+        ctx.signal.removeEventListener("abort", abort);
+      });
+    })
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
     .onRequest(methods.agent.session.list, (ctx) => agent.listSessions(ctx.params))
@@ -3815,6 +4466,31 @@ export function runAcp(deps?: AgentDeps) {
     )
     .onRequest(methods.agent.session.setConfigOption, (ctx) =>
       agent.setSessionConfigOption(ctx.params),
+    )
+    .onRequest(methods.agent.session.setTitle, (ctx) => agent.setSessionTitle(ctx.params))
+    .onRequest("_x.ai/session/rename", parseGrokSessionRename, (ctx) =>
+      agent.handleGrokSessionRename(ctx.params),
+    )
+    .onRequest("x.ai/session/rename", parseGrokSessionRename, (ctx) =>
+      agent.handleGrokSessionRename(ctx.params),
+    )
+    .onRequest("_x.ai/session/info", parseGrokSessionId, (ctx) =>
+      agent.handleGrokSessionInfo(ctx.params),
+    )
+    .onRequest("x.ai/session/info", parseGrokSessionId, (ctx) =>
+      agent.handleGrokSessionInfo(ctx.params),
+    )
+    .onRequest("_x.ai/session/usage", parseGrokSessionId, (ctx) =>
+      agent.handleGrokSessionUsage(ctx.params),
+    )
+    .onRequest("x.ai/session/usage", parseGrokSessionId, (ctx) =>
+      agent.handleGrokSessionUsage(ctx.params),
+    )
+    .onRequest("_x.ai/interject", parseGrokInterject, (ctx) =>
+      agent.handleGrokInterject(ctx.params),
+    )
+    .onRequest("x.ai/interject", parseGrokInterject, (ctx) =>
+      agent.handleGrokInterject(ctx.params),
     )
     .onRequest(methods.agent.logout, async (ctx) => (await agent.logout(ctx.params)) ?? {})
     .connect(stream);
@@ -3856,4 +4532,104 @@ function mcpServerNames(servers: NewSessionRequest["mcpServers"] | undefined): s
     }
     return "mcp";
   });
+}
+
+function latestContextUsage(messages: SessionMessage[] | undefined): Record<string, unknown> | undefined {
+  if (!messages) return undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const value = messages[i]?.contextUsage;
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+function latestContextUsageFromTranscript(sessionId: string): ContextUsageSnapshot | undefined {
+  const matches = findTranscript(sessionId);
+  if (matches.length !== 1) return undefined;
+  return scanContextUsageFromJsonl(readFileTail(matches[0]));
+}
+
+function grokSessionInfo(
+  sessionId: string,
+  session: Session,
+  model: string,
+  modelDisplayName: string,
+): Record<string, unknown> {
+  const snapshot =
+    session.lastContextSnapshot ??
+    (latestContextUsage(session.lastMessages) as ContextUsageSnapshot | undefined);
+  const context = grokContextFromSnapshot(snapshot, {
+    used: session.lastContextUsed,
+    total: session.contextWindowSize,
+    mcpServers: mcpServerNames(session.mcpServers),
+  });
+  return {
+    sessionId,
+    cwd: session.clientCwd || session.cwd,
+    agentName: "claude",
+    model,
+    modelDisplayName,
+    resolvedModelId: model,
+    turns: context.turnCount,
+    turnIndex: context.turnCount,
+    context,
+  };
+}
+
+function abortedPermission(signal: AbortSignal): Promise<RequestPermissionResponse> {
+  return new Promise((resolve) => {
+    const settle = () => resolve({ outcome: { outcome: "cancelled" } });
+    if (signal.aborted) {
+      settle();
+      return;
+    }
+    signal.addEventListener("abort", settle, { once: true });
+  });
+}
+
+function consumePendingInterject(session: Session, content: unknown): boolean {
+  const pending = session.pendingInterjectTexts;
+  if (!pending?.length) return false;
+  const text = flattenUserText(content);
+  if (!text) return false;
+  const index = pending.findIndex(
+    (item) => item === text || text === item || text.startsWith(item) || item.startsWith(text),
+  );
+  if (index < 0) return false;
+  pending.splice(index, 1);
+  return true;
+}
+
+function flattenUserText(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const rec = block as { type?: unknown; text?: unknown };
+    if (rec.type === "text" && typeof rec.text === "string") parts.push(rec.text);
+  }
+  return parts.join("").trim();
+}
+
+function grokPromptUsage(session: Session): Record<string, unknown> {
+  const inputTokens = Math.max(0, Math.round(session.accumulatedUsage.inputTokens));
+  const outputTokens = Math.max(0, Math.round(session.accumulatedUsage.outputTokens));
+  const cachedReadTokens = Math.max(0, Math.round(session.accumulatedUsage.cachedReadTokens));
+  const cacheCreationTokens = Math.max(0, Math.round(session.accumulatedUsage.cachedWriteTokens));
+  const usage: Record<string, unknown> = {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    cachedReadTokens,
+    cacheCreationTokens,
+    modelCalls: 0,
+    numTurns: 0,
+  };
+  if (typeof session.lastCostUsd === "number" && Number.isFinite(session.lastCostUsd)) {
+    usage.costUsdTicks = Math.round(session.lastCostUsd * USD_TICKS_PER_USD);
+  }
+  return usage;
 }

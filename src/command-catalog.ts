@@ -9,15 +9,16 @@ function cmd(name: string, description: string, hint?: string): AvailableCommand
 
 /**
  * Slash commands we advertise. They are answered by the ACP agent (config
- * options, usage_update, session snapshot) — not by waiting on a TUI turn.
+ * options, usage_update, session snapshot, rename) — not by waiting on a TUI turn.
  * Project `.claude/commands` and skills are discovered separately.
  */
 export const BUILTIN_COMMANDS: readonly AvailableCommand[] = [
-  cmd("context", "Show context occupancy, model, and token buckets", "all"),
+  cmd("context", "Show context occupancy by category", "all"),
   cmd("effort", "Set thinking intensity for this session", "low|medium|high|xhigh|max|auto"),
   cmd("fast", "Toggle faster Opus output", "on|off"),
   cmd("model", "Switch the model for this session", "model"),
-  cmd("usage", "Show session cost, token buckets, and context occupancy"),
+  cmd("rename", "Rename the current session", "<title>"),
+  cmd("usage", "Show session cost, plan rate limits, and token buckets"),
 ];
 
 export interface DiscoverCommandsDeps {

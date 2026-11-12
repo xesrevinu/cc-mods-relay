@@ -12,6 +12,7 @@ import { bindModChannel, startModChannel } from "./mod-channel.js";
 import { resolveTerminalBackendName } from "./terminal-backend.js";
 import { installTuiExitHooks, reapAllTuis } from "./tui-lifetime.js";
 import { reapOrphanHerdrWorkspaces, reapOrphanPluginProcesses } from "./tui-reap.js";
+import { DEFAULT_HERDR_SESSION } from "./herdr-names.js";
 
 export async function ensureHerdr(session: string) {
   if (resolveTerminalBackendName() === "bun-pty") return;
@@ -39,7 +40,7 @@ export async function runAgent(pluginDir: string) {
   }
   const herdrSession = process.env.HERDR_ENV === "1"
     ? process.env.HERDR_SESSION || process.env.CLAUDE_TUI_HERDR_SESSION || "default"
-    : "cc-mods-relay";
+    : process.env.CLAUDE_TUI_HERDR_SESSION?.trim() || DEFAULT_HERDR_SESSION;
   process.env.CLAUDE_TUI_HERDR_SESSION = herdrSession;
   const channel = startModChannel();
   bindModChannel(channel);

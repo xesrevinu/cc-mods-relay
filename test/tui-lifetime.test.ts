@@ -1,11 +1,16 @@
 import { expect, test } from "bun:test";
 import { createBunPtySpawn } from "../src/bun-pty-backend.js";
-import { createHerdrSpawn } from "../src/herdr-backend.js";
+import { createHerdrSpawn, tuiResumeFailed } from "../src/herdr-backend.js";
 import { buildClaudeCmd } from "../src/engine-pty.js";
 import { pidAlive } from "../src/tui-lifetime.js";
 
 test("fresh TUI command execs claude over the shell", () => {
   expect(buildClaudeCmd("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").startsWith("exec claude --session-id ")).toBe(true);
+});
+
+test("resume/fork error copy fails fast instead of waiting for the prompt", () => {
+  expect(tuiResumeFailed("No conversation found with session ID abc")).toContain("No conversation found");
+  expect(tuiResumeFailed("? for shortcuts")).toBeUndefined();
 });
 
 test("bun PTY kill reaps the child process", async () => {
