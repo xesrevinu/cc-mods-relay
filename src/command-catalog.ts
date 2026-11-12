@@ -13,11 +13,11 @@ function cmd(name: string, description: string, hint?: string): AvailableCommand
  * Project `.claude/commands` and skills are discovered separately.
  */
 export const BUILTIN_COMMANDS: readonly AvailableCommand[] = [
-  cmd("context", "Show what is filling the current session context", "all"),
+  cmd("context", "Show context occupancy, model, and token buckets", "all"),
   cmd("effort", "Set thinking intensity for this session", "low|medium|high|xhigh|max|auto"),
   cmd("fast", "Toggle faster Opus output", "on|off"),
   cmd("model", "Switch the model for this session", "model"),
-  cmd("usage", "Show token usage and cost for this session"),
+  cmd("usage", "Show session cost, token buckets, and context occupancy"),
 ];
 
 export interface DiscoverCommandsDeps {

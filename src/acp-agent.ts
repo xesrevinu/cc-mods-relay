@@ -235,6 +235,7 @@ type Session = {
   accumulatedUsage: AccumulatedUsage;
   lastContextUsed: number;
   lastCostUsd?: number;
+  startedAtMs: number;
   modes: SessionModeState;
   modelInfos: ModelInfo[];
   allowBypass?: boolean;
@@ -265,6 +266,8 @@ type Session = {
   turnTempImagePaths?: string[];
   liveFromMod?: boolean;
   modTools?: Map<string, { tool: string; input: Record<string, unknown> }>;
+  /** ACP client `PromptRequest._meta.promptId`, echoed on `session/update`. */
+  currentPromptId?: string;
 };
 
 export interface StartedEngine {
@@ -990,6 +993,12 @@ function registerGateToolUses(raw: unknown, gate: SessionGate): void {
   }
 }
 
+function promptIdFromMeta(meta: unknown): string | undefined {
+  if (!meta || typeof meta !== "object") return undefined;
+  const id = (meta as { promptId?: unknown }).promptId;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
 function deriveSubagentLabel(
   messages: SessionMessage[],
   parentId: string | null,
@@ -1091,7 +1100,7 @@ export class ClaudeAcpAgent {
     deps: AgentDeps = {},
   ) {
     this.sessions = {};
-    this.client = client;
+    this.client = this.wrapClient(client);
     this.toolUseCache = {};
     this.logger = logger ?? console;
     this.startEngine = deps.startEngine ?? defaultStartEngine;
@@ -1132,6 +1141,29 @@ export class ClaudeAcpAgent {
       deps.deleteStoredSession ?? ((sessionId) => deleteSessionIfStored(sessionId, deleteSession));
     this.unsubMod = onModEvent((event) => {
       void this.handleModEvent(event).catch((error) => this.logger.error("[mod-live]", error));
+    });
+  }
+
+  private wrapClient(client: AcpClient): AcpClient {
+    return {
+      sessionUpdate: (params) => this.stampAndForwardSessionUpdate(client, params),
+      requestPermission: (p) => client.requestPermission(p),
+      readTextFile: (p) => client.readTextFile(p),
+      writeTextFile: (p) => client.writeTextFile(p),
+      createElicitation: (p) => client.createElicitation(p),
+    };
+  }
+
+  private stampAndForwardSessionUpdate(
+    client: AcpClient,
+    params: SessionNotification,
+  ): Promise<void> {
+    const pid = this.sessions[params.sessionId]?.currentPromptId;
+    if (!pid) return client.sessionUpdate(params);
+    if (promptIdFromMeta(params._meta)) return client.sessionUpdate(params);
+    return client.sessionUpdate({
+      ...params,
+      _meta: { ...params._meta, promptId: pid },
     });
   }
 
@@ -1409,6 +1441,15 @@ export class ClaudeAcpAgent {
       );
     }
 
+    sessionRecord.currentPromptId = promptIdFromMeta(params._meta);
+    try {
+      return await this.runPrompt(params, sessionRecord);
+    } finally {
+      sessionRecord.currentPromptId = undefined;
+    }
+  }
+
+  private async runPrompt(params: PromptRequest, sessionRecord: Session): Promise<PromptResponse> {
     const turnTempImagePaths: string[] = [];
     sessionRecord.turnTempImagePaths = turnTempImagePaths;
     const payload = promptToClaude(params, this.logger, turnTempImagePaths);
@@ -1473,9 +1514,13 @@ export class ClaudeAcpAgent {
             "options" in group ? group.options.map((o) => o.value) : [group.value],
           )
         : [];
+    const model = this.currentModel(session);
+    const modelDisplayName =
+      session.modelInfos.find((info) => info.value === model)?.displayName ?? model;
     return {
-      cwd: session.cwd,
-      model: this.currentModel(session),
+      cwd: session.clientCwd || session.cwd,
+      model,
+      modelDisplayName,
       mode: session.modes.currentModeId,
       effort: this.currentEffort(session) ?? "default",
       fast: session.fastModeOn ?? false,
@@ -1485,6 +1530,9 @@ export class ClaudeAcpAgent {
       contextSize: session.contextWindowSize,
       usage: session.accumulatedUsage,
       costUsd: session.lastCostUsd,
+      mcpServers: mcpServerNames(session.mcpServers),
+      additionalDirectories: session.additionalDirectories ?? [],
+      startedAtMs: session.startedAtMs,
     };
   }
 
@@ -3072,6 +3120,7 @@ export class ClaudeAcpAgent {
       settingsManager,
       accumulatedUsage: { ...EMPTY_USAGE },
       lastContextUsed: 0,
+      startedAtMs: Date.now(),
       modes,
       modelInfos: liveModelCatalog,
       allowBypass,
@@ -3797,4 +3846,14 @@ export function inferContextWindowFromModelId(id: string): number | null {
   const haiku = id.match(/claude-haiku-(\d+)/);
   if (haiku) return Number(haiku[1]) >= 5 ? 1_000_000 : 200_000;
   return null;
+}
+
+function mcpServerNames(servers: NewSessionRequest["mcpServers"] | undefined): string[] {
+  if (!servers) return [];
+  return servers.map((server) => {
+    if (server && typeof server === "object" && "name" in server && typeof server.name === "string") {
+      return server.name;
+    }
+    return "mcp";
+  });
 }

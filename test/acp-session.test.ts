@@ -134,14 +134,18 @@ test("an ACP client can create, slash, fork, resume, list, close, and delete", a
   updates.length = 0;
   const usage = await agent.prompt(slashPrompt(created.sessionId, "/usage"));
   expect(usage.stopReason).toBe("end_turn");
+  expect(textOf(updates)).toContain("Session");
+  expect(textOf(updates)).toContain("Current session");
   expect(textOf(updates)).toContain("tokens");
   expect(updates.some((n) => n.update.sessionUpdate === "usage_update")).toBe(true);
 
   updates.length = 0;
   const context = await agent.prompt(slashPrompt(created.sessionId, "/context"));
   expect(context.stopReason).toBe("end_turn");
-  expect(textOf(updates)).toContain(`cwd: `);
-  expect(textOf(updates)).toContain("mode: default");
+  expect(textOf(updates)).toContain("Context Usage");
+  expect(textOf(updates)).toContain("cwd:");
+  expect(textOf(updates)).toMatch(/mode:\s+default/);
+  expect(textOf(updates)).toContain("Token buckets");
 
   updates.length = 0;
   const effortSlash = await agent.prompt(slashPrompt(created.sessionId, "/effort high"));
@@ -161,7 +165,7 @@ test("an ACP client can create, slash, fork, resume, list, close, and delete", a
   await agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
   updates.length = 0;
   await agent.prompt(slashPrompt(created.sessionId, "/context"));
-  expect(textOf(updates)).toContain("mode: plan");
+  expect(textOf(updates)).toMatch(/mode:\s+plan/);
 
   const config = await agent.setSessionConfigOption({
     sessionId: created.sessionId,
@@ -220,6 +224,23 @@ test("an ACP client can create, slash, fork, resume, list, close, and delete", a
   expect(deleted).toContain(forked.sessionId);
   const afterDelete = await agent.listSessions({ cwd });
   expect(afterDelete.sessions.map((s) => s.sessionId)).not.toContain(forked.sessionId);
+});
+
+test("session/update echoes PromptRequest _meta.promptId", async () => {
+  const { agent, cwd, updates } = harness();
+  live.push(agent);
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  const created = await agent.newSession({ cwd, mcpServers: [] });
+  updates.length = 0;
+  await agent.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: "text", text: "/usage" }],
+    _meta: { promptId: "client-prompt-1" },
+  });
+  expect(updates.length).toBeGreaterThan(0);
+  expect(
+    updates.every((n) => (n._meta as { promptId?: string } | undefined)?.promptId === "client-prompt-1"),
+  ).toBe(true);
 });
 
 test("session/list includes live ACP sessions even when disk listing is empty", async () => {
