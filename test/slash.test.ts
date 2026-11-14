@@ -162,6 +162,14 @@ test("empty usage still has a full report instead of a one-liner", () => {
   expect(context).toContain("(none)");
 });
 
+test("usage omits Total cost when the session has no USD figure", () => {
+  const { costUsd: _costUsd, ...unknownCost } = session;
+  const usage = formatUsage(unknownCost);
+  expect(usage).toContain("Session");
+  expect(usage).not.toContain("Total cost:");
+  expect(usage).not.toContain("$0.0000");
+});
+
 test("model effort and fast with args map to session config", () => {
   expect(dispatchSlash("model", "opus", session)).toMatchObject({
     kind: "config",

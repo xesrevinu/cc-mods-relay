@@ -2,25 +2,17 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { which } from "bun";
-import { openRemote } from "../../src/client.js";
+import { startServer } from "../../src/server.js";
 import { startMockAnthropic, toolResultsFromBody } from "../../src/mock-anthropic.js";
 import { AcpTestClient } from "../acp-client.js";
 import { MARKER, claudeBin, isolatedWorkspace, tuiEnv, tuiInitializeParams } from "../harness.js";
 
 const TOOL_ID = "toolu_01ReadHelloTxtXXXXXX000000";
+const INDEX = join(import.meta.dir, "../../src/index.ts");
 
-async function sshLocalhost(): Promise<boolean> {
-  const proc = Bun.spawn(
-    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-T", "localhost", "echo ok"],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  const out = await new Response(proc.stdout).text();
-  return (await proc.exited) === 0 && out.includes("ok");
-}
-
-test("localhost ssh ACP tunnel forwards Read against the mock API", async () => {
-  if (!claudeBin() || !which("herdr") || !(await sshLocalhost())) {
-    console.warn("skip: claude, herdr, or ssh localhost is unavailable");
+test("local WS ACP session forwards Read against the mock API", async () => {
+  if (!claudeBin() || !which("herdr")) {
+    console.warn("skip: claude or herdr is unavailable");
     return;
   }
 
@@ -32,7 +24,7 @@ test("localhost ssh ACP tunnel forwards Read against the mock API", async () => 
     { blocks: [{ type: "tool_use", id: TOOL_ID, name: "Read", input: { file_path: "hello.txt" } }] },
     { blocks: [{ type: "text", text: "ssh-read-ok" }] },
   ]);
-  const herdrSession = `cc-mods-ssh-${process.pid}-${Date.now()}`;
+  const herdrSession = `cc-mods-ws-${process.pid}-${Date.now()}`;
   const env = tuiEnv({
     mockUrl: mock.url,
     configDir: dirs.config,
@@ -44,8 +36,12 @@ test("localhost ssh ACP tunnel forwards Read against the mock API", async () => 
     },
   });
 
-  const opened = await openRemote("localhost", { cwd: dirs.project, env, inheritErr: false });
-  const client = AcpTestClient.fromNode(opened.child);
+  const token = "test-token";
+  const server = startServer({ token, hostname: "127.0.0.1", port: 0 });
+  const client = AcpTestClient.spawn(["bun", INDEX, "--url", server.sessionUrl, "--token", token], {
+    cwd: dirs.project,
+    env,
+  });
 
   try {
     const init = await client.request<{ protocolVersion: number }>(
@@ -74,13 +70,13 @@ test("localhost ssh ACP tunnel forwards Read against the mock API", async () => 
     expect(forwarded, `Read not forwarded\nstderr:\n${client.stderr.slice(-3000)}\ntext:${client.agentText()}`).toBeDefined();
     expect(JSON.stringify(forwarded?.content)).toContain(MARKER);
     expect(client.agentText()).toContain("ssh-read-ok");
-    expect(await Bun.file(join(opened.tuiRoot, ".claude", "skills", "demo", "SKILL.md")).text()).toContain("# demo");
-    expect(await Bun.file(join(opened.tuiRoot, "AGENTS.md")).text()).toContain("# agents");
-    expect(await Bun.file(join(opened.tuiRoot, "CLAUDE.md")).text()).toContain("use bun");
+    expect(await Bun.file(join(dirs.project, ".claude", "skills", "demo", "SKILL.md")).text()).toContain("# demo");
+    expect(await Bun.file(join(dirs.project, "AGENTS.md")).text()).toContain("# agents");
+    expect(await Bun.file(join(dirs.project, "CLAUDE.md")).text()).toContain("use bun");
     expect(mock.url.startsWith("http://127.0.0.1:")).toBe(true);
   } finally {
     await client.stop();
-    opened.relay.stop();
+    await server.stop();
     mock.stop();
   }
 }, 180_000);

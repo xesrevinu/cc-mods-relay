@@ -2,9 +2,9 @@
  * Live leftover check against the real SSH host.
  * Spawns a TUI on Mini, then simulates exits. Usage: bun scripts/e2e-reap.ts
  */
-import { openRemote } from "../src/client.js";
 import { configuredHost } from "../src/config.js";
 import { REMOTE_PATH, rsh } from "../src/ssh.js";
+import { hostFromWsUrl, liveEndpoint, spawnLiveShim } from "./shim-client.js";
 import { AcpTestClient } from "../test/acp-client.js";
 import { tuiInitializeParams } from "../test/harness.js";
 
@@ -15,7 +15,8 @@ const ONLY = new Set(
     .map((s) => s.trim())
     .filter(Boolean),
 );
-const HOST = ARGS[0] || (await configuredHost()) || "cc-remote";
+const endpoint = await liveEndpoint().catch(() => undefined);
+const HOST = ARGS[0] || (endpoint ? hostFromWsUrl(endpoint.url) : undefined) || (await configuredHost()) || "cc-remote";
 const CWD = process.cwd();
 const SETTLE_MS = Number(process.env.REAP_SETTLE_MS) || 15_000;
 
@@ -153,13 +154,11 @@ async function waitFor(label: string, pred: () => Promise<boolean>, ms = 20_000)
 
 type Handle = {
   client: AcpTestClient;
-  opened: Awaited<ReturnType<typeof openRemote>>;
   sessionId: string;
 };
 
 async function spawnSession(): Promise<Handle> {
-  const opened = await openRemote(HOST, { cwd: CWD, env: liveEnv(), inheritErr: true });
-  const client = AcpTestClient.fromNode(opened.child);
+  const client = await spawnLiveShim(CWD, liveEnv());
   try {
     await client.request("initialize", tuiInitializeParams(["Read"]), 45_000);
     const session = await client.request<{ sessionId: string }>(
@@ -169,12 +168,11 @@ async function spawnSession(): Promise<Handle> {
     );
     await waitFor("remote TUI", async () => {
       const s = await snap();
-      return s.claudes.some((l) => l.includes(session.sessionId)) && s.agents.length > 0;
+      return s.claudes.some((l) => l.includes(session.sessionId));
     }, 30_000);
-    return { client, opened, sessionId: session.sessionId };
+    return { client, sessionId: session.sessionId };
   } catch (err) {
     await client.stop();
-    opened.relay.stop();
     throw err;
   }
 }
@@ -219,7 +217,6 @@ async function scenario(
   if (!during.claudes.some((l) => l.includes(h.sessionId))) {
     record(name, false, "TUI never appeared on Mini");
     await h.client.stop();
-    h.opened.relay.stop();
     return;
   }
   try {
@@ -236,7 +233,6 @@ async function scenario(
       await h.client.stop();
     } catch {
     }
-    h.opened.relay.stop();
     await forceClean();
   }
 }
@@ -279,11 +275,8 @@ async function main(): Promise<void> {
   await scenario(
     "local SIGTERM (Ctrl-C, no session/close)",
     async (h) => {
-      h.opened.child.kill("SIGTERM");
-      await Promise.race([
-        new Promise<void>((resolve) => h.opened.child.once("exit", () => resolve())),
-        Bun.sleep(8_000),
-      ]);
+      h.client.kill("SIGTERM");
+      await Promise.race([h.client.exited ?? Bun.sleep(8_000), Bun.sleep(8_000)]);
     },
     (h, after) => {
       const tui = noTui(after, h.sessionId);
@@ -297,13 +290,10 @@ async function main(): Promise<void> {
   );
 
   await scenario(
-    "local SIGKILL ssh (hard client death → sshd SIGHUP)",
+    "local SIGKILL shim (hard client death → WS close)",
     async (h) => {
-      h.opened.child.kill("SIGKILL");
-      await Promise.race([
-        new Promise<void>((resolve) => h.opened.child.once("exit", () => resolve())),
-        Bun.sleep(2_000),
-      ]);
+      h.client.kill("SIGKILL");
+      await Promise.race([h.client.exited ?? Bun.sleep(2_000), Bun.sleep(2_000)]);
     },
     (h, after) => {
       const tui = noTui(after, h.sessionId);
@@ -317,16 +307,10 @@ async function main(): Promise<void> {
   );
 
   await scenario(
-    "remote SIGHUP on bun agent",
+    "SIGHUP on stdio shim",
     async (h) => {
-      const agents = await pidsFor(/bun .*\/.cc-mods-relay\/agent\.js/);
-      if (!agents.length) throw new Error("no remote agent pid");
-      console.error(`[reap] kill -HUP ${agents.join(" ")}`);
-      await remote(`kill -HUP ${agents.join(" ")}`);
-      await Promise.race([
-        new Promise<void>((resolve) => h.opened.child.once("exit", () => resolve())),
-        Bun.sleep(8_000),
-      ]);
+      h.client.kill("SIGHUP");
+      await Promise.race([h.client.exited ?? Bun.sleep(8_000), Bun.sleep(8_000)]);
     },
     (h, after) => {
       const tui = noTui(after, h.sessionId);
@@ -340,25 +324,17 @@ async function main(): Promise<void> {
   );
 
   await scenario(
-    "remote SIGKILL on bun agent (hooks cannot run)",
+    "SIGKILL on stdio shim",
     async (h) => {
-      const agents = await pidsFor(/bun .*\/.cc-mods-relay\/agent\.js/);
-      if (!agents.length) throw new Error("no remote agent pid");
-      console.error(`[reap] kill -KILL ${agents.join(" ")}`);
-      await remote(`kill -KILL ${agents.join(" ")}`);
-      await Promise.race([
-        new Promise<void>((resolve) => h.opened.child.once("exit", () => resolve())),
-        Bun.sleep(8_000),
-      ]);
+      h.client.kill("SIGKILL");
+      await Promise.race([h.client.exited ?? Bun.sleep(8_000), Bun.sleep(8_000)]);
     },
     (h, after) => {
       const tui = noTui(after, h.sessionId);
-      const agentGone = after.agents.length === 0;
-      // Expected: TUI/workspaces leak because reapers never run.
-      const leaked = !tui || after.workspaces.length > 0;
+      const ok = tui && after.workspaces.length === 0 && after.ws.length === 0;
       return {
-        ok: agentGone && leaked,
-        detail: `expected leak: tuiGone=${tui} agentGone=${agentGone} workspaces=${after.workspaces.length} herdrDaemon=${after.herdr.length}`,
+        ok,
+        detail: `tuiGone=${tui} workspaces=${after.workspaces.length} ws-client=${after.ws.length} herdrDaemon=${after.herdr.length}`,
       };
     },
   );
@@ -367,41 +343,27 @@ async function main(): Promise<void> {
     console.error("\n======== next start reaps SIGKILL orphans ========");
     await forceClean();
     const leaked = await spawnSession();
-    const agents = await pidsFor(/bun .*\/.cc-mods-relay\/agent\.js/);
-    console.error(`[reap] kill -KILL ${agents.join(" ")} (leave TUI)`);
-    if (agents.length) await remote(`kill -KILL ${agents.join(" ")}`);
-    await Promise.race([
-      new Promise<void>((resolve) => leaked.opened.child.once("exit", () => resolve())),
-      Bun.sleep(8_000),
-    ]);
     try {
       await leaked.client.stop();
     } catch {
     }
-    leaked.opened.relay.stop();
     const mid = await snap();
-    console.error(`[leaked]\n${fmt(mid, leaked.sessionId)}`);
-    const didLeak = !noTui(mid, leaked.sessionId) || mid.workspaces.length > 0;
-    if (!didLeak) {
-      record("next start reaps SIGKILL orphans", false, "SIGKILL did not leak, so reap-on-start was not exercised");
-    } else {
-      const next = await spawnSession();
-      const after = await snap();
-      console.error(`[after next session/new]\n${fmt(after)}`);
-      const oldGone = noTui(after, leaked.sessionId);
-      const newLive = after.claudes.some((l) => l.includes(next.sessionId));
-      record(
-        "next start reaps SIGKILL orphans",
-        oldGone && newLive,
-        `oldGone=${oldGone} newLive=${newLive} workspaces=${after.workspaces.length}`,
-      );
-      try {
-        await next.client.request("session/close", { sessionId: next.sessionId }, 20_000);
-      } catch {
-      }
-      await next.client.stop();
-      next.opened.relay.stop();
+    console.error(`[after shim drop]\n${fmt(mid, leaked.sessionId)}`);
+    const next = await spawnSession();
+    const after = await snap();
+    console.error(`[after next session/new]\n${fmt(after)}`);
+    const oldGone = noTui(after, leaked.sessionId);
+    const newLive = after.claudes.some((l) => l.includes(next.sessionId));
+    record(
+      "next start after shim drop",
+      oldGone && newLive,
+      `oldGone=${oldGone} newLive=${newLive} workspaces=${after.workspaces.length}`,
+    );
+    try {
+      await next.client.request("session/close", { sessionId: next.sessionId }, 20_000);
+    } catch {
     }
+    await next.client.stop();
   }
 
   console.error("\n======== summary ========");

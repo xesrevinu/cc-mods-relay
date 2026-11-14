@@ -1,100 +1,47 @@
-import { $ } from "bun";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, release, type } from "node:os";
-import { basename, dirname, join } from "node:path";
-
-const run = (cmd: ReturnType<typeof $>, cwd: string) =>
-  cmd.cwd(cwd).quiet().nothrow().text().then((s) => s.trim());
-
-/** Instruction files Claude Code would load for this directory: user, then every ancestor, nearest last. */
-async function memory(cwd: string): Promise<string> {
-  const dirs: string[] = [];
-  for (let d = cwd; ; d = dirname(d)) {
-    dirs.unshift(d);
-    if (d === dirname(d)) break;
-  }
-  const candidates = [
-    join(homedir(), ".claude", "CLAUDE.md"),
-    ...dirs.flatMap((d) => [
-      join(d, "AGENTS.md"),
-      join(d, "CLAUDE.md"),
-      join(d, ".claude", "CLAUDE.md"),
-      join(d, "CLAUDE.local.md"),
-    ]),
-  ];
-  const found: string[] = [];
-  for (const path of new Set(candidates)) {
-    const file = Bun.file(path);
-    if (await file.exists()) found.push(`Contents of ${path}:\n\n${(await file.text()).trim()}`);
-  }
-  if (!found.length) return "";
-  return (
-    `\n\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. ` +
-    `IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\n` +
-    found.join("\n\n")
-  );
-}
-
-async function git(cwd: string): Promise<string> {
-  const branch = await run($`git rev-parse --abbrev-ref HEAD`, cwd);
-  if (!branch) return "";
-  const status = (await run($`git status --short`, cwd)).split("\n").slice(0, 40).join("\n");
-  const log = await run($`git log --oneline -5`, cwd);
-  return (
-    `\n\n# gitStatus\nThis is the git status of the working directory at the start of the conversation.\n` +
-    `Current branch: ${branch}\n\nStatus:\n${status || "(clean)"}\n\nRecent commits:\n${log}`
-  );
-}
-
-/**
- * Appended onto the TUI system prompt so file and shell tools use the client
- * working directory. Claude Code also prints its own Environment block for the
- * host session cwd (`~/Workspace/<relative path>`).
- */
-export async function buildEnvironmentAppend(cwd: string, extraDirs: string[] = []): Promise<string> {
-  const [gitStatus, claudeMd] = await Promise.all([git(cwd), memory(cwd)]);
-  const extra = extraDirsLine(extraDirs);
-  const shell = process.platform === "win32" ? "PowerShell" : basename(process.env.SHELL || "bash");
-  return `# Environment
-File and shell tools in this session use the working directory below.
- - Working directory: ${cwd}${extra}
- - Is a git repository: ${gitStatus ? "yes" : "no"}
- - Platform: ${process.platform}
- - OS version: ${type()} ${release()}
- - Shell: ${shell}${gitStatus}${claudeMd}
-`;
-}
-
-export const ENVIRONMENT_FILE = "environment.txt";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 /** Sidecar next to the plugin. Mods cats this at session.start instead of printenv. */
 export const EXTRA_DIRS_FILE = "extra-dirs.json";
 
 export function workspaceOnClient(opts: {
   fs?: { readTextFile?: boolean; writeTextFile?: boolean } | null;
-  environmentFile?: boolean;
 }): boolean {
-  if (opts.environmentFile) return true;
   return opts.fs?.readTextFile === true && opts.fs?.writeTextFile === true;
 }
 
-/** Host session cwd when the workspace lives on the ACP client. */
+/** Absolute path with no shell metacharacters. Need not exist on this host. */
+export function isSafeAbsPath(p: string): boolean {
+  return p.startsWith("/") && !/["$`\n\r]/.test(p);
+}
+
+/**
+ * Client pwd stamped at agent launch. ACP `session/new.cwd` is only a fallback
+ * when the launcher did not pass `--cwd`.
+ */
+export function sessionClientCwd(launchCwd: string | undefined, requested: string): string {
+  if (launchCwd && isSafeAbsPath(launchCwd)) return launchCwd;
+  return requested;
+}
+
+/**
+ * Host directory the TUI process cds into. Prefer the client pwd when that
+ * directory exists here (hostTuiRoot mkdir's it) so Claude Code's Environment
+ * is the client path, not the TUI host `$HOME`.
+ */
 export function resolveTuiCwd(
   requested: string,
   onClient: boolean,
   here: string = process.cwd(),
 ): string {
-  return onClient ? here : requested;
-}
-
-export function extraDirsLine(dirs: string[]): string {
-  if (!dirs.length) return "";
-  return `\n - Additional working directories: ${dirs.join(", ")}`;
+  if (!onClient) return requested;
+  if (requested && existsSync(requested)) return requested;
+  return here;
 }
 
 /**
- * Each local project maps to a new folder under ~/Workspace on the host.
- * Mark that folder trusted in the host Claude config before the TUI starts.
+ * Mark the TUI session cwd trusted in the host Claude config before the TUI starts.
  */
 export function trustTuiCwd(cwd: string, env: NodeJS.ProcessEnv = process.env, home = homedir()): void {
   if (!cwd.startsWith("/") || /[\n\r]/.test(cwd)) return;
@@ -119,19 +66,7 @@ export function trustTuiCwd(cwd: string, env: NodeJS.ProcessEnv = process.env, h
   }
 }
 
-/**
- * Extra dirs go in a sidecar (Mods cats it). Keep a Mac-baked environment.txt
- * if present — rewriting on Mini would drop the git/CLAUDE.md snapshot.
- */
-export async function writeSessionMount(pluginDir: string, cwd: string, extraDirs: string[]): Promise<void> {
+/** Extra dirs go in a sidecar (Mods cats it). Prompt listing uses Claude Code `--add-dir`. */
+export async function writeSessionMount(pluginDir: string, extraDirs: string[]): Promise<void> {
   writeFileSync(join(pluginDir, EXTRA_DIRS_FILE), JSON.stringify(extraDirs));
-  const envPath = join(pluginDir, ENVIRONMENT_FILE);
-  if (existsSync(envPath)) {
-    if (!extraDirs.length) return;
-    const current = readFileSync(envPath, "utf8");
-    const extra = extraDirsLine(extraDirs);
-    if (!current.includes(extra.trim())) writeFileSync(envPath, `${current.trimEnd()}${extra}\n`);
-    return;
-  }
-  if (extraDirs.length) writeFileSync(envPath, await buildEnvironmentAppend(cwd, extraDirs));
 }

@@ -8,9 +8,8 @@ import { createBunPtySpawn } from "../src/bun-pty-backend.js";
 import { startModChannel } from "../src/mod-channel.js";
 import { startRelay } from "../src/relay.js";
 import { stagePlugin } from "../src/launch.js";
-import { acpTunnelArgs } from "../src/ssh.js";
 import { resolveTerminalBackendName } from "../src/terminal-backend.js";
-import { HOST_WRONG_TOOLS, WORKSPACE_TOOLS } from "../src/tools/forward.js";
+import { DEFERRED_TOOLS, WORKSPACE_TOOLS } from "../src/tools/forward.js";
 
 test("withPlugin injects --plugin-dir on the claude command, not path fragments", () => {
   const tui = "claude --session-id sess --mcp-config /tmp/claude-abc/x.json";
@@ -23,21 +22,6 @@ test("withPlugin injects --plugin-dir on the claude command, not path fragments"
   expect(() => withPlugin("echo hi", "/opt/plugin")).toThrow();
 });
 
-test("ACP ssh carries stdio and the tool port, not a TTY wrapping claude", () => {
-  const argv = acpTunnelArgs("mini", 4321, "bun /home/me/.cc-mods-relay/agent.js --plugin-dir /home/me/.cc-mods-relay/plugin");
-  expect(argv).toContain("-T");
-  expect(argv).not.toContain("-tt");
-  expect(argv.join(" ")).toContain("127.0.0.1:4321:127.0.0.1:4321");
-  expect(argv.join(" ")).toContain("agent.js");
-  expect(argv.join(" ")).not.toMatch(/\bclaude -p\b/);
-});
-
-test("localhost ssh skips -R because the relay is already bound here", () => {
-  const argv = acpTunnelArgs("localhost", 4321, "bun agent.js --plugin-dir /tmp/plugin");
-  expect(argv.join(" ")).not.toContain("-R");
-  expect(argv.join(" ")).not.toContain("ExitOnForwardFailure");
-});
-
 test("Mods plugin source stays inside the sandbox", () => {
   const src = readFileSync(join(import.meta.dir, "../plugin/hooks/register.js"), "utf8");
   expect(src).not.toMatch(/\bWebSocket\b/);
@@ -45,7 +29,8 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).toContain("$.process.run");
   expect(src).toContain("$.process.spawn");
   expect(src).toContain("WORKSPACE_TOOLS");
-  expect(src).toContain("HOST_WRONG_TOOLS");
+  expect(src).toContain("DEFERRED_TOOLS");
+  expect(src).toContain("failResult");
   expect(src).toContain("classic.Stop");
   expect(src).toContain("classic.PermissionRequest");
   expect(src).toContain("HYDRATE_TOOLS");
@@ -58,8 +43,10 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).toContain("plugin_error");
   expect(src).not.toContain("asUser");
   expect(src).not.toContain("/poll");
+  expect(src).not.toContain("This tool would run on the TUI host");
+  expect(src).not.toContain("result: message");
   for (const tool of WORKSPACE_TOOLS) expect(src).toContain(`"${tool}"`);
-  for (const tool of HOST_WRONG_TOOLS) expect(src).toContain(`"${tool}"`);
+  for (const tool of DEFERRED_TOOLS) expect(src).toContain(`"${tool}"`);
 });
 
 test("terminal backend defaults to herdr and accepts bun PTY aliases", () => {
@@ -107,8 +94,8 @@ test("mod-channel delivers events, not prompts", async () => {
 
 test("tuiRoot paths map onto this machine's cwd; escapes are rejected", () => {
   const cwd = "/Users/me/proj";
-  const tui = "/Users/ray/Workspace/abc";
-  expect(mapPath(cwd, tui, "/Users/ray/Workspace/abc/src/a.ts")).toBe("/Users/me/proj/src/a.ts");
+  const tui = "/Users/bob/Workspace/abc";
+  expect(mapPath(cwd, tui, "/Users/bob/Workspace/abc/src/a.ts")).toBe("/Users/me/proj/src/a.ts");
   expect(mapPath(cwd, tui, "src/a.ts")).toBe("/Users/me/proj/src/a.ts");
   expect(() => mapPath(cwd, tui, "/etc/passwd")).toThrow(/outside/);
 });
@@ -218,20 +205,21 @@ test("the out-of-sandbox helper speaks the tool protocol", async () => {
       stdout: "pipe",
       stderr: "pipe",
     });
-    proc.stdin.write(JSON.stringify({
+    await proc.stdin.write(JSON.stringify({
       url: relay.url,
       token: relay.token,
       cwd: dir,
       tuiRoot: dir,
       type: "call",
-      id: "1",
-      callId: "c1",
+      id: "helper-1",
+      callId: `helper-read-${process.pid}-${Date.now()}`,
       tool: "Read",
       input: { file_path: join(dir, "hello.txt") },
     }));
     proc.stdin.end();
     const stdout = await new Response(proc.stdout).text();
-    expect(await proc.exited).toBe(0);
+    const stderr = await new Response(proc.stderr).text();
+    expect(await proc.exited, `stdout=${stdout}\nstderr=${stderr}`).toBe(0);
     const frame = JSON.parse(stdout.trim());
     expect(frame.ok).toBe(true);
     expect(frame.result.file.content).toContain("hello");

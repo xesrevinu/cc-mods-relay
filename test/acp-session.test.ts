@@ -333,6 +333,7 @@ test("session/list includes live ACP sessions even when disk listing is empty", 
 
 test("session/list maps the client's cwd filter onto the host TUI cwd", async () => {
   const storedId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const clientCwd = "/Users/someoneelse/cc-mods-list-cwd-missing";
   const stored: StoredSessionInfo[] = [
     {
       sessionId: storedId,
@@ -341,18 +342,54 @@ test("session/list maps the client's cwd filter onto the host TUI cwd", async ()
       lastModified: Date.parse("2026-01-02T00:00:00Z"),
     },
   ];
-  const { agent, cwd, listedDirs } = harness({ stored });
+  const listedDirs: Array<string | undefined> = [];
+  const agent = new ClaudeAcpAgent(mockClient(), silent, {
+    startEngine: (args) => ({
+      sessionId: args.sessionId ?? randomUUID(),
+      pty: fakePty(),
+      cwd: args.cwd,
+    }),
+    tuiRoot: process.cwd(),
+    modelCatalogSource: async () => MODEL_CATALOG,
+    discoverCommands: () => [...BUILTIN_COMMANDS],
+    discoverAgents: () => [],
+    getSessionInfo: async () => undefined,
+    listStoredSessions: async ({ dir }) => {
+      listedDirs.push(dir);
+      return stored;
+    },
+    deleteStoredSession: async () => {},
+    renameStoredSession: async () => {},
+    getMessages: async () => [],
+    fastModeProbe: () => false,
+    getPlanUsage: async () => undefined,
+  });
   live.push(agent);
   await agent.initialize({
     protocolVersion: 1,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   });
 
-  const listed = await agent.listSessions({ cwd });
+  const listed = await agent.listSessions({ cwd: clientCwd });
   expect(listedDirs).toContain(process.cwd());
   const row = listed.sessions.find((s) => s.sessionId === storedId);
   expect(row).toBeDefined();
-  expect(row?.cwd).toBe(cwd);
+  expect(row?.cwd).toBe(clientCwd);
+});
+
+test("session/load of a stored id after the agent is gone spawns claude --resume", async () => {
+  const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const { agent, cwd, starts } = harness();
+  live.push(agent);
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  const loaded = await agent.loadSession({ sessionId, cwd, mcpServers: [] });
+  expect(loaded.sessionId).toBe(sessionId);
+  expect(starts).toHaveLength(1);
+  expect(starts[0]).toMatchObject({
+    resume: true,
+    replayOnly: false,
+    sessionId,
+  });
 });
 
 test("session/load replays history for a live session without spawning again", async () => {
@@ -544,6 +581,37 @@ test("x.ai/session/info and session/usage expose live occupancy", async () => {
   expect(usage.usage.inputTokens).toBeGreaterThan(0);
   expect(usage.usage.outputTokens).toBeGreaterThan(0);
   expect(usage.usage.costUsdTicks).toBeGreaterThan(0);
+});
+
+test("/usage and session/usage take session cost from modelUsage, not a zeroed total_cost_usd", async () => {
+  const { agent, cwd, updates } = harness();
+  live.push(agent);
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  const created = await agent.newSession({ cwd, mcpServers: [] });
+  const liveSession = agent.sessions[created.sessionId];
+  liveSession.lastCostUsd = undefined;
+  liveSession.lastMessages = [
+    {
+      type: "assistant",
+      message: { usage: { input_tokens: 100, output_tokens: 20 } },
+    },
+    {
+      type: "result",
+      total_cost_usd: 0,
+      modelUsage: {
+        "claude-opus-4-7": { costUSD: 0.41, inputTokens: 80, outputTokens: 16 },
+      },
+    },
+  ];
+
+  updates.length = 0;
+  const slash = await agent.prompt(slashPrompt(created.sessionId, "/usage"));
+  expect(slash.stopReason).toBe("end_turn");
+  expect(textOf(updates)).toContain("$0.4100");
+  expect(textOf(updates)).not.toMatch(/Total cost:\s+\$0\.0000/);
+
+  const usage = await agent.handleGrokSessionUsage({ sessionId: created.sessionId });
+  expect(usage.usage.costUsdTicks).toBe(Math.round(0.41 * 10_000_000_000));
 });
 
 test("fork of an unknown session fails immediately", async () => {

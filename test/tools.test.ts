@@ -1,14 +1,29 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { cancelCall, execute } from "../src/exec.js";
 import { applyModEvent } from "../src/mod-live.js";
-import { mapPath } from "../src/tools/paths.js";
+import { mapPath, rewriteRemoteText } from "../src/tools/paths.js";
 
-function run(dir: string, tool: string, input: Record<string, unknown>) {
+function run(
+  dir: string,
+  tool: string,
+  input: Record<string, unknown>,
+  opts: { callId?: string; sessionId?: string; tuiRoot?: string } = {},
+) {
   return new Promise<any>((resolve) => {
-    void execute({ tool, input, cwd: dir, tuiRoot: dir, callId: "t" }, (frame) => resolve(frame));
+    void execute(
+      {
+        tool,
+        input,
+        cwd: dir,
+        tuiRoot: opts.tuiRoot ?? dir,
+        callId: opts.callId ?? "t",
+        sessionId: opts.sessionId,
+      },
+      (frame) => resolve(frame),
+    );
   });
 }
 
@@ -75,10 +90,18 @@ test("Glob uses path, skips node_modules, truncates at 100", async () => {
 
 test("relative TUI paths map onto the client workspace", () => {
   const cwd = "/Users/me/proj";
-  const tui = "/Users/ray/Workspace/abc";
+  const tui = "/Users/bob/Workspace/abc";
+  const home = homedir();
   expect(mapPath(cwd, tui, "src/a.ts")).toBe("/Users/me/proj/src/a.ts");
-  expect(mapPath(cwd, tui, "/Users/ray/Workspace/abc/src/a.ts")).toBe("/Users/me/proj/src/a.ts");
+  expect(mapPath(cwd, tui, "/Users/bob/Workspace/abc/src/a.ts")).toBe("/Users/me/proj/src/a.ts");
   expect(mapPath(cwd, tui, "/Users/me/other/x.ts", ["/Users/me/other"])).toBe("/Users/me/other/x.ts");
+  expect(mapPath(cwd, tui, "/Users/bob/.cursor/artifacts/x.sh")).toBe(join(home, ".cursor/artifacts/x.sh"));
+  expect(mapPath(cwd, tui, join(home, ".cursor/artifacts/x.sh"))).toBe(join(home, ".cursor/artifacts/x.sh"));
+  expect(() => mapPath(cwd, tui, "/Users/bob/Workspace/other/x.ts")).toThrow(/outside/);
+  expect(rewriteRemoteText("cd /Users/bob/Workspace/abc && ls", cwd, tui)).toBe("cd /Users/me/proj && ls");
+  expect(rewriteRemoteText("cd /Users/bob/Workspace/abc-extra", cwd, tui)).toBe(`cd ${home}/Workspace/abc-extra`);
+  expect(rewriteRemoteText("cd ~/Workspace/abc && pwd", cwd, tui)).toBe("cd /Users/me/proj && pwd");
+  expect(rewriteRemoteText("cat ~/.cursor/artifacts/x.sh", cwd, tui)).toBe(`cat ${home}/.cursor/artifacts/x.sh`);
 });
 
 test("Bash returns stdout/stderr/interrupted; non-zero is still a result", async () => {
@@ -161,6 +184,70 @@ test("Bash cancel during run returns interrupted without waiting out the command
   expect(frame.result.interrupted).toBe(true);
   expect(frame.result.stderr).toMatch(/aborted/i);
   expect(Date.now() - started).toBeLessThan(5_000);
+});
+
+test("Write to ~/.cursor/artifacts is allowed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const dest = join(homedir(), ".cursor", "artifacts", "cc-mods-relay-test", "out.txt");
+  try {
+    const wrote = await run(dir, "Write", { file_path: dest, content: "scratch\n" }, { callId: "art" });
+    expect(wrote.ok).toBe(true);
+    expect(await Bun.file(dest).text()).toBe("scratch\n");
+  } finally {
+    rmSync(join(homedir(), ".cursor", "artifacts", "cc-mods-relay-test"), { recursive: true, force: true });
+  }
+});
+
+test("Bash rewrites Mini TUI paths onto the client workspace", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const tui = "/Users/bob/Workspace/abc";
+  const frame = await run(dir, "Bash", { command: `test -d '${tui}' && printf mapped` }, { tuiRoot: tui, callId: "rw", sessionId: "rw" });
+  expect(frame.ok).toBe(true);
+  expect(frame.result.stdout).toContain("mapped");
+  const home = await run(dir, "Bash", { command: `printf '%s' "$HOME"` }, { tuiRoot: tui, callId: "rw-home", sessionId: "rw" });
+  expect(home.result.stdout).toBe(homedir());
+});
+
+test("session cwd after cd applies to later Read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  mkdirSync(join(dir, "sub"));
+  writeFileSync(join(dir, "a.txt"), "root\n");
+  writeFileSync(join(dir, "sub", "a.txt"), "nested\n");
+  const cd = await run(dir, "Bash", { command: "cd sub" }, { callId: "cd1", sessionId: "cwd-sess" });
+  expect(cd.ok).toBe(true);
+  const read = await run(dir, "Read", { file_path: "a.txt" }, { callId: "cd2", sessionId: "cwd-sess" });
+  expect(read.ok).toBe(true);
+  expect(read.result.file.content).toBe("nested");
+});
+
+test("Monitor runs the command locally instead of denying", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const frame = await run(dir, "Monitor", { command: "printf watched", timeout_ms: 8_000 }, { callId: "mon" });
+  expect(frame.ok).toBe(true);
+  expect(frame.result.stdout).toContain("watched");
+});
+
+test("LSP returns empty diagnostics instead of denying", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  writeFileSync(join(dir, "a.ts"), "const x = 1;\n");
+  const frame = await run(dir, "LSP", { file_path: join(dir, "a.ts"), operation: "diagnostics" }, { callId: "lsp" });
+  expect(frame.ok).toBe(true);
+  expect(frame.result.diagnostics).toEqual([]);
+});
+
+test("EnterWorktree path switches session cwd; ExitWorktree restores", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  mkdirSync(join(dir, "wt"));
+  writeFileSync(join(dir, "here.txt"), "root\n");
+  writeFileSync(join(dir, "wt", "here.txt"), "tree\n");
+  const entered = await run(dir, "EnterWorktree", { path: join(dir, "wt") }, { callId: "ew", sessionId: "wt-sess" });
+  expect(entered.ok).toBe(true);
+  const nested = await run(dir, "Read", { file_path: "here.txt" }, { callId: "ew-r", sessionId: "wt-sess" });
+  expect(nested.result.file.content).toBe("tree");
+  const exited = await run(dir, "ExitWorktree", {}, { callId: "ex", sessionId: "wt-sess" });
+  expect(exited.ok).toBe(true);
+  const root = await run(dir, "Read", { file_path: "here.txt" }, { callId: "ex-r", sessionId: "wt-sess" });
+  expect(root.result.file.content).toBe("root");
 });
 
 test("mod events become ACP session updates", async () => {

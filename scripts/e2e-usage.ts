@@ -2,9 +2,7 @@
  * Live /usage over SSH: intercept should print Claude plan rate-limit windows.
  * Usage: bun scripts/e2e-usage.ts
  */
-import { openRemote } from "../src/client.js";
-import { configuredHost } from "../src/config.js";
-import { AcpTestClient } from "../test/acp-client.js";
+import { spawnLiveShim } from "./shim-client.js";
 
 function liveEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || "haiku" };
@@ -18,10 +16,8 @@ function liveEnv(): NodeJS.ProcessEnv {
 }
 
 async function main(): Promise<void> {
-  const host = (await configuredHost()) || "cc-remote";
-  console.error(`[usage-e2e] host=${host}`);
-  const opened = await openRemote(host, { cwd: process.cwd(), env: liveEnv(), inheritErr: true });
-  const client = AcpTestClient.fromNode(opened.child);
+  const client = await spawnLiveShim(process.cwd(), liveEnv());
+  console.error("[usage-e2e] shim connected");
   try {
     await client.request(
       "initialize",
@@ -55,7 +51,6 @@ async function main(): Promise<void> {
     }
   } finally {
     await client.stop();
-    opened.relay.stop();
   }
 }
 

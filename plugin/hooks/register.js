@@ -6,8 +6,17 @@ const ENDPOINT = {"url":"","token":"","cwd":"","tuiRoot":"","helper":"","extraDi
 const RESERVED = new Set(["tool", "tool_use_id", "agentId", "consent", "requestMeta"]);
 
 const WORKSPACE_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit", "Bash", "PowerShell"]);
-const HOST_WRONG_TOOLS = new Set(["LSP", "Monitor", "EnterWorktree", "ExitWorktree", "SendFile", "SendUserFile"]);
+const DEFERRED_TOOLS = new Set(["LSP", "Monitor", "EnterWorktree", "ExitWorktree", "SendFile", "SendUserFile"]);
 const HYDRATE_TOOLS = new Set(["Artifact", "DesignSync"]);
+
+function isLocalTool(tool) {
+  return WORKSPACE_TOOLS.has(tool) || DEFERRED_TOOLS.has(tool);
+}
+
+function failResult(message) {
+  const text = String(message);
+  return { isError: true, text };
+}
 let extraDirs = [];
 let permissionSeq = 0;
 
@@ -254,26 +263,20 @@ export function register(on) {
       emit($, socket, { type: "tool_finished", toolUseId, isError, ...(result !== undefined ? { result } : {}), ...tag });
     };
 
-    if (HOST_WRONG_TOOLS.has(e.tool)) {
-      finish(true);
-      return { deny: "This tool would run on the TUI host, not the client workspace." };
-    }
-
-    if (WORKSPACE_TOOLS.has(e.tool)) {
+    if (isLocalTool(e.tool)) {
       let frame;
       try {
         frame = await rpc($, { type: "call", id: toolUseId, callId: toolUseId, tool: e.tool, input }, 600_000);
       } catch (error) {
         try { await rpc($, { type: "cancel", callId: toolUseId }, 5_000); } catch { /* already gone */ }
         const message = error && error.message ? String(error.message) : String(error);
-        finish(true, message);
-        return { isError: true, result: message, text: message };
+        finish(true);
+        return failResult(message);
       }
       if (!frame.ok) {
         const message = `${frame.error?.code || "ERROR"}: ${frame.error?.message || "Tool failed"}`;
-        finish(true, message);
-        if (frame.error?.code === "UNSUPPORTED_TOOL") return { deny: message };
-        return { isError: true, result: message, text: message };
+        finish(true);
+        return failResult(message);
       }
       finish(false, frame.result);
       return { result: frame.result };
@@ -296,12 +299,9 @@ export function register(on) {
     finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result);
     return ran;
   }).catch(async ($, e, next) => {
-    if (WORKSPACE_TOOLS.has(e.tool)) {
+    if (isLocalTool(e.tool)) {
       try { await rpc($, { type: "cancel", callId: e.tool_use_id }, 5_000); } catch { /* already gone */ }
-      return { isError: true, result: "Tool call was cancelled", text: "Tool call was cancelled" };
-    }
-    if (HOST_WRONG_TOOLS.has(e.tool)) {
-      return { deny: "This tool would run on the TUI host, not the client workspace." };
+      return failResult("Tool call was cancelled");
     }
     return next(e);
   });

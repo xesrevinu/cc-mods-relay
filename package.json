@@ -2,7 +2,7 @@
   "name": "cc-mods-relay",
   "version": "0.1.4",
   "private": true,
-  "description": "Claude Code on an SSH host, with workspace tools executing on this machine.",
+  "description": "Claude Code on a WebSocket server, with workspace tools executing on this machine.",
   "bin": {
     "cc-mods-relay": "dist/cc-mods-relay"
   },

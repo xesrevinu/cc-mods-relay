@@ -65,7 +65,7 @@ import {
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
@@ -92,7 +92,7 @@ import { createSessionEngine, spawnResumePty, SessionEngine } from "./engine-lif
 import type { SessionWatcher } from "./engine-lifecycle.js";
 import { createJsonlWatcher } from "./engine-watcher.js";
 import type { JsonlWatcher, GetMessages, SessionMessage } from "./engine-watcher.js";
-import { findTranscript, readFileTail, resolveWatchTarget } from "./jsonl.js";
+import { findTranscript, peekTranscript, readFileTail, resolveWatchTarget } from "./jsonl.js";
 import type { LocateOptions } from "./jsonl.js";
 import { linearizeTurns, readOrderedMessages, defaultGetMessages } from "./linearize.js";
 import { createDiffEnrichedReader } from "./diff-enriched-reader.js";
@@ -133,6 +133,9 @@ import {
   addUsage,
   contextTokensUsed,
   EMPTY_USAGE,
+  latestSessionCostUsd,
+  scanSessionCostFromJsonl,
+  sessionCostUsdFromRecord,
   usageUpdatesFor,
   type AccumulatedUsage,
   type UsageCarrier,
@@ -148,7 +151,8 @@ import { createTurnResolver } from "./end-of-turn.js";
 import type { DetectorSchedule, EndOfTurnDetector } from "./end-of-turn.js";
 import { parseCcModsRelayMeta, sendPrompt, type CcModsRelayFlags } from "./engine-pty.js";
 import { asAskQuestions, formAnswers, questionForm } from "./ask-user-question.js";
-import { ENVIRONMENT_FILE, resolveTuiCwd, trustTuiCwd, workspaceOnClient, writeSessionMount } from "./environment.js";
+import { isSafeAbsPath, resolveTuiCwd, sessionClientCwd, trustTuiCwd, workspaceOnClient, writeSessionMount } from "./environment.js";
+import { materializeClientDir } from "./config.js";
 import { debug } from "./debug.js";
 import { answerPermission, answerQuestion, modChannelConnected, onModEvent, type ModEvent, type PermissionDecision } from "./mod-channel.js";
 import { applyModEvent, stopReasonFromMod } from "./mod-live.js";
@@ -531,6 +535,19 @@ export interface AgentDeps {
   getPlanUsage?: PlanUsageSource;
   /** How long `session/load` waits for a forked child JSONL to inherit parent turns. */
   forkHistoryWaitMs?: number;
+  /** Client working directory from agent launch (`--cwd`). Not from ACP `_meta`. */
+  clientCwd?: string;
+  /** Host session folder the TUI should `cd` into. */
+  tuiRoot?: string;
+  /** Plugin stage directory. Falls back to `$CC_MODS_PLUGIN_DIR`. */
+  pluginDir?: string;
+  /** Per-instance Mods unix channel. Falls back to the process-wide bind. */
+  modChannel?: {
+    onEvent: (listener: (event: ModEvent) => void) => () => void;
+    connected: boolean;
+    answerPermission: (requestId: string, decision: PermissionDecision) => void;
+    answerQuestion: (requestId: string, answers: Record<string, string> | null) => void;
+  };
 }
 
 async function defaultGetPlanUsage(): Promise<PlanUsageView | undefined> {
@@ -609,9 +626,22 @@ export async function defaultStartEngine(args: StartEngineArgs): Promise<Started
   }
 
   if (args.resume && args.sessionId) {
+    const peeked = peekTranscript(args.sessionId, {
+      glob: args.locateOptions?.glob,
+      preferCwd: args.cwd,
+    });
+    const cwd = peeked?.cwd ?? args.cwd;
+    if (cwd.startsWith("/")) {
+      try {
+        mkdirSync(cwd, { recursive: true });
+      } catch {
+        /* spawn still uses cwd; Claude --resume may fail if the dir is missing */
+      }
+    }
+    if (cwd !== args.cwd) trustTuiCwd(cwd);
     const handle = spawnResumePty({
       sessionId: args.sessionId,
-      cwd: args.cwd,
+      cwd,
       baseEnv: args.baseEnv,
       spawn: args.spawn,
       permissionMode: args.permissionMode,
@@ -629,15 +659,15 @@ export async function defaultStartEngine(args: StartEngineArgs): Promise<Started
       engine.setPendingDiscovery(ac);
       void (async () => {
         try {
-          const { transcriptPath, cwd } = await resolveWatchTarget(args.sessionId!, {
+          const target = peeked ?? (await resolveWatchTarget(args.sessionId!, {
             watchdogMs: Infinity,
             ...args.locateOptions,
             signal: ac.signal,
-          });
+          }));
           const watcher = createJsonlWatcher({
             sessionId: args.sessionId!,
-            transcriptPath,
-            dir: cwd ?? args.cwd,
+            transcriptPath: target.transcriptPath,
+            dir: target.cwd ?? cwd,
             onEvent: () => args.onEvent?.(args.sessionId!),
           });
           engine.watcher = watcher;
@@ -655,21 +685,30 @@ export async function defaultStartEngine(args: StartEngineArgs): Promise<Started
         pty: handle.pty,
         watcher: undefined,
         engine,
-        cwd: args.cwd,
+        cwd,
       };
     }
 
-    const { transcriptPath, cwd } = await resolveWatchTarget(args.sessionId, {
-      ...args.locateOptions,
-    });
+    let transcriptPath: string;
+    let watchCwd: string | undefined;
+    if (peeked) {
+      transcriptPath = peeked.transcriptPath;
+      watchCwd = peeked.cwd;
+    } else {
+      const found = await resolveWatchTarget(args.sessionId, {
+        ...args.locateOptions,
+      });
+      transcriptPath = found.transcriptPath;
+      watchCwd = found.cwd;
+    }
     const watcher = createJsonlWatcher({
       sessionId: args.sessionId,
       transcriptPath,
-      dir: cwd,
+      dir: watchCwd ?? cwd,
       onEvent: () => args.onEvent?.(args.sessionId!),
     });
     const engine = new SessionEngine({ handle, watcher, sessions: args.sessions });
-    return { sessionId: args.sessionId, pty: handle.pty, watcher, engine, cwd };
+    return { sessionId: args.sessionId, pty: handle.pty, watcher, engine, cwd: watchCwd ?? cwd };
   }
 
   const engine = createSessionEngine({
@@ -733,15 +772,22 @@ function resolveAdditionalDirs(p: {
   return p.additionalDirectories ?? roots ?? [];
 }
 
-function computeSessionFingerprint(params: {
-  cwd: string;
-  mcpServers?: NewSessionRequest["mcpServers"];
-  additionalDirectories?: string[];
-  _meta?: NewSessionRequest["_meta"];
-}): string {
+function computeSessionFingerprint(
+  params: {
+    cwd: string;
+    mcpServers?: NewSessionRequest["mcpServers"];
+    additionalDirectories?: string[];
+    _meta?: NewSessionRequest["_meta"];
+  },
+  launchCwd?: string,
+): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
   const dirs = [...resolveAdditionalDirs(params)].sort();
-  return JSON.stringify({ cwd: params.cwd, mcpServers: servers, additionalDirectories: dirs });
+  return JSON.stringify({
+    cwd: sessionClientCwd(launchCwd, params.cwd),
+    mcpServers: servers,
+    additionalDirectories: dirs,
+  });
 }
 
 function sessionMatchesCwd(
@@ -1297,6 +1343,10 @@ export class ClaudeAcpAgent {
   private readonly getPlanUsage: PlanUsageSource;
   private readonly locateTranscriptFiles: (sessionId: string) => string[];
   private readonly forkHistoryWaitMs: number;
+  private readonly launchCwd: string | undefined;
+  private readonly tuiRoot: string | undefined;
+  private readonly pluginDir: string | undefined;
+  private readonly modChannel?: AgentDeps["modChannel"];
   private readonly engines: Map<string, SessionEngine> = new Map();
   private readonly unsubMod: () => void;
 
@@ -1315,6 +1365,10 @@ export class ClaudeAcpAgent {
     this.getPlanUsage = deps.getPlanUsage ?? defaultGetPlanUsage;
     this.locateTranscriptFiles = deps.findTranscript ?? findTranscript;
     this.forkHistoryWaitMs = deps.forkHistoryWaitMs ?? FORK_HISTORY_WAIT_MS;
+    this.launchCwd = deps.clientCwd && isSafeAbsPath(deps.clientCwd) ? deps.clientCwd : undefined;
+    this.tuiRoot = deps.tuiRoot && isSafeAbsPath(deps.tuiRoot) ? deps.tuiRoot : undefined;
+    this.pluginDir = deps.pluginDir;
+    this.modChannel = deps.modChannel;
     this.getMessages =
       (deps.liveDiff ?? false)
         ? createDiffEnrichedReader(deps.getMessages ?? defaultGetMessages, {
@@ -1350,9 +1404,17 @@ export class ClaudeAcpAgent {
       deps.deleteStoredSession ?? ((sessionId) => deleteSessionIfStored(sessionId, deleteSession));
     this.renameStoredSession =
       deps.renameStoredSession ?? ((sessionId, title, options) => renameSession(sessionId, title, options));
-    this.unsubMod = onModEvent((event) => {
+    this.unsubMod = (deps.modChannel?.onEvent ?? onModEvent)((event) => {
       void this.handleModEvent(event).catch((error) => this.logger.error("[mod-live]", error));
     });
+  }
+
+  private pluginDirectory(): string | undefined {
+    return this.pluginDir ?? process.env.CC_MODS_PLUGIN_DIR;
+  }
+
+  private modsConnected(): boolean {
+    return this.modChannel ? this.modChannel.connected : modChannelConnected();
   }
 
   private wrapClient(client: AcpClient): AcpClient {
@@ -1370,13 +1432,10 @@ export class ClaudeAcpAgent {
 
   /** Host TUI cwd for an ACP client cwd. Session JSONL is keyed by this path. */
   private tuiCwdFor(clientCwd: string): string {
-    const pluginDir = process.env.CC_MODS_PLUGIN_DIR;
     return resolveTuiCwd(
       clientCwd,
-      workspaceOnClient({
-        fs: this.clientCapabilities?.fs,
-        environmentFile: Boolean(pluginDir && existsSync(path.join(pluginDir, ENVIRONMENT_FILE))),
-      }),
+      workspaceOnClient({ fs: this.clientCapabilities?.fs }),
+      this.tuiRoot ?? process.cwd(),
     );
   }
 
@@ -1604,7 +1663,10 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const result = await this.getOrCreateSession(params, { replayOnly: true });
+    // Live sessions only need history replay. After a serve restart the
+    // in-memory engine is gone: spawn `claude --resume` so the TUI is not empty.
+    const live = Boolean(this.sessions[params.sessionId]);
+    const result = await this.getOrCreateSession(params, { replayOnly: live });
 
     await this.replaySessionHistory(params.sessionId, { force: true });
 
@@ -1802,6 +1864,15 @@ export class ClaudeAcpAgent {
     }
   }
 
+  private refreshSessionCost(sessionId: string, session: Session, messages?: SessionMessage[]): void {
+    const fromMessages = latestSessionCostUsd(messages ?? session.lastMessages ?? []);
+    const matches = findTranscript(sessionId);
+    const fromTranscript =
+      matches.length === 1 ? scanSessionCostFromJsonl(readFileTail(matches[0])) : undefined;
+    const cost = fromTranscript ?? fromMessages;
+    if (cost !== undefined) session.lastCostUsd = cost;
+  }
+
   private slashView(session: Session): SlashSessionView {
     const modelOpt = session.configOptions.find((o) => o.id === "model");
     const effortOpt = session.configOptions.find((o) => o.id === "effort");
@@ -1854,6 +1925,7 @@ export class ClaudeAcpAgent {
     name: string,
     args: string,
   ): Promise<PromptResponse> {
+    if (name === "usage") this.refreshSessionCost(sessionId, session);
     const view = this.slashView(session);
     if (name === "usage") view.plan = await this.loadPlanUsage();
     const result = dispatchSlash(name, args, view);
@@ -2132,6 +2204,7 @@ export class ClaudeAcpAgent {
   async handleGrokSessionUsage(params: GrokSessionIdParams): Promise<{ usage: Record<string, unknown> }> {
     const session = this.sessions[params.sessionId];
     if (!session) throw RequestError.resourceNotFound(params.sessionId);
+    this.refreshSessionCost(params.sessionId, session);
     return { usage: grokPromptUsage(session) };
   }
 
@@ -2503,12 +2576,7 @@ export class ClaudeAcpAgent {
         disallowedTools: session.disallowedTools,
         appendSystemPromptFile: session.appendSystemPromptFile,
         extraFlags: extraFlagsWithModel(this.relayFlags, this.currentModel(session)),
-        additionalDirectories: workspaceOnClient({
-          fs: this.clientCapabilities?.fs,
-          environmentFile: Boolean(process.env.CC_MODS_PLUGIN_DIR && existsSync(path.join(process.env.CC_MODS_PLUGIN_DIR, ENVIRONMENT_FILE))),
-        })
-          ? undefined
-          : session.additionalDirectories,
+        additionalDirectories: (session.additionalDirectories ?? []).filter((dir) => materializeClientDir(dir)),
         sessions: this.engines,
         onEvent: (sid) => void this.pumpUpdates(sid),
       });
@@ -2891,7 +2959,8 @@ export class ClaudeAcpAgent {
           inferContextWindowFromModelId(realModel) ?? session.contextWindowSize;
       }
       session.accumulatedUsage = addUsage(session.accumulatedUsage, carrier.usage);
-      if (typeof carrier.total_cost_usd === "number") session.lastCostUsd = carrier.total_cost_usd;
+      const cost = sessionCostUsdFromRecord(turn.message) ?? sessionCostUsdFromRecord(carrier);
+      if (cost !== undefined) session.lastCostUsd = cost;
       for (const usageUpdate of usageUpdatesFor(carrier, {
         usageUpdate: this.usageUpdate,
         contextWindowSize: session.contextWindowSize,
@@ -3109,7 +3178,7 @@ export class ClaudeAcpAgent {
     const info = toolInfoFromToolUse({ id: toolCallId, name: tool, input }, false, session?.cwd);
     let decision: PermissionDecision = "reject";
     if (!session) {
-      answerPermission(requestId, decision);
+      (this.modChannel ?? { answerPermission }).answerPermission(requestId, decision);
       return;
     }
     const abort = new AbortController();
@@ -3148,7 +3217,7 @@ export class ClaudeAcpAgent {
     } finally {
       if (session.permissionAbort === abort) session.permissionAbort = undefined;
     }
-    answerPermission(requestId, decision);
+    (this.modChannel ?? { answerPermission }).answerPermission(requestId, decision);
   }
 
   private async bridgeQuestion(sessionId: string, event: ModEvent): Promise<void> {
@@ -3170,7 +3239,7 @@ export class ClaudeAcpAgent {
         this.logger.error("[mod-live] elicitation failed:", err);
       }
     }
-    answerQuestion(requestId, answers);
+    (this.modChannel ?? { answerQuestion }).answerQuestion(requestId, answers);
   }
 
   private async pumpUpdates(sessionId: string): Promise<void> {
@@ -3178,7 +3247,7 @@ export class ClaudeAcpAgent {
     if (!session) return;
 
     session.interacted = true;
-    if (session.liveFromMod || modChannelConnected()) {
+    if (session.liveFromMod || this.modsConnected()) {
       const messages = await readOrderedMessages(sessionId, session.cwd, {
         getMessages: this.getMessages,
       });
@@ -3195,6 +3264,7 @@ export class ClaudeAcpAgent {
         for (const m of fed) registerGateToolUses(m, session.gate);
       }
       session.lastMessages = messages;
+      this.refreshSessionCost(sessionId, session, messages);
       await this.emitCompactionSignals(sessionId, session, messages, true);
       return;
     }
@@ -3264,6 +3334,7 @@ export class ClaudeAcpAgent {
     }
 
     session.lastMessages = messages;
+    this.refreshSessionCost(sessionId, session, messages);
     if (this.liveSubagentWatch) {
       if (!session.subagentWatcher && hasSubagentSpawn(messages) && spawnIdsOpen(messages)) {
         session.subagentWatcher = createSubagentWatcher({
@@ -3598,7 +3669,7 @@ export class ClaudeAcpAgent {
   ): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
     if (existingSession) {
-      const fingerprint = computeSessionFingerprint(params);
+      const fingerprint = computeSessionFingerprint(params, this.launchCwd);
       if (opts.replayOnly || fingerprint === existingSession.sessionFingerprint) {
         return {
           sessionId: params.sessionId,
@@ -3645,17 +3716,15 @@ export class ClaudeAcpAgent {
     }
 
     const additionalDirs = resolveAdditionalDirs(params);
-    const pluginDir = process.env.CC_MODS_PLUGIN_DIR;
-    const onClient = workspaceOnClient({
-      fs: this.clientCapabilities?.fs,
-      environmentFile: Boolean(pluginDir && existsSync(path.join(pluginDir, ENVIRONMENT_FILE))),
-    });
-    const tuiCwd = resolveTuiCwd(params.cwd, onClient);
+    const pluginDir = this.pluginDirectory();
+    const onClient = workspaceOnClient({ fs: this.clientCapabilities?.fs });
+    const clientCwd = sessionClientCwd(this.launchCwd, params.cwd);
+    const tuiCwd = this.tuiCwdFor(clientCwd);
     if (onClient) trustTuiCwd(tuiCwd);
     if (pluginDir) {
-      await writeSessionMount(pluginDir, params.cwd, additionalDirs);
+      await writeSessionMount(pluginDir, additionalDirs);
     }
-    const spawnDirs = onClient ? undefined : additionalDirs;
+    const spawnDirs = additionalDirs.filter((dir) => materializeClientDir(dir));
 
     const sessionMeta = params._meta as NewSessionMeta | null | undefined;
     const localToolForward = isLocalToolForwardEnabled(process.env, sessionMeta);
@@ -3677,7 +3746,7 @@ export class ClaudeAcpAgent {
         disallowedTools = resolveDisallowedBuiltins(sessionMeta);
         appendSystemPromptFile = await writeAppendSystemPromptFile(
           buildLocalEnvironmentAppend({
-            cwd: params.cwd,
+            cwd: clientCwd,
             servers: forwardMcpServers,
           }),
         );
@@ -3738,6 +3807,7 @@ export class ClaudeAcpAgent {
         fork: !!creationOpts.forkSession,
         resumeFrom: creationOpts.forkSession ? creationOpts.resume : undefined,
         replayOnly: creationOpts.replayOnly,
+        locateOptions: { glob: this.locateTranscriptFiles },
         sessions: this.engines,
         onEvent: (sid) => void this.pumpUpdates(sid),
         permissionMode: seededMode,
@@ -3830,7 +3900,7 @@ export class ClaudeAcpAgent {
       engine: started.engine,
       cancelled: false,
       cwd: runtimeCwd,
-      clientCwd: params.cwd,
+      clientCwd,
       additionalDirectories: additionalDirs,
       mcpConfigFile,
       mcpServers: params.mcpServers,
@@ -3839,7 +3909,7 @@ export class ClaudeAcpAgent {
       forwardMcpServers,
       appendSystemPromptFile,
       disallowedTools,
-      sessionFingerprint: computeSessionFingerprint(params),
+      sessionFingerprint: computeSessionFingerprint(params, this.launchCwd),
       settingsManager,
       accumulatedUsage: { ...EMPTY_USAGE },
       lastContextUsed: 0,
@@ -4508,11 +4578,10 @@ export function toAcpNotifications(
   return output;
 }
 
-export function runAcp(deps?: AgentDeps) {
-  const input = nodeToWebWritable(process.stdout);
-  const output = nodeToWebReadable(process.stdin);
-
-  const stream = ndJsonStream(input, output);
+export function runAcp(stream?: ReturnType<typeof ndJsonStream>, deps?: AgentDeps) {
+  const resolved =
+    stream ??
+    ndJsonStream(nodeToWebWritable(process.stdout), nodeToWebReadable(process.stdin));
   // eslint-disable-next-line prefer-const
   let agent: ClaudeAcpAgent;
   const connection = acpAgent()
@@ -4578,7 +4647,7 @@ export function runAcp(deps?: AgentDeps) {
       agent.handleGrokInterject(ctx.params),
     )
     .onRequest(methods.agent.logout, async (ctx) => (await agent.logout(ctx.params)) ?? {})
-    .connect(stream);
+    .connect(resolved);
   agent = new ClaudeAcpAgent(new ClientConnection(connection.client), undefined, deps);
   return { connection, agent };
 }

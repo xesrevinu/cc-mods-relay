@@ -168,10 +168,10 @@ function planContributorLines(plan: PlanUsageView | undefined): string[] {
 }
 
 export function formatUsage(session: SlashSessionView): string {
-  const lines = [
-    "Session",
-    `  ${padLabel("Total cost:")}${formatUsd(session.costUsd ?? 0)}`,
-  ];
+  const lines = ["Session"];
+  if (typeof session.costUsd === "number" && Number.isFinite(session.costUsd)) {
+    lines.push(`  ${padLabel("Total cost:")}${formatUsd(session.costUsd)}`);
+  }
   if (typeof session.startedAtMs === "number") {
     const now = session.nowMs ?? Date.now();
     lines.push(`  ${padLabel("Wall time:")}${formatDuration(now - session.startedAtMs)}`);

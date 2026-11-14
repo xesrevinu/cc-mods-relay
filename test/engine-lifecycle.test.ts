@@ -7,7 +7,7 @@ const FORK = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 test("resume keeps the same session id and does not spawn a fresh claude", () => {
   const [, cmd] = buildResumeArgv(SOURCE);
-  expect(cmd).toBe(`exec claude --resume "${SOURCE}"`);
+  expect(cmd).toBe(`exec claude --resume "${SOURCE}" --allowedTools Grep,Glob`);
   expect(cmd).not.toContain("||");
 });
 
@@ -20,7 +20,7 @@ test("fork resumes the source session under a new session id", () => {
     forkSessionId: FORK,
   });
   expect(cmd).toBe(
-    `exec claude --resume "${SOURCE}" --fork-session --session-id "${FORK}"`,
+    `exec claude --resume "${SOURCE}" --fork-session --session-id "${FORK}" --allowedTools Grep,Glob`,
   );
   expect(cmd).not.toContain("|| claude");
 });

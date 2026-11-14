@@ -7,5 +7,9 @@ plugin/tsconfig.json
 .zed/
 node_modules
 dist
+tmp/
+*.bun-build
+.*.bun-build
 scripts/e2e-live-tools.ts
 scripts/e2e-orient.ts
+scripts/dump-cc-system-prompt.ts

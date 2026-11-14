@@ -15,6 +15,38 @@ export function findTranscript(sessionId: string): string[] {
   return globSync(transcriptGlob(sessionId));
 }
 
+function mtimeMs(path: string): number {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/** Prefer `preferCwd` from inside the JSONL, otherwise the newest file. */
+export function selectTranscript(paths: string[], preferCwd?: string): string {
+  if (paths.length === 1) return paths[0]!;
+  if (preferCwd) {
+    const hit = paths.find((p) => readCwdFromInside(p) === preferCwd);
+    if (hit) return hit;
+  }
+  return paths.slice().sort((a, b) => mtimeMs(b) - mtimeMs(a) || b.localeCompare(a))[0]!;
+}
+
+/**
+ * Existing JSONL for a session id, if any. Does not wait.
+ * Mapping changes can leave the same id under more than one projects folder.
+ */
+export function peekTranscript(
+  sessionId: string,
+  opts: { glob?: (sessionId: string) => string[]; preferCwd?: string } = {},
+): { transcriptPath: string; cwd: string | undefined } | undefined {
+  const matches = opts.glob?.(sessionId) ?? findTranscript(sessionId);
+  if (matches.length === 0) return undefined;
+  const transcriptPath = selectTranscript(matches, opts.preferCwd);
+  return { transcriptPath, cwd: readCwdFromInside(transcriptPath) };
+}
+
 export const FILE_DISCOVERY_WATCHDOG_MS = 2000;
 
 export const DEFAULT_POLL_INTERVAL_MS = 50;

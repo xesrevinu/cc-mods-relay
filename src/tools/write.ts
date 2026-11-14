@@ -3,8 +3,8 @@ import { dirname } from "node:path";
 import { asString, mapPath } from "./paths.js";
 import { structuredPatch } from "./patch.js";
 
-export async function writeTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = []) {
-  const path = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs);
+export async function writeTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string) {
+  const path = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const content = asString(input.content);
   const existed = await Bun.file(path).exists();
   const originalFile = existed ? await Bun.file(path).text() : null;

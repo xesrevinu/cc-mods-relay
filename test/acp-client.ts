@@ -94,6 +94,14 @@ export class AcpTestClient {
       .join("");
   }
 
+  kill(signal: NodeJS.Signals = "SIGTERM"): void {
+    this.proc.kill(signal);
+  }
+
+  get exited(): Promise<number> | undefined {
+    return this.proc.exited;
+  }
+
   async stop(): Promise<void> {
     if (this.closed) return;
     this.closed = true;

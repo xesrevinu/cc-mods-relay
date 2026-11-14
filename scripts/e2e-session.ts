@@ -5,9 +5,7 @@
  *
  * Usage: bun scripts/e2e-session.ts
  */
-import { openRemote } from "../src/client.js";
-import { configuredHost } from "../src/config.js";
-import { AcpTestClient } from "../test/acp-client.js";
+import { spawnLiveShim } from "./shim-client.js";
 
 function liveEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
@@ -58,10 +56,8 @@ function chunkText(updates: Record<string, unknown>[]): string {
 }
 
 async function main(): Promise<void> {
-  const host = (await configuredHost()) || "cc-remote";
-  console.error(`[session-e2e] host=${host}`);
-  const opened = await openRemote(host, { cwd: process.cwd(), env: liveEnv(), inheritErr: true });
-  const client = AcpTestClient.fromNode(opened.child);
+  const client = await spawnLiveShim(process.cwd(), liveEnv());
+  console.error("[session-e2e] shim connected");
   const failures: string[] = [];
   try {
     await client.request(
@@ -192,7 +188,6 @@ async function main(): Promise<void> {
     }
   } finally {
     await client.stop();
-    opened.relay.stop();
   }
 }
 

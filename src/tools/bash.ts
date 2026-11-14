@@ -1,10 +1,18 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnEnv, withDirenv } from "./direnv.js";
 import { cancelCall, finishJob, registerJob, wasCancelled } from "./jobs.js";
-import { asBool, asNumber, asString, inside } from "./paths.js";
+import { asBool, asNumber, asString, mapCwd, mergeRoots, rewriteRemoteText } from "./paths.js";
 
-type ToolFrame = { callId?: string; sessionId?: string; cwd?: string; tool?: string };
+type ToolFrame = {
+  callId?: string;
+  sessionId?: string;
+  cwd?: string;
+  tuiRoot?: string;
+  extraDirs?: string[];
+  tool?: string;
+};
 
 type Send = (frame: Record<string, unknown>) => void;
 
@@ -13,16 +21,34 @@ const cwdBySession = new Map<string, string>();
 
 export { cancelCall };
 
-function sessionCwd(frame: ToolFrame, workspace: string): string {
-  const id = frame.sessionId || "";
-  return cwdBySession.get(id) || frame.cwd || workspace;
+export function sessionCwd(frame: ToolFrame, workspace: string): string {
+  const id = frame.sessionId;
+  if (id) {
+    const next = cwdBySession.get(id);
+    if (next) return next;
+  }
+  return frame.cwd || workspace;
 }
 
-function persistCwd(workspace: string, sessionId: string, next: string): void {
+function real(path: string): string {
   try {
-    cwdBySession.set(sessionId, inside(workspace, next));
+    return existsSync(path) ? realpathSync(path) : path;
+  } catch {
+    return path;
+  }
+}
+
+export function persistCwd(workspace: string, sessionId: string, next: string, extraDirs: string[] = []): void {
+  if (!sessionId) return;
+  try {
+    const root = real(workspace);
+    cwdBySession.set(sessionId, mapCwd(root, undefined, real(next), extraDirs, root));
   } catch {
   }
+}
+
+export function resetSessionCwd(sessionId: string): void {
+  if (sessionId) cwdBySession.delete(sessionId);
 }
 
 function killTree(pid: number): void {
@@ -60,13 +86,16 @@ export async function bashTool(
   input: Record<string, unknown>,
   notify: Send,
 ): Promise<Record<string, unknown>> {
-  const command = asString(input.command);
+  const extraDirs = mergeRoots(frame.extraDirs);
+  const command = rewriteRemoteText(asString(input.command), workspace, frame.tuiRoot);
   const cwd = sessionCwd(frame, workspace);
   const callId = frame.callId ?? "";
   const sessionId = frame.sessionId || "";
 
   if (wasCancelled(callId)) return abortedResult();
-  if (asBool(input.run_in_background)) return background(frame, command, cwd, notify);
+  const env = await withDirenv(cwd, process.env);
+  if (wasCancelled(callId)) return abortedResult();
+  if (asBool(input.run_in_background)) return background(frame, command, cwd, env, notify);
 
   const pwdFile = join(tmpdir(), `cc-mods-pwd-${process.pid}-${callId || Date.now()}`);
   const argv = shellArgv(frame.tool || "Bash", command);
@@ -77,7 +106,7 @@ export async function bashTool(
     stdout: "pipe",
     stderr: "pipe",
     detached: process.platform !== "win32",
-    env: { ...process.env, __CC_PWD: pwdFile },
+    env: spawnEnv({ ...env, __CC_PWD: pwdFile }),
   });
   registerJob(callId, sessionId, () => killTree(proc.pid));
   if (wasCancelled(callId)) {
@@ -107,7 +136,7 @@ export async function bashTool(
   clearTimeout(timer);
   const aborted = finishJob(callId);
   const nextCwd = (await Bun.file(pwdFile).text().catch(() => "")).trim();
-  if (nextCwd) persistCwd(workspace, sessionId, nextCwd);
+  if (nextCwd) persistCwd(workspace, sessionId, nextCwd, extraDirs);
   await Bun.file(pwdFile).delete().catch(() => {});
 
   let stderr = clip(stderrRaw);
@@ -121,12 +150,18 @@ export async function bashTool(
   };
 }
 
-function background(frame: ToolFrame, command: string, cwd: string, notify: Send): Record<string, unknown> {
+function background(
+  frame: ToolFrame,
+  command: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  notify: Send,
+): Record<string, unknown> {
   const output = join(tmpdir(), `cc-mods-bg-${process.pid}-${Date.now()}.log`);
   mkdirSync(tmpdir(), { recursive: true });
   const proc = Bun.spawn(["bash", "-c", `exec >>"$OUT" 2>&1\n${command}`], {
     cwd,
-    env: { ...process.env, OUT: output },
+    env: spawnEnv({ ...env, OUT: output }),
     stdin: "ignore",
     stdout: "ignore",
     stderr: "ignore",

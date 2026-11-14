@@ -2,12 +2,12 @@ import { expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { which } from "bun";
-import { prepareLocal } from "../../src/client.js";
+import { startServer } from "../../src/server.js";
 import { startMockAnthropic, toolResultsFromBody } from "../../src/mock-anthropic.js";
 import { AcpTestClient } from "../acp-client.js";
 import { MARKER, claudeBin, isolatedWorkspace, tuiEnv, tuiInitializeParams } from "../harness.js";
 
-const AGENT = join(import.meta.dir, "../../src/agent.ts");
+const INDEX = join(import.meta.dir, "../../src/index.ts");
 const TOOL_ID = "toolu_01ReadHelloTxtXXXXXX000000";
 
 test("herdr TUI ACP handshake forwards Read through Mods to the mock API", async () => {
@@ -19,7 +19,7 @@ test("herdr TUI ACP handshake forwards Read through Mods to the mock API", async
   const dirs = isolatedWorkspace();
   mkdirSync(join(dirs.root, "herdr-home"));
   const mock = startMockAnthropic([
-    { blocks: [{ type: "tool_use", id: TOOL_ID, name: "Read", input: { file_path: join(dirs.tui, "hello.txt") } }] },
+    { blocks: [{ type: "tool_use", id: TOOL_ID, name: "Read", input: { file_path: "hello.txt" } }] },
     { blocks: [{ type: "text", text: "herdr-read-ok" }] },
   ]);
   const herdrSession = `cc-mods-test-${process.pid}-${Date.now()}`;
@@ -34,8 +34,12 @@ test("herdr TUI ACP handshake forwards Read through Mods to the mock API", async
       CLAUDE_TUI_READY_TIMEOUT_MS: "45000",
     },
   });
-  const { relay, pluginDir } = await prepareLocal(dirs.project, dirs.tui);
-  const client = AcpTestClient.spawn(["bun", AGENT, "--plugin-dir", pluginDir], { cwd: dirs.tui, env });
+  const token = "herdr-token";
+  const server = startServer({ token, hostname: "127.0.0.1", port: 0 });
+  const client = AcpTestClient.spawn(["bun", INDEX, "--url", server.sessionUrl, "--token", token], {
+    cwd: dirs.project,
+    env,
+  });
 
   try {
     const init = await client.request<{ protocolVersion: number }>(
@@ -47,12 +51,10 @@ test("herdr TUI ACP handshake forwards Read through Mods to the mock API", async
 
     const session = await client.request<{ sessionId: string }>(
       "session/new",
-      { cwd: dirs.tui, mcpServers: [] },
+      { cwd: dirs.project, mcpServers: [] },
       90_000,
     );
     expect(session.sessionId).toBeTruthy();
-
-    const pluginConnected = await relay.waitUntilReady(8_000).then(() => true).catch(() => false);
 
     const prompt = await client.request<{ stopReason: string }>(
       "session/prompt",
@@ -60,7 +62,7 @@ test("herdr TUI ACP handshake forwards Read through Mods to the mock API", async
       120_000,
     ).catch((err) => {
       throw new Error(
-        `${err instanceof Error ? err.message : err}\npluginConnected=${pluginConnected}\nupdates=${JSON.stringify(client.updates).slice(0, 2000)}\npermissions=${client.permissions.length}\nmock=${JSON.stringify(mock.requests.map((r) => ({ path: r.path, cls: r.requestClass })))}`,
+        `${err instanceof Error ? err.message : err}\nupdates=${JSON.stringify(client.updates).slice(0, 2000)}\npermissions=${client.permissions.length}\nmock=${JSON.stringify(mock.requests.map((r) => ({ path: r.path, cls: r.requestClass })))}`,
       );
     });
     expect(["end_turn", "max_tokens", "stop_sequence"]).toContain(prompt.stopReason);
@@ -78,7 +80,7 @@ test("herdr TUI ACP handshake forwards Read through Mods to the mock API", async
     await client.request("session/close", { sessionId: session.sessionId }, 15_000);
   } finally {
     await client.stop();
-    relay.stop();
+    await server.stop();
     mock.stop();
   }
 }, 180_000);

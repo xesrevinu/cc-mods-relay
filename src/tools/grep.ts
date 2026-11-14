@@ -49,11 +49,12 @@ export async function grepTool(
   extraDirs: string[] = [],
   callId = "",
   sessionId = "",
+  project?: string,
 ) {
   const mode: Mode = asString(input.output_mode) === "content" || asString(input.output_mode) === "count"
     ? asString(input.output_mode) as Mode
     : "files_with_matches";
-  const path = mapPath(cwd, tuiRoot, asString(input.path, ".") || ".", extraDirs);
+  const path = mapPath(cwd, tuiRoot, asString(input.path, ".") || ".", extraDirs, project);
   if (wasCancelled(callId)) throw new Error("Tool call was cancelled");
   const proc = Bun.spawn(argv(input, mode, path), { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   registerJob(callId, sessionId, () => {

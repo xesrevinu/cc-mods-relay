@@ -39,8 +39,8 @@ function ioMessage(path: string, error: unknown, missing: string): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-export async function readTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = []) {
-  const path = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs);
+export async function readTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string) {
+  const path = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const file = Bun.file(path);
   let info: { isDirectory(): boolean; size: number };
   try {

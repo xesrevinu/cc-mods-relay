@@ -1,19 +1,26 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { withPlugin } from "../src/compose.js";
-import { sessionSyncPaths } from "../src/launch.js";
+import {
+  collectHomeFiles,
+  collectSessionFiles,
+  hashSyncFiles,
+  homeSyncPaths,
+  rememberSessionSync,
+  selectSyncFiles,
+  sessionSyncPaths,
+  writeHomeFiles,
+} from "../src/launch.js";
 import { debugOn, summarize } from "../src/debug.js";
 import { buildSanitizedEnv, buildSpawnArgv, extraClaudeFlags, parseCcModsRelayMeta } from "../src/engine-pty.js";
 import { remoteEnvPrefix } from "../src/ssh.js";
 import { TEST_API_KEY, isolatedWorkspace, pinMockSettings, testApiKeySuffix } from "./harness.js";
 import {
-  buildEnvironmentAppend,
-  ENVIRONMENT_FILE,
   EXTRA_DIRS_FILE,
-  extraDirsLine,
   resolveTuiCwd,
+  sessionClientCwd,
   trustTuiCwd,
   workspaceOnClient,
   writeSessionMount,
@@ -21,21 +28,6 @@ import {
 import { mapPath } from "../src/exec.js";
 import { isLocalToolForwardEnabled } from "../src/local-tool-forward.js";
 import { assertMockBaseUrl } from "../src/mock-anthropic.js";
-
-test("environment append names the Mac cwd and inlines AGENTS.md and CLAUDE.md", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "cc-mods-env-"));
-  writeFileSync(join(dir, "CLAUDE.md"), "use bun");
-  writeFileSync(join(dir, "AGENTS.md"), "prefer AGENTS.md");
-  const text = await buildEnvironmentAppend(dir);
-  expect(text).toContain("# Environment");
-  expect(text).toContain(`Working directory: ${dir}`);
-  expect(text).toContain("File and shell tools");
-  expect(text).toContain("Contents of " + join(dir, "CLAUDE.md"));
-  expect(text).toContain("Contents of " + join(dir, "AGENTS.md"));
-  expect(text).toContain("use bun");
-  expect(text).toContain("prefer AGENTS.md");
-  expect(text).toContain("Is a git repository: no");
-});
 
 test("session sync includes AGENTS.md even when .claude is absent", () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-mods-sync-"));
@@ -46,42 +38,125 @@ test("session sync includes AGENTS.md even when .claude is absent", () => {
   expect(sessionSyncPaths(dir)).toEqual([".claude", "AGENTS.md", "CLAUDE.md"]);
 });
 
-test("environment append includes git snapshot when the cwd is a repo", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "cc-mods-git-"));
-  const git = (args: string[]) => Bun.spawnSync(["git", ...args], { cwd: dir });
-  git(["init"]);
-  git(["config", "user.email", "t@t"]);
-  git(["config", "user.name", "t"]);
-  writeFileSync(join(dir, "a.txt"), "a\n");
-  git(["add", "a.txt"]);
-  git(["commit", "-m", "init"]);
-  const text = await buildEnvironmentAppend(dir);
-  expect(text).toContain("Is a git repository: yes");
-  expect(text).toContain("# gitStatus");
-  expect(text).toContain("init");
+test("session sync includes .agents and .claude/.agents", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-sync-agents-"));
+  mkdirSync(join(dir, ".agents", "skills", "demo"), { recursive: true });
+  writeFileSync(join(dir, ".agents", "skills", "demo", "SKILL.md"), "# skill\n");
+  expect(sessionSyncPaths(dir)).toEqual([".agents"]);
+  mkdirSync(join(dir, ".claude", ".agents"), { recursive: true });
+  writeFileSync(join(dir, ".claude", ".agents", "foo.md"), "# agent\n");
+  expect(sessionSyncPaths(dir)).toEqual([".claude", ".agents"]);
+  expect(collectSessionFiles(dir).map((file) => file.path).sort()).toEqual([
+    ".agents/skills/demo/SKILL.md",
+    ".claude/.agents/foo.md",
+  ]);
 });
 
-test("withPlugin adds append-system-prompt-file when the plugin ships environment.txt", () => {
+test("home sync copies user-level skills and agents, not transcripts", () => {
+  const home = mkdtempSync(join(tmpdir(), "cc-mods-home-sync-"));
+  mkdirSync(join(home, ".claude", "skills", "demo"), { recursive: true });
+  mkdirSync(join(home, ".claude", "agents"), { recursive: true });
+  mkdirSync(join(home, ".claude", ".agents"), { recursive: true });
+  mkdirSync(join(home, ".claude", "projects", "x"), { recursive: true });
+  mkdirSync(join(home, ".agents", "skills", "work"), { recursive: true });
+  writeFileSync(join(home, ".claude", "skills", "demo", "SKILL.md"), "# skill\n");
+  writeFileSync(join(home, ".claude", "agents", "review.md"), "# agent\n");
+  writeFileSync(join(home, ".claude", ".agents", "nested.md"), "# nested\n");
+  writeFileSync(join(home, ".claude", "CLAUDE.md"), "# global\n");
+  writeFileSync(join(home, ".claude", "projects", "x", "session.jsonl"), "{}\n");
+  writeFileSync(join(home, ".claude.json"), '{"oauth":true}\n');
+  writeFileSync(join(home, ".agents", "skills", "work", "SKILL.md"), "# work\n");
+  expect(homeSyncPaths(home)).toEqual([
+    ".claude/skills",
+    ".claude/agents",
+    ".claude/.agents",
+    ".agents",
+    ".claude/CLAUDE.md",
+  ]);
+  expect(collectHomeFiles(home).map((file) => file.path).sort()).toEqual([
+    ".agents/skills/work/SKILL.md",
+    ".claude/.agents/nested.md",
+    ".claude/CLAUDE.md",
+    ".claude/agents/review.md",
+    ".claude/skills/demo/SKILL.md",
+  ]);
+
+  const dest = mkdtempSync(join(tmpdir(), "cc-mods-home-write-"));
+  writeHomeFiles(dest, [
+    ...collectHomeFiles(home),
+    { path: ".claude/projects/x/session.jsonl", content: "nope\n" },
+    { path: "../escape.md", content: "nope\n" },
+    { path: ".claude.json", content: "nope\n" },
+  ]);
+  expect(readFileSync(join(dest, ".claude/skills/demo/SKILL.md"), "utf8")).toBe("# skill\n");
+  expect(readFileSync(join(dest, ".agents/skills/work/SKILL.md"), "utf8")).toBe("# work\n");
+  expect(existsSync(join(dest, ".claude/projects/x/session.jsonl"))).toBe(false);
+  expect(existsSync(join(dest, ".claude.json"))).toBe(false);
+  expect(existsSync(join(dest, "escape.md"))).toBe(false);
+});
+
+test("local sync hashes skip unchanged project and home payloads", () => {
+  const config = mkdtempSync(join(tmpdir(), "cc-mods-sync-cache-"));
+  const prev = Bun.env.CC_MODS_CONFIG_DIR;
+  Bun.env.CC_MODS_CONFIG_DIR = config;
+  try {
+    const cwd = mkdtempSync(join(tmpdir(), "cc-mods-sync-proj-"));
+    const home = mkdtempSync(join(tmpdir(), "cc-mods-sync-home-"));
+    mkdirSync(join(cwd, ".agents", "skills", "demo"), { recursive: true });
+    mkdirSync(join(home, ".agents", "skills", "work"), { recursive: true });
+    writeFileSync(join(cwd, "AGENTS.md"), "# project\n");
+    writeFileSync(join(cwd, ".agents", "skills", "demo", "SKILL.md"), "# demo\n");
+    writeFileSync(join(home, ".agents", "skills", "work", "SKILL.md"), "# work\n");
+    const files = collectSessionFiles(cwd);
+    const homeFiles = collectHomeFiles(home);
+    const url = "ws://127.0.0.1:18765/session";
+    expect(hashSyncFiles(files)).toBe(hashSyncFiles([...files].reverse()));
+
+    const first = selectSyncFiles(url, cwd, home, files, homeFiles);
+    expect(first.files).toEqual(files);
+    expect(first.homeFiles).toEqual(homeFiles);
+    rememberSessionSync(url, cwd, home, first.projectHash, first.homeHash);
+
+    const second = selectSyncFiles(url, cwd, home, files, homeFiles);
+    expect(second.files).toBeUndefined();
+    expect(second.homeFiles).toBeUndefined();
+    expect(second.projectHash).toBe(first.projectHash);
+    expect(second.homeHash).toBe(first.homeHash);
+
+    writeFileSync(join(cwd, "AGENTS.md"), "# project changed\n");
+    const filesChanged = collectSessionFiles(cwd);
+    const third = selectSyncFiles(url, cwd, home, filesChanged, homeFiles);
+    expect(third.files).toEqual(filesChanged);
+    expect(third.homeFiles).toBeUndefined();
+    expect(third.projectHash).not.toBe(first.projectHash);
+    expect(third.homeHash).toBe(first.homeHash);
+  } finally {
+    if (prev == null) delete Bun.env.CC_MODS_CONFIG_DIR;
+    else Bun.env.CC_MODS_CONFIG_DIR = prev;
+  }
+});
+
+test("withPlugin only adds --plugin-dir", () => {
   const plugin = mkdtempSync(join(tmpdir(), "cc-mods-plug-"));
-  writeFileSync(join(plugin, ENVIRONMENT_FILE), "Working directory: /Users/me/proj\n");
+  writeFileSync(join(plugin, "environment.txt"), "Working directory: /tmp/proj\n");
   const cmd = withPlugin("claude --session-id sess", plugin);
   expect(cmd).toContain(`--plugin-dir '${plugin}'`);
-  expect(cmd).toContain(`--append-system-prompt-file '${plugin}/${ENVIRONMENT_FILE}'`);
+  expect(cmd).not.toContain("--append-system-prompt-file");
 });
 
 test("Mac absolute paths already under cwd pass through mapPath", () => {
   const cwd = "/Users/me/proj";
-  const tui = "/Users/ray/Workspace/abc";
+  const tui = "/Users/bob/Workspace/abc";
   expect(mapPath(cwd, tui, "/Users/me/proj/src/a.ts")).toBe("/Users/me/proj/src/a.ts");
 });
 
-test("remote TUI cwd stays on Mini; extra dirs are named in the environment append", () => {
+test("remote TUI cwd stays on Mini when the client path is missing here", () => {
   expect(workspaceOnClient({ fs: { readTextFile: true, writeTextFile: true } })).toBe(true);
-  expect(workspaceOnClient({ environmentFile: true })).toBe(true);
   expect(workspaceOnClient({ fs: {} })).toBe(false);
-  expect(resolveTuiCwd("/Users/me/proj", true, "/tmp/tui")).toBe("/tmp/tui");
-  expect(resolveTuiCwd("/Users/me/proj", false, "/tmp/tui")).toBe("/Users/me/proj");
-  expect(extraDirsLine(["/Users/me/other"])).toContain("/Users/me/other");
+  expect(resolveTuiCwd("/tmp/cc-mods-missing-proj", true, "/tmp/tui")).toBe("/tmp/tui");
+  expect(resolveTuiCwd("/tmp/cc-mods-missing-proj", false, "/tmp/tui")).toBe("/tmp/cc-mods-missing-proj");
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-tui-"));
+  expect(resolveTuiCwd(dir, true, "/tmp/tui")).toBe(dir);
 });
 
 test("trustTuiCwd marks the host session cwd trusted without rewriting other projects", () => {
@@ -98,11 +173,9 @@ test("trustTuiCwd marks the host session cwd trusted without rewriting other pro
 
 test("session mount writes extra dirs next to the plugin without process.env", async () => {
   const plugin = mkdtempSync(join(tmpdir(), "cc-mods-mount-"));
-  writeFileSync(join(plugin, ENVIRONMENT_FILE), "Working directory: /Users/me/proj\n");
-  await writeSessionMount(plugin, "/Users/me/proj", ["/Users/me/other"]);
-  expect(JSON.parse(readFileSync(join(plugin, EXTRA_DIRS_FILE), "utf8"))).toEqual(["/Users/me/other"]);
-  expect(readFileSync(join(plugin, ENVIRONMENT_FILE), "utf8")).toContain("/Users/me/other");
-  expect(readFileSync(join(plugin, ENVIRONMENT_FILE), "utf8")).toContain("Working directory: /Users/me/proj");
+  await writeSessionMount(plugin, ["/tmp/other"]);
+  expect(JSON.parse(readFileSync(join(plugin, EXTRA_DIRS_FILE), "utf8"))).toEqual(["/tmp/other"]);
+  expect(existsSync(join(plugin, "environment.txt"))).toBe(false);
 });
 
 test("isolated TUI config pre-approves the mock API key under CLAUDE_CONFIG_DIR", () => {
@@ -140,7 +213,7 @@ test("mock guard refuses a real Anthropic base URL", () => {
 });
 
 test("extra Claude flags come from initialize._meta.ccModsRelay", () => {
-  expect(extraClaudeFlags({})).toBe("");
+  expect(extraClaudeFlags({})).toBe(" --allowedTools Grep,Glob");
   expect(parseCcModsRelayMeta({ ccModsRelay: { noChrome: true, skipPermissions: true, tools: ["Read", "Write"] } })).toEqual({
     noChrome: true,
     skipPermissions: true,
@@ -149,7 +222,13 @@ test("extra Claude flags come from initialize._meta.ccModsRelay", () => {
   expect(extraClaudeFlags({ noChrome: true, skipPermissions: true, tools: ["Read", "Write"] })).toBe(
     " --no-chrome --dangerously-skip-permissions --tools Read,Write",
   );
-  expect(extraClaudeFlags({ model: "haiku" })).toBe(" --model haiku");
+  expect(extraClaudeFlags({ model: "haiku" })).toBe(" --allowedTools Grep,Glob --model haiku");
+});
+
+test("launch --cwd is the client pwd; session/new.cwd is only a fallback", () => {
+  expect(sessionClientCwd("/Users/alice/proj", "/Users/bob/stub")).toBe("/Users/alice/proj");
+  expect(sessionClientCwd(undefined, "/Users/bob/stub")).toBe("/Users/bob/stub");
+  expect(sessionClientCwd("relative", "/Users/bob/stub")).toBe("/Users/bob/stub");
 });
 
 test("debug tracing is off unless CC_MODS_DEBUG is set", () => {
@@ -162,7 +241,7 @@ test("TUI spawn env looks like a user session and drops billing plus relay inter
   const env = buildSanitizedEnv({
     PATH: "/bin",
     HOME: "/tmp/iso",
-    USER: "kee",
+    USER: "alice",
     LANG: "en_US.UTF-8",
     EDITOR: "vim",
     XDG_CONFIG_HOME: "/tmp/iso/.config",
@@ -176,7 +255,7 @@ test("TUI spawn env looks like a user session and drops billing plus relay inter
     CLAUDE_TUI_BACKEND: "herdr",
   });
   expect(env.PATH).toBe("/bin");
-  expect(env.USER).toBe("kee");
+  expect(env.USER).toBe("alice");
   expect(env.EDITOR).toBe("vim");
   expect(env.XDG_CONFIG_HOME).toBe("/tmp/iso/.config");
   expect(env.SSH_AUTH_SOCK).toBe("/tmp/ssh.sock");

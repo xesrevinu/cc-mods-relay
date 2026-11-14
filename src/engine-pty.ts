@@ -131,6 +131,9 @@ export function extraClaudeFlags(flags: CcModsRelayFlags = {}): string {
     .map((name) => name.trim())
     .filter((name) => TOOL_NAME.test(name));
   if (tools.length) out += ` --tools ${tools.join(",")}`;
+  // Native macOS/Linux CC drops Grep/Glob in favor of bash find/grep. Naming
+  // either in --allowedTools restores both without replacing the default set.
+  else out += " --allowedTools Grep,Glob";
   if (flags.model && MODEL_NAME.test(flags.model)) out += ` --model ${flags.model}`;
   return out;
 }

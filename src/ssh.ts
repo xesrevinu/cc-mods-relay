@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { userInfo } from "node:os";
 import { hostDirFor } from "./config.js";
+import { collectForwardedEnv } from "./forwarded-env.js";
 
 export { hostDirFor };
 
@@ -25,88 +26,37 @@ export async function remoteHome(host: string): Promise<string> {
   return home;
 }
 
-const FORWARDED_ENV = [
-  "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_MODEL",
-  "CC_MODS_DEBUG",
-  "CLAUDE_CONFIG_DIR",
-  "CLAUDE_TUI_BACKEND",
-  "CLAUDE_TUI_HERDR_SESSION",
-  "CLAUDE_TUI_HERDR_BIN",
-  "CLAUDE_TUI_HERDR_HOME",
-  "CC_MODS_MOCK",
-  "FORK_GATE",
-  "DISABLE_TELEMETRY",
-  "DISABLE_ERROR_REPORTING",
-  "DISABLE_AUTOUPDATER",
-  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-  "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
-  "CI",
-] as const;
+function isSafeAbsDir(path: string): boolean {
+  return path.startsWith("/") && !/[\n\r]/.test(path);
+}
+
+/**
+ * Directory the Mini TUI process should `cd` into. Prefer the client's pwd so
+ * Claude Code's Environment matches the client path, not the TUI host `$HOME/Workspace/...`.
+ * Falls back to `hostDirFor` when the client path cannot be created remotely.
+ */
+export async function remoteTuiRoot(host: string, clientCwd: string): Promise<string> {
+  const fallback = `${await remoteHome(host)}/${hostDirFor(clientCwd)}`;
+  if (!isSafeAbsDir(clientCwd)) return fallback;
+  const probe = Bun.spawn(
+    [
+      ...rsh(),
+      "-T",
+      host,
+      `mkdir -p ${quote(clientCwd)} && { test -e ${quote(clientCwd)}/.git || git init -q ${quote(clientCwd)}; } && test -d ${quote(clientCwd)}`,
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  if ((await probe.exited) === 0) return clientCwd;
+  return fallback;
+}
 
 export function remoteEnvPrefix(env: NodeJS.ProcessEnv = process.env): string {
-  const keys: string[] = [...FORWARDED_ENV];
-  if (env.CC_MODS_MOCK === "1") keys.push("HOME", "CLAUDE_CODE_SIMPLE");
   const parts: string[] = [];
-  for (const key of keys) {
-    const value = env[key];
-    if (!value) continue;
+  for (const [key, value] of Object.entries(collectForwardedEnv(env))) {
     parts.push(`${key}=${quote(value)}`);
   }
   return parts.length ? `${parts.join(" ")} ` : "";
-}
-
-export function isLoopbackHost(host: string): boolean {
-  return host === "localhost" || host === "127.0.0.1" || host === "::1";
-}
-
-/** Reverse-forward a local mock API onto a real Mini. Skip on localhost — the port is already bound. */
-export function mockForwardArgs(host: string, env: NodeJS.ProcessEnv = process.env): string[] {
-  if (isLoopbackHost(host)) return [];
-  const match = /^https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)/i.exec(env.ANTHROPIC_BASE_URL ?? "");
-  if (!match) return [];
-  const port = match[1]!;
-  return ["-R", `127.0.0.1:${port}:127.0.0.1:${port}`];
-}
-
-export function acpTunnelArgs(
-  host: string,
-  port: number,
-  command: string,
-  env: NodeJS.ProcessEnv = process.env,
-): string[] {
-  const [ssh, ...flags] = rsh();
-  const forwards = isLoopbackHost(host)
-    ? []
-    : ["-R", `127.0.0.1:${port}:127.0.0.1:${port}`, ...mockForwardArgs(host, env)];
-  return [
-    ssh!,
-    ...flags,
-    "-T",
-    ...(forwards.length ? ["-o", "ExitOnForwardFailure=yes", ...forwards] : []),
-    host,
-    command,
-  ];
-}
-
-export function spawnAcpTunnel(
-  host: string,
-  port: number,
-  command: string,
-  inheritErr = true,
-  env: NodeJS.ProcessEnv = process.env,
-) {
-  const argv = acpTunnelArgs(host, port, command, env);
-  return spawn(argv[0]!, argv.slice(1), { stdio: ["pipe", "pipe", inheritErr ? "inherit" : "pipe"] });
-}
-
-export function tunnelAcp(host: string, port: number, command: string): Promise<number> {
-  const child = spawnAcpTunnel(host, port, command);
-  process.stdin.pipe(child.stdin!);
-  child.stdout!.pipe(process.stdout);
-  return new Promise((done) => child.on("exit", (code) => done(code ?? 1)));
 }
 
 export function runRemote(host: string, args: string[], cwd: string): Promise<number> {

@@ -115,3 +115,70 @@ export function usageByModel(messages: Iterable<UsageCarrier>): Map<UsageModelKe
   }
   return totals;
 }
+
+function finiteUsd(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function costFromModelUsage(value: unknown): number | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  let sum = 0;
+  let found = false;
+  for (const row of Object.values(value as Record<string, unknown>)) {
+    if (!row || typeof row !== "object") continue;
+    const rec = row as Record<string, unknown>;
+    const cost = finiteUsd(rec.costUSD) ?? finiteUsd(rec.costUsd) ?? finiteUsd(rec.cost_usd);
+    if (cost === undefined) continue;
+    sum += cost;
+    found = true;
+  }
+  return found ? sum : undefined;
+}
+
+/**
+ * Session USD from a Claude JSONL / SDK usage record.
+ * Prefer `modelUsage.costUSD` (the accounting object `/usage` uses) over a
+ * zeroed `total_cost_usd` — subscription transcripts often leave the latter at 0.
+ * Result records are cumulative; callers should keep the latest, not sum.
+ */
+export function sessionCostUsdFromRecord(record: unknown): number | undefined {
+  if (!record || typeof record !== "object") return undefined;
+  const rec = record as Record<string, unknown>;
+  const fromModels = costFromModelUsage(rec.modelUsage) ?? costFromModelUsage(rec.model_usage);
+  const total =
+    finiteUsd(rec.total_cost_usd) ?? finiteUsd(rec.costUSD) ?? finiteUsd(rec.costUsd) ?? finiteUsd(rec.cost_usd);
+  if (fromModels !== undefined && fromModels > 0) return fromModels;
+  if (total !== undefined && total > 0) return total;
+  if (fromModels !== undefined) return fromModels;
+  if (total !== undefined) return total;
+  if (rec.session) {
+    const nested = sessionCostUsdFromRecord(rec.session);
+    if (nested !== undefined) return nested;
+  }
+  if (rec.message) return sessionCostUsdFromRecord(rec.message);
+  return undefined;
+}
+
+export function latestSessionCostUsd(messages: Iterable<unknown>): number | undefined {
+  let last: number | undefined;
+  for (const message of messages) {
+    const cost = sessionCostUsdFromRecord(message);
+    if (cost !== undefined) last = cost;
+  }
+  return last;
+}
+
+export function scanSessionCostFromJsonl(contents: string): number | undefined {
+  const lines = contents.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line) continue;
+    try {
+      const cost = sessionCostUsdFromRecord(JSON.parse(line));
+      if (cost !== undefined) return cost;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}

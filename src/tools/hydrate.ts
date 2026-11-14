@@ -25,8 +25,9 @@ export async function hydrateTool(
   tuiRoot: string | undefined,
   input: Record<string, unknown>,
   extraDirs: string[] = [],
+  project?: string,
 ) {
-  const abs = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs);
+  const abs = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const file = Bun.file(abs);
   if (!(await file.exists())) throw new Error(`File does not exist: ${abs}`);
   const buf = Buffer.from(await file.arrayBuffer());

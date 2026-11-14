@@ -1,17 +1,18 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { buildEnvironmentAppend, ENVIRONMENT_FILE } from "./environment.js";
-import { quote, remoteHome, rsh } from "./ssh.js";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { configDir } from "./config.js";
 import pluginManifest from "../plugin/.claude-plugin/plugin.json";
 import pluginHooks from "../plugin/hooks/hooks.json";
 // @ts-expect-error Bun `type: "text"` is source text, not a module
 import pluginRegister from "../plugin/hooks/register.js" with { type: "text" };
 import pluginWsClient from "../plugin/hooks/ws-client.js" with { type: "text" };
 import pluginWriteFile from "../plugin/hooks/write-file.js" with { type: "text" };
-import embeddedAgent from "./embedded-agent.js" with { type: "text" };
 
 export type Endpoint = { url: string; token: string; cwd: string; tuiRoot: string; helper?: string };
+
+export type SyncFile = { path: string; content: string };
 
 const ENDPOINT_SENTINEL = 'const ENDPOINT = {"url":"","token":"","cwd":"","tuiRoot":"","helper":"","extraDirs":[]};';
 
@@ -27,10 +28,6 @@ function readPlugin(rel: string): string {
   const text = PLUGIN_FILES[rel];
   if (text == null) throw new Error(`unknown plugin file: ${rel}`);
   return text;
-}
-
-function compiledBinary(): boolean {
-  return import.meta.dir.includes("$bunfs");
 }
 
 async function minifyJs(source: string, filename: string, target: "bun" | "browser"): Promise<string> {
@@ -76,115 +73,204 @@ async function writeMinifiedPlugin(stage: string, endpoint: Endpoint): Promise<s
   return helper;
 }
 
-async function bakeEnvironment(stage: string, endpoint: Endpoint): Promise<void> {
-  if (!endpoint.tuiRoot || endpoint.tuiRoot === endpoint.cwd) return;
-  writeFileSync(join(stage, ENVIRONMENT_FILE), await buildEnvironmentAppend(endpoint.cwd));
-}
-
 export async function stagePlugin(endpoint: Endpoint): Promise<string> {
   const stage = mkdtempSync(join(tmpdir(), "cc-mods-plugin-"));
   await writeMinifiedPlugin(stage, endpoint);
-  await bakeEnvironment(stage, endpoint);
   return stage;
 }
 
-async function tarToHost(host: string, stage: string, dest: string): Promise<void> {
-  const tar = Bun.spawn(["tar", "-czf", "-", "-C", stage, "."], { stdout: "pipe", stderr: "pipe" });
-  const ssh = Bun.spawn(
-    [...rsh(), "-T", host, `mkdir -p ${quote(dest)} && tar -xzf - -C ${quote(dest)}`],
-    { stdin: tar.stdout, stdout: "ignore", stderr: "pipe" },
-  );
-  const code = await ssh.exited;
-  await tar.exited;
-  if (code !== 0) throw new Error(`upload failed: ${(await new Response(ssh.stderr).text()).trim()}`);
-}
+const CLAUDE_DIR_EXCLUDES = new Set(["projects", "debug", "file-history", "todos", "sessions"]);
+const CLAUDE_FILE_EXCLUDES = new Set(["history.jsonl"]);
 
-const CLAUDE_TAR_EXCLUDES = [
-  "--exclude",
-  ".claude/projects",
-  "--exclude",
-  ".claude/debug",
-  "--exclude",
-  ".claude/file-history",
-  "--exclude",
-  ".claude/history.jsonl",
-  "--exclude",
-  ".claude/todos",
-  "--exclude",
-  ".claude/sessions",
-];
-
-/** Project files Claude Code loads at session start, plus `.claude/` skills/commands. */
+/** Project files Claude Code loads at session start. */
 export const SESSION_MEMORY_FILES = ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"] as const;
+
+/** Project dirs Claude Code loads: `.claude/` skills/commands/agents, and `.agents/` skills. */
+const SESSION_SYNC_DIRS = [".claude", ".agents"] as const;
+
+/**
+ * User-level dirs Claude Code loads at session start from `$HOME`.
+ * Skills, commands, and agents only — not transcripts, plugins, or credentials.
+ */
+const HOME_SYNC_DIRS = [
+  ".claude/skills",
+  ".claude/commands",
+  ".claude/agents",
+  ".claude/.agents",
+  ".agents",
+] as const;
+const HOME_SYNC_FILES = [".claude/CLAUDE.md"] as const;
+const HOME_SYNC_PREFIXES = [
+  ".claude/skills/",
+  ".claude/commands/",
+  ".claude/agents/",
+  ".claude/.agents/",
+  ".agents/",
+] as const;
 
 export function sessionSyncPaths(cwd: string): string[] {
   const paths: string[] = [];
-  if (existsSync(join(cwd, ".claude"))) paths.push(".claude");
+  for (const name of SESSION_SYNC_DIRS) {
+    if (existsSync(join(cwd, name))) paths.push(name);
+  }
   for (const name of SESSION_MEMORY_FILES) {
     if (existsSync(join(cwd, name))) paths.push(name);
   }
   return paths;
 }
 
-/** Copy project memory files and `.claude/` onto the host session cwd. */
-export async function syncProjectClaude(host: string, cwd: string, tuiRoot: string): Promise<void> {
-  const paths = sessionSyncPaths(cwd);
-  if (!paths.length) return;
-  const tar = Bun.spawn(["tar", "-czf", "-", "-C", cwd, ...CLAUDE_TAR_EXCLUDES, ...paths], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const ssh = Bun.spawn(
-    [...rsh(), "-T", host, `mkdir -p ${quote(tuiRoot)} && tar -xzf - -C ${quote(tuiRoot)}`],
-    { stdin: tar.stdout, stdout: "ignore", stderr: "pipe" },
-  );
-  const code = await ssh.exited;
-  await tar.exited;
-  if (code !== 0) throw new Error(`sync session files failed: ${(await new Response(ssh.stderr).text()).trim()}`);
+export function homeSyncPaths(home: string): string[] {
+  const paths: string[] = [];
+  for (const name of HOME_SYNC_DIRS) {
+    if (existsSync(join(home, name))) paths.push(name);
+  }
+  for (const name of HOME_SYNC_FILES) {
+    if (existsSync(join(home, name))) paths.push(name);
+  }
+  return paths;
 }
 
-export async function uploadPlugin(host: string, endpoint: Endpoint): Promise<string> {
-  const home = await remoteHome(host);
-  const dest = `${home}/.cc-mods-relay/plugin`;
-  const stage = mkdtempSync(join(tmpdir(), "cc-mods-plugin-"));
-  await writeMinifiedPlugin(stage, { ...endpoint, helper: `${dest}/hooks/ws-client.js` });
-  await bakeEnvironment(stage, endpoint);
-  await tarToHost(host, stage, dest);
-  return dest;
-}
-
-async function bundleAgent(): Promise<string> {
-  if (!compiledBinary()) {
-    const result = await Bun.build({
-      entrypoints: [join(import.meta.dir, "agent.ts")],
-      target: "bun",
-      minify: true,
-    });
-    if (!result.success || !result.outputs[0]) {
-      const logs = result.logs.map((log) => String(log)).join("\n");
-      throw new Error(`agent bundle failed: ${logs || "no output"}`);
+function walkFiles(root: string, rel: string, out: SyncFile[]): void {
+  const abs = join(root, rel);
+  let st;
+  try {
+    st = statSync(abs);
+  } catch {
+    return;
+  }
+  if (st.isDirectory()) {
+    const base = rel.split(/[\\/]/).pop() ?? "";
+    if (rel.startsWith(".claude") && CLAUDE_DIR_EXCLUDES.has(base) && rel !== ".claude") return;
+    for (const name of readdirSync(abs)) {
+      walkFiles(root, join(rel, name), out);
     }
-    return await result.outputs[0].text();
+    return;
   }
-  const agent = embeddedAgent as unknown as string;
-  if (agent.includes("embedded agent missing")) {
-    throw new Error("agent bundle was not compiled into this binary");
+  const base = rel.split(/[\\/]/).pop() ?? "";
+  if (CLAUDE_FILE_EXCLUDES.has(base)) return;
+  try {
+    out.push({ path: rel.split(sep).join("/"), content: readFileSync(abs, "utf8") });
+  } catch {
+    /* skip unreadable / binary */
   }
-  return agent;
 }
 
-export async function uploadAgent(host: string): Promise<string> {
-  const home = await remoteHome(host);
-  const dest = `${home}/.cc-mods-relay/agent.js`;
-  const stage = mkdtempSync(join(tmpdir(), "cc-mods-agent-"));
-  await Bun.write(join(stage, "agent.js"), await bundleAgent());
-  const tar = Bun.spawn(["tar", "-czf", "-", "-C", stage, "agent.js"], { stdout: "pipe", stderr: "pipe" });
-  const ssh = Bun.spawn(
-    [...rsh(), "-T", host, `mkdir -p ${quote(`${home}/.cc-mods-relay`)} && tar -xzf - -C ${quote(`${home}/.cc-mods-relay`)}`],
-    { stdin: tar.stdout, stdout: "ignore", stderr: "pipe" },
-  );
-  const code = await ssh.exited;
-  await tar.exited;
-  if (code !== 0) throw new Error(`agent upload failed: ${(await new Response(ssh.stderr).text()).trim()}`);
-  return dest;
+function collectFrom(root: string, rels: string[]): SyncFile[] {
+  const files: SyncFile[] = [];
+  for (const rel of rels) walkFiles(root, rel, files);
+  return files;
+}
+
+export function collectSessionFiles(cwd: string): SyncFile[] {
+  return collectFrom(cwd, sessionSyncPaths(cwd));
+}
+
+export function collectHomeFiles(home = homedir()): SyncFile[] {
+  return collectFrom(home, homeSyncPaths(home));
+}
+
+export function hashSyncFiles(files: SyncFile[]): string {
+  const hash = createHash("sha256");
+  const rows = [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  for (const file of rows) {
+    hash.update(file.path.replaceAll("\\", "/"));
+    hash.update("\0");
+    hash.update(file.content);
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+type UrlSync = { home?: Record<string, string>; project?: Record<string, string> };
+
+function syncCachePath(): string {
+  return join(configDir(), "sync.json");
+}
+
+function loadSyncCache(): Record<string, UrlSync> {
+  try {
+    const raw = JSON.parse(readFileSync(syncCachePath(), "utf8")) as unknown;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw as Record<string, UrlSync>;
+  } catch {
+    /* missing or unreadable */
+  }
+  return {};
+}
+
+function saveSyncCache(cache: Record<string, UrlSync>): void {
+  mkdirSync(configDir(), { recursive: true, mode: 0o700 });
+  writeFileSync(syncCachePath(), `${JSON.stringify(cache)}\n`, { mode: 0o600 });
+}
+
+export type SyncSelection = {
+  files?: SyncFile[];
+  homeFiles?: SyncFile[];
+  projectHash: string;
+  homeHash: string;
+};
+
+/** Omit a scope when this machine already synced that hash to `url`. */
+export function selectSyncFiles(
+  url: string,
+  cwd: string,
+  home: string,
+  files: SyncFile[],
+  homeFiles: SyncFile[],
+): SyncSelection {
+  const projectHash = hashSyncFiles(files);
+  const homeHash = hashSyncFiles(homeFiles);
+  const entry = loadSyncCache()[url];
+  const skipProject = entry?.project?.[cwd] === projectHash;
+  const skipHome = entry?.home?.[home] === homeHash;
+  return {
+    projectHash,
+    homeHash,
+    ...(skipProject || files.length === 0 ? {} : { files }),
+    ...(skipHome || homeFiles.length === 0 ? {} : { homeFiles }),
+  };
+}
+
+export function rememberSessionSync(url: string, cwd: string, home: string, projectHash: string, homeHash: string): void {
+  const cache = loadSyncCache();
+  const entry = cache[url] ?? (cache[url] = {});
+  entry.project = { ...entry.project, [cwd]: projectHash };
+  entry.home = { ...entry.home, [home]: homeHash };
+  saveSyncCache(cache);
+}
+
+function normalizeRel(path: string): string | undefined {
+  const rel = path.replaceAll("\\", "/");
+  if (!rel || rel.startsWith("/") || rel.split("/").includes("..")) return undefined;
+  return rel;
+}
+
+function isInsideRoot(root: string, dest: string): boolean {
+  const rel = relative(root, dest);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+function allowedHomeRel(rel: string): boolean {
+  if ((HOME_SYNC_FILES as readonly string[]).includes(rel)) return true;
+  return HOME_SYNC_PREFIXES.some((prefix) => rel.startsWith(prefix));
+}
+
+function writeRelFiles(root: string, files: SyncFile[], allow?: (rel: string) => boolean): void {
+  mkdirSync(root, { recursive: true });
+  for (const file of files) {
+    const rel = normalizeRel(file.path);
+    if (!rel || (allow && !allow(rel))) continue;
+    const dest = join(root, rel);
+    if (!isInsideRoot(root, dest)) continue;
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(dest, file.content);
+  }
+}
+
+export function writeSessionFiles(tuiRoot: string, files: SyncFile[]): void {
+  writeRelFiles(tuiRoot, files);
+}
+
+/** Overlay client user-level skills/agents onto the TUI host `$HOME`. */
+export function writeHomeFiles(home: string, files: SyncFile[]): void {
+  writeRelFiles(home, files, allowedHomeRel);
 }

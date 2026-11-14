@@ -1,8 +1,5 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { runAcp, driveFastModeProbe } from "./acp-agent.js";
+import { runAcp, driveFastModeProbe, type AgentDeps } from "./acp-agent.js";
 import { stackedEngine } from "./compose.js";
-import { ENVIRONMENT_FILE } from "./environment.js";
 import { applyManagedPolicyEnv } from "./managed-policy.js";
 import { assertMockBaseUrl } from "./mock-anthropic.js";
 import { usageUpdateEnabled } from "./usage-env.js";
@@ -30,43 +27,85 @@ export async function ensureHerdr(session: string) {
   process.env.CLAUDE_TUI_BACKEND = "pty";
 }
 
-export async function runAgent(pluginDir: string) {
-  assertMockBaseUrl();
-  process.env.CLAUDE_TUI_BACKEND ??= "herdr";
+export type BootedAgent = {
+  pluginDir: string;
+  clientCwd?: string;
+  channel: ReturnType<typeof startModChannel>;
+  herdrSession: string;
+  deps: AgentDeps;
+};
+
+export async function bootAgent(
+  pluginDir: string,
+  opts: { cwd?: string; tuiRoot?: string; env?: NodeJS.ProcessEnv; bindProcess?: boolean } = {},
+): Promise<BootedAgent> {
+  const env = opts.env ?? process.env;
+  assertMockBaseUrl(env);
+  process.env.CLAUDE_TUI_BACKEND ??= env.CLAUDE_TUI_BACKEND ?? "herdr";
   process.env.CLAUDE_TUI_MODEL_CATALOG ??= "builtin";
-  process.env.CC_MODS_PLUGIN_DIR = pluginDir;
-  if (existsSync(join(pluginDir, ENVIRONMENT_FILE))) {
-    process.env.CLAUDE_CODE_DISABLE_CLAUDE_MDS ??= "1";
-  }
-  const herdrSession = process.env.HERDR_ENV === "1"
-    ? process.env.HERDR_SESSION || process.env.CLAUDE_TUI_HERDR_SESSION || "default"
-    : process.env.CLAUDE_TUI_HERDR_SESSION?.trim() || DEFAULT_HERDR_SESSION;
+  const herdrSession = env.HERDR_ENV === "1"
+    ? env.HERDR_SESSION || env.CLAUDE_TUI_HERDR_SESSION || "default"
+    : env.CLAUDE_TUI_HERDR_SESSION?.trim() || process.env.CLAUDE_TUI_HERDR_SESSION?.trim() || DEFAULT_HERDR_SESSION;
   process.env.CLAUDE_TUI_HERDR_SESSION = herdrSession;
   const channel = startModChannel();
-  bindModChannel(channel);
-  process.env.CC_MODS_SOCKET = channel.path;
+  if (opts.bindProcess !== false) {
+    bindModChannel(channel);
+    process.env.CC_MODS_PLUGIN_DIR = pluginDir;
+    process.env.CC_MODS_SOCKET = channel.path;
+  }
   installTuiExitHooks();
   await ensureHerdr(herdrSession);
   if (resolveTerminalBackendName() !== "bun-pty") {
     reapOrphanHerdrWorkspaces({ herdrSession });
   }
   reapOrphanPluginProcesses(pluginDir);
-  const startEngine = await stackedEngine(pluginDir, herdrSession);
-
+  const inner = await stackedEngine(pluginDir, herdrSession);
   await applyManagedPolicyEnv();
+  const startEngine: AgentDeps["startEngine"] = (args) =>
+    inner({
+      ...args,
+      baseEnv: {
+        ...process.env,
+        ...env,
+        ...(args.baseEnv ?? {}),
+        CC_MODS_SOCKET: channel.path,
+      },
+    });
+  return {
+    pluginDir,
+    clientCwd: opts.cwd,
+    channel,
+    herdrSession,
+    deps: {
+      startEngine,
+      usageUpdate: usageUpdateEnabled(),
+      gate: (env.FORK_GATE ?? process.env.FORK_GATE) === "on",
+      liveDiff: liveDiffEnabled(),
+      liveSubagentWatch: liveSubagentWatchEnabled(),
+      fastModeProbe: env.FAST_MODE_FORCE === "1" || process.env.FAST_MODE_FORCE === "1"
+        ? () => true
+        : env.FAST_MODE_LIVE === "1" || process.env.FAST_MODE_LIVE === "1"
+          ? driveFastModeProbe
+          : undefined,
+      clientCwd: opts.cwd,
+      tuiRoot: opts.tuiRoot,
+      pluginDir,
+      modChannel: channel,
+    },
+  };
+}
+
+export async function runAgent(
+  pluginDir: string,
+  opts: { cwd?: string; stream?: Parameters<typeof runAcp>[0] } = {},
+) {
+  const boot = await bootAgent(pluginDir, { cwd: opts.cwd });
   console.log = console.error;
   console.info = console.error;
   console.warn = console.error;
   console.debug = console.error;
 
-  const { connection, agent } = runAcp({
-    startEngine,
-    usageUpdate: usageUpdateEnabled(),
-    gate: process.env.FORK_GATE === "on",
-    liveDiff: liveDiffEnabled(),
-    liveSubagentWatch: liveSubagentWatchEnabled(),
-    fastModeProbe: process.env.FAST_MODE_FORCE === "1" ? () => true : process.env.FAST_MODE_LIVE === "1" ? driveFastModeProbe : undefined,
-  });
+  const { connection, agent } = runAcp(opts.stream, boot.deps);
 
   let shuttingDown = false;
   async function shutdown() {
@@ -75,14 +114,13 @@ export async function runAgent(pluginDir: string) {
     await agent.dispose().catch((error) => console.error(error));
     await Bun.sleep(400);
     reapAllTuis();
-    channel.stop();
+    boot.channel.stop();
     process.exit(0);
   }
   connection.closed.then(shutdown);
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
-  // sshd sends SIGHUP when the ACP tunnel drops. Without a handler, Bun
-  // exits before dispose/reapers run and herdr panes leak (PPID=1).
   if (process.platform !== "win32") process.on("SIGHUP", shutdown);
   process.stdin.resume();
+  await connection.closed;
 }
