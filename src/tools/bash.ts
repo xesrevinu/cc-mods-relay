@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnEnv, withDirenv } from "./direnv.js";
 import { cancelCall, finishJob, registerJob, wasCancelled } from "./jobs.js";
+import { classifyBashIntent } from "./bash-intent.js";
 import { asBool, asNumber, asString, mapCwd, mergeRoots, rewriteRemoteText } from "./paths.js";
 import { abortedShellResult, clampTimeout, killTree, type Send, type ToolFrame } from "./runtime.js";
 
@@ -171,8 +172,11 @@ export async function bashTool(
   notify: Send,
 ): Promise<BashOutput> {
   const extraDirs = mergeRoots(frame.extraDirs);
-  const command = rewriteRemoteText(asString(input.command), workspace, frame.tuiRoot);
+  const rewritten = rewriteRemoteText(asString(input.command), workspace, frame.tuiRoot);
   const cwd = sessionCwd(frame, workspace);
+  const intent = frame.tool === "PowerShell" ? { action: "run" as const, command: rewritten } : classifyBashIntent(rewritten, cwd);
+  if (intent.action === "prefer") throw new Error(intent.message);
+  const command = intent.command;
   const callId = frame.callId ?? "";
   const sessionId = frame.sessionId || "";
   const sandbox = asBool(input.dangerouslyDisableSandbox) === true ? { dangerouslyDisableSandbox: true } : {};

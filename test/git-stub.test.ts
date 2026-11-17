@@ -30,6 +30,21 @@ test("readClientGit reports a named branch and a non-repo", () => {
   expect(readClientGit(dir)).toEqual({ repo: true, branch: "feature-x" });
 });
 
+test("readClientGit recovers a detached worktree branch instead of omitting it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-git-detach-"));
+  git(dir, ["init", "-q", "-b", "herdr/moonbit-migration"]);
+  git(dir, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"]);
+  const wt = join(dir, "wt");
+  git(dir, ["worktree", "add", "--detach", wt]);
+  expect(readClientGit(wt)).toEqual({ repo: true, branch: "herdr/moonbit-migration" });
+});
+
+test("applyGitStub does not invent main when the client branch is unknown", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-git-nobranch-"));
+  applyGitStub(dir, { repo: true });
+  expect(existsSync(join(dir, ".git"))).toBe(false);
+});
+
 test("applyGitStub names an empty stub after the client branch", () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-mods-git-stub-"));
   applyGitStub(dir, { repo: true, branch: "herdr/moonbit-migration" });
