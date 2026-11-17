@@ -7,6 +7,7 @@ import { bootAgent } from "./agent-main.js";
 import { hostTuiRoot } from "./config.js";
 import { debug } from "./debug.js";
 import { isSafeAbsPath } from "./environment.js";
+import { applyGitStub, parseClientGit } from "./git-stub.js";
 import { collectForwardedEnv } from "./forwarded-env.js";
 import { stagePlugin, writeHomeFiles, writeSessionFiles, type SyncFile } from "./launch.js";
 import { acpStreamFromWs, classify, parseWsJson } from "./mux.js";
@@ -36,6 +37,7 @@ type CtrlFrame = {
   env?: unknown;
   files?: unknown;
   homeFiles?: unknown;
+  git?: unknown;
   callId?: string;
   id?: string;
   sessionId?: string;
@@ -180,11 +182,13 @@ export function startServer(opts: ServeOpts) {
     }
     const extraDirs = extraDirsOf(frame.extraDirs);
     const clientHome = typeof frame.home === "string" && isSafeAbsPath(frame.home) ? frame.home : undefined;
+    const git = parseClientGit(frame.git);
     const requested =
       typeof frame.tuiRoot === "string" && isSafeAbsPath(frame.tuiRoot) && existsSync(frame.tuiRoot)
         ? frame.tuiRoot
         : undefined;
-    const tuiRoot = requested ?? hostTuiRoot(cwd, { clientHome });
+    const tuiRoot = requested ?? hostTuiRoot(cwd, { clientHome, git });
+    applyGitStub(tuiRoot, git);
     if (tuiRoot !== cwd) {
       debug("TUI cwd is not the client cwd (mkdir of client path failed)", { cwd, tuiRoot });
     }

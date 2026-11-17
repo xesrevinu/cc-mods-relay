@@ -13,9 +13,9 @@ function isLocalTool(tool) {
   return WORKSPACE_TOOLS.has(tool) || DEFERRED_TOOLS.has(tool);
 }
 
+/** Mods `tool.call` only accepts `{ result }` or `{ deny }`. Anything else is skipped and the builtin runs on Mini. */
 function failResult(message) {
-  const text = String(message);
-  return { isError: true, text };
+  return { deny: String(message) };
 }
 let extraDirs = [];
 let permissionSeq = 0;
@@ -253,7 +253,6 @@ export function register(on) {
 
   on("tool.call", async ($, e, next) => {
     const parent = e.agentId ? spawnToolUse.get(e.agentId) : undefined;
-    if (e.agentId && !parent) return next(e);
     const tag = parent ? { parentToolUseId: parent } : {};
     const toolUseId = e.tool_use_id;
     const input = toolInput(e);
@@ -273,10 +272,14 @@ export function register(on) {
         finish(true);
         return failResult(message);
       }
-      if (!frame.ok) {
-        const message = `${frame.error?.code || "ERROR"}: ${frame.error?.message || "Tool failed"}`;
+      if (!frame || !frame.ok) {
+        const message = `${frame?.error?.code || "ERROR"}: ${frame?.error?.message || "Tool failed"}`;
         finish(true);
         return failResult(message);
+      }
+      if (frame.result === undefined) {
+        finish(true);
+        return failResult("empty tool result");
       }
       finish(false, frame.result);
       return { result: frame.result };
@@ -299,7 +302,7 @@ export function register(on) {
     finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result);
     return ran;
   }).catch(async ($, e, next) => {
-    if (isLocalTool(e.tool)) {
+    if (isLocalTool(e.tool) && !next.called) {
       try { await rpc($, { type: "cancel", callId: e.tool_use_id }, 5_000); } catch { /* already gone */ }
       return failResult("Tool call was cancelled");
     }

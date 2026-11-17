@@ -1,4 +1,5 @@
 import { collectForwardedEnv } from "./forwarded-env.js";
+import { readClientGit } from "./git-stub.js";
 import { collectHomeFiles, collectSessionFiles, rememberSessionSync, selectSyncFiles } from "./launch.js";
 import { classify, parseWsJson, readNdjsonStream } from "./mux.js";
 import { configuredToken, configuredUrl, httpUrlFromWs } from "./config.js";
@@ -89,6 +90,7 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
     tuiRoot: opts.tuiRoot,
     extraDirs: opts.extraDirs ?? [],
     env: collectForwardedEnv(env),
+    git: readClientGit(cwd),
     ...(sync.files ? { files: sync.files } : {}),
     ...(sync.homeFiles ? { homeFiles: sync.homeFiles } : {}),
   });

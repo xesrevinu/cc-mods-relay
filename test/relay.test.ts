@@ -31,6 +31,9 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).toContain("WORKSPACE_TOOLS");
   expect(src).toContain("DEFERRED_TOOLS");
   expect(src).toContain("failResult");
+  expect(src).toContain("deny:");
+  expect(src).not.toContain("isError: true");
+  expect(src).not.toContain("if (e.agentId && !parent) return next(e)");
   expect(src).toContain("classic.Stop");
   expect(src).toContain("classic.PermissionRequest");
   expect(src).toContain("HYDRATE_TOOLS");

@@ -4,8 +4,8 @@
  * this process is started with $.process.run / $.process.spawn.
  *
  * stdin: one JSON object. stdout: one JSON object, or JSONL in listen mode.
- * Always prints a result frame on failure so the plugin can return an error
- * instead of falling through to a native Mini tool.
+ * Always prints a result frame on failure so the plugin can `{ deny }`
+ * instead of being skipped (wrong shape) and falling through to Mini.
  */
 const raw = await Bun.stdin.text();
 const msg = JSON.parse(raw);

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../src/server.js";
@@ -101,6 +101,59 @@ test("instance.ready tuiRoot is the client cwd when that path can be created her
     const started = await ready;
     expect(started.type).toBe("instance.ready");
     expect(started.tuiRoot).toBe(dir);
+    ws.close();
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("instance.start names an empty TUI stub after the client git branch", async () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "cc-mods-tui-git-")), "project");
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const ws = await openWs(server.sessionUrl);
+    const hello = nextJson(ws);
+    ws.send(JSON.stringify({ v: 1, type: "hello", token: "secret" }));
+    expect((await hello).ok).toBe(true);
+    const ready = nextJson(ws);
+    ws.send(JSON.stringify({
+      v: 1,
+      type: "instance.start",
+      cwd: dir,
+      git: { repo: true, branch: "herdr/moonbit-migration" },
+    }));
+    const started = await ready;
+    expect(started.type).toBe("instance.ready");
+    expect(started.tuiRoot).toBe(dir);
+    const ran = Bun.spawnSync(["git", "-C", dir, "symbolic-ref", "--short", "HEAD"], { stdout: "pipe" });
+    const branch = Buffer.isBuffer(ran.stdout) ? ran.stdout.toString().trim() : String(ran.stdout ?? "").trim();
+    expect(branch).toBe("herdr/moonbit-migration");
+    ws.close();
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("instance.start leaves a non-git client cwd without .git", async () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "cc-mods-tui-nongit-")), "project");
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const ws = await openWs(server.sessionUrl);
+    const hello = nextJson(ws);
+    ws.send(JSON.stringify({ v: 1, type: "hello", token: "secret" }));
+    expect((await hello).ok).toBe(true);
+    const ready = nextJson(ws);
+    ws.send(JSON.stringify({
+      v: 1,
+      type: "instance.start",
+      cwd: dir,
+      git: { repo: false },
+    }));
+    const started = await ready;
+    expect(started.type).toBe("instance.ready");
+    expect(existsSync(join(dir, ".git"))).toBe(false);
     ws.close();
   } finally {
     await server.stop();

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, hostname as osHostname } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { applyGitStub, type ClientGit } from "./git-stub.js";
 
 /** home = ~/Workspace/<rel> (default). opaque = hashed ids. path = legacy hostname+cwd. */
 export type WsStyle = "home" | "opaque" | "path";
@@ -181,38 +182,17 @@ function materializeAbsDir(path: string): boolean {
   }
 }
 
-/** Create `path` here (and `git init` if needed) so Claude Code `--add-dir` / cwd can use it. */
-export function materializeClientDir(path: string): boolean {
+/** Create `path` here (and a git stub if needed) so Claude Code `--add-dir` / cwd can use it. */
+export function materializeClientDir(path: string, git?: ClientGit): boolean {
   if (path.startsWith("/") && existsSync(path)) {
-    ensureGitRepo(path);
+    applyGitStub(path, git);
     return true;
   }
   if (materializeAbsDir(path)) {
-    ensureGitRepo(path);
+    applyGitStub(path, git);
     return true;
   }
   return false;
-}
-
-/** Skip git init at `/Users/<user>` / `/home/<user>` — only project dirs, not the home prefix. */
-function isHomePrefix(path: string): boolean {
-  return /^\/Users\/[^/]+$/.test(path) || /^\/home\/[^/]+$/.test(path);
-}
-
-/**
- * Claude Code's Environment reminder sets `Is a git repository` from this cwd.
- * An empty stub is not a repo; `git init` is enough for the boolean. Skip if
- * `.git` already exists (file or directory, including worktrees).
- */
-function ensureGitRepo(dir: string): void {
-  if (!dir.startsWith("/") || /[\n\r]/.test(dir) || dir === "/" || dir === "/Users" || dir === "/home") return;
-  if (isHomePrefix(dir)) return;
-  if (existsSync(join(dir, ".git"))) return;
-  try {
-    Bun.spawnSync(["git", "init", "-q", dir], { stdout: "ignore", stderr: "ignore" });
-  } catch {
-    /* git missing */
-  }
 }
 
 /**
@@ -222,9 +202,9 @@ function ensureGitRepo(dir: string): void {
  */
 export function hostTuiRoot(
   clientCwd: string,
-  opts: { home?: string; clientHome?: string; host?: string } = {},
+  opts: { home?: string; clientHome?: string; host?: string; git?: ClientGit } = {},
 ): string {
-  if (materializeClientDir(clientCwd)) return clientCwd;
+  if (materializeClientDir(clientCwd, opts.git)) return clientCwd;
   const home = opts.home ?? homedir();
   const clientHome = opts.clientHome ?? inferClientHome(clientCwd) ?? home;
   const hostDir = hostDirFor(clientCwd, opts.host ?? osHostname(), clientHome);
