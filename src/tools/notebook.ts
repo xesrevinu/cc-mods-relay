@@ -72,12 +72,15 @@ export async function notebookEditTool(cwd: string, tuiRoot: string | undefined,
   const updated_file = `${JSON.stringify(nb, null, 1)}\n`;
   await Bun.write(path, updated_file);
   const edited = edit_mode === "delete" ? undefined : nb.cells[index];
+  const meta = nb as Notebook & { metadata?: { language_info?: { name?: string }; kernelspec?: { language?: string } } };
+  const language = meta.metadata?.language_info?.name || meta.metadata?.kernelspec?.language || "python";
+  const cellType = (edited?.cell_type ?? (edit_mode === "delete" ? undefined : "code")) === "markdown" ? "markdown" as const : "code" as const;
   return {
     new_source,
     old_source,
     cell_id: edit_mode === "delete" ? cell_id : edited ? cellId(edited, index) : cell_id,
-    cell_type: edited?.cell_type === "markdown" ? "markdown" as const : "code" as const,
-    language: "python",
+    cell_type: cellType,
+    language,
     edit_mode,
     notebook_path: path,
     original_file,

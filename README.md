@@ -139,9 +139,8 @@ The compiled binary is about 95 MB on disk because it embeds the Bun runtime. Th
 
 | Where | Tools |
 | --- | --- |
-| This machine | Read, Write, Edit, Glob, Grep, NotebookEdit, Bash, PowerShell |
+| This machine | Read, Write, Edit, Glob, Grep, NotebookEdit, Bash, PowerShell, Monitor, EnterWorktree, ExitWorktree, SendFile, SendUserFile |
 | Copied to the server, then native | Artifact, DesignSync |
-| Not run (no local executor yet) | LSP, Monitor, EnterWorktree, ExitWorktree, SendFile, SendUserFile |
 | Server session | Agent, Skill, WebSearch, TodoWrite, and other session/cloud tools |
 
 ## Environment

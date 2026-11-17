@@ -14,7 +14,6 @@ export const DEFAULT_DISALLOWED_BUILTINS: readonly string[] = [
   "NotebookEdit",
   "Bash",
   "PowerShell",
-  "LSP",
   "Monitor",
   "EnterWorktree",
   "ExitWorktree",
@@ -25,7 +24,6 @@ const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]*$/;
 export const DEFAULT_REQUIRED_FORWARD_TOOLS: readonly string[] = ["Read", "Bash"];
 
 export const UNREPLACED_FORWARD_TOOLS: readonly string[] = [
-  "LSP",
   "Monitor",
   "EnterWorktree",
   "ExitWorktree",

@@ -23,7 +23,6 @@ export const WORKSPACE_TOOLS = [
 
 /** ToolSearch extras. Execute locally when selected — do not hard-deny. */
 export const DEFERRED_TOOLS = [
-  "LSP",
   "Monitor",
   "EnterWorktree",
   "ExitWorktree",

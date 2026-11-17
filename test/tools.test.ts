@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { cancelCall, execute } from "../src/exec.js";
@@ -220,32 +220,119 @@ test("session cwd after cd applies to later Read", async () => {
   expect(read.result.file.content).toBe("nested");
 });
 
-test("Monitor runs the command locally instead of denying", async () => {
+test("Monitor starts in the background and streams stdout lines", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
-  const frame = await run(dir, "Monitor", { command: "printf watched", timeout_ms: 8_000 }, { callId: "mon" });
+  const frames: any[] = [];
+  const started = Date.now();
+  const frame = await new Promise<any>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Monitor did not return")), 5_000);
+    void execute(
+      {
+        tool: "Monitor",
+        input: { command: "printf 'watched\\n'", timeout_ms: 8_000, description: "watch" },
+        cwd: dir,
+        tuiRoot: dir,
+        callId: "mon",
+      },
+      (next) => {
+        frames.push(next);
+        if (next.type === "result") {
+          clearTimeout(timer);
+          resolve(next);
+        }
+      },
+      (next) => {
+        frames.push(next);
+      },
+    );
+  });
+  expect(Date.now() - started).toBeLessThan(3_000);
   expect(frame.ok).toBe(true);
-  expect(frame.result.stdout).toContain("watched");
+  expect(frame.result.taskId).toBeDefined();
+  expect(frame.result.timeoutMs).toBe(8_000);
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline && !frames.some((f) => f.kind === "monitor" && String(f.line || "").includes("watched"))) {
+    await Bun.sleep(20);
+  }
+  expect(frames.some((f) => f.kind === "monitor" && String(f.line || "").includes("watched"))).toBe(true);
 });
 
-test("LSP returns empty diagnostics instead of denying", async () => {
+test("Monitor does not block on a long command", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
-  writeFileSync(join(dir, "a.ts"), "const x = 1;\n");
-  const frame = await run(dir, "LSP", { file_path: join(dir, "a.ts"), operation: "diagnostics" }, { callId: "lsp" });
+  const started = Date.now();
+  const frame = await run(dir, "Monitor", { command: "sleep 30", timeout_ms: 60_000, description: "wait" }, { callId: "mon-nb" });
+  expect(Date.now() - started).toBeLessThan(5_000);
   expect(frame.ok).toBe(true);
-  expect(frame.result.diagnostics).toEqual([]);
+  expect(frame.result.taskId).toBeDefined();
+  expect(frame.result.timeoutMs).toBe(60_000);
+  cancelCall("mon-nb");
 });
 
-test("EnterWorktree path switches session cwd; ExitWorktree restores", async () => {
+test("Bash foreground timeout auto-backgrounds instead of killing", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
-  mkdirSync(join(dir, "wt"));
+  mkdirSync(join(dir, "sub"));
+  writeFileSync(join(dir, "a.txt"), "root\n");
+  writeFileSync(join(dir, "sub", "a.txt"), "nested\n");
+  const frames: any[] = [];
+  const started = Date.now();
+  const frame = await new Promise<any>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Bash did not return")), 6_000);
+    void execute(
+      {
+        tool: "Bash",
+        input: { command: "cd sub; printf start\\n; sleep 3.2; printf done\\n", timeout: 120 },
+        cwd: dir,
+        tuiRoot: dir,
+        callId: "bg-timeout",
+        sessionId: "bg-timeout-sess",
+      },
+      (next) => {
+        frames.push(next);
+        if (next.type === "result") {
+          clearTimeout(timer);
+          resolve(next);
+        }
+      },
+      (next) => {
+        frames.push(next);
+      },
+    );
+  });
+  expect(Date.now() - started).toBeLessThan(5_000);
+  expect(frame.ok).toBe(true);
+  expect(frame.result.interrupted).toBe(false);
+  expect(frame.result.backgroundTaskId).toBeDefined();
+  expect(frame.result.timedOutAfterMs).toBe(120);
+  expect(frame.result.backgroundCwdHint).toMatch(/Session cwd remains/);
+  expect(String(frame.result.stdout)).not.toContain("done");
+  const later = await run(dir, "Read", { file_path: "a.txt" }, { callId: "bg-timeout-read", sessionId: "bg-timeout-sess" });
+  expect(later.result.file.content).toBe("root");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && !frames.some((f) => f.kind === "background" && String(f.output || "").includes("done"))) {
+    await Bun.sleep(20);
+  }
+  expect(frames.some((f) => f.kind === "background" && String(f.output || "").includes("done"))).toBe(true);
+});
+
+test("EnterWorktree path switches session cwd; ExitWorktree keep restores", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
   writeFileSync(join(dir, "here.txt"), "root\n");
-  writeFileSync(join(dir, "wt", "here.txt"), "tree\n");
-  const entered = await run(dir, "EnterWorktree", { path: join(dir, "wt") }, { callId: "ew", sessionId: "wt-sess" });
+  const git = (args: string[]) => Bun.spawnSync(["git", ...args], { cwd: dir, stdout: "pipe", stderr: "pipe" });
+  git(["init"]);
+  git(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"]);
+  const wt = join(dir, "wt");
+  git(["worktree", "add", "--detach", wt]);
+  writeFileSync(join(wt, "here.txt"), "tree\n");
+  const entered = await run(dir, "EnterWorktree", { path: wt }, { callId: "ew", sessionId: "wt-sess" });
   expect(entered.ok).toBe(true);
+  expect(entered.result.worktreePath).toBe(realpathSync(wt));
   const nested = await run(dir, "Read", { file_path: "here.txt" }, { callId: "ew-r", sessionId: "wt-sess" });
   expect(nested.result.file.content).toBe("tree");
-  const exited = await run(dir, "ExitWorktree", {}, { callId: "ex", sessionId: "wt-sess" });
+  const missing = await run(dir, "ExitWorktree", {}, { callId: "ex-bad", sessionId: "wt-sess" });
+  expect(missing.ok).toBe(false);
+  const exited = await run(dir, "ExitWorktree", { action: "keep" }, { callId: "ex", sessionId: "wt-sess" });
   expect(exited.ok).toBe(true);
+  expect(exited.result.action).toBe("keep");
   const root = await run(dir, "Read", { file_path: "here.txt" }, { callId: "ex-r", sessionId: "wt-sess" });
   expect(root.result.file.content).toBe("root");
 });

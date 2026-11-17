@@ -1,5 +1,6 @@
 import { compressImage, IMAGE_MAX_SOURCE_BYTES, type ImageMime } from "./image-compress.js";
 import { asBool, asNumber, asString, mapPath } from "./paths.js";
+import { ioMessage } from "./runtime.js";
 
 const IMAGES: Record<string, ImageMime> = {
   png: "image/png",
@@ -30,13 +31,6 @@ function isProbablyBinary(buf: Uint8Array): boolean {
   const n = Math.min(buf.length, 8000);
   for (let i = 0; i < n; i++) if (buf[i] === 0) return true;
   return false;
-}
-
-function ioMessage(path: string, error: unknown, missing: string): Error {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code;
-  if (code === "ENOENT") return new Error(missing);
-  if (code === "EACCES" || code === "EPERM") return new Error(`Permission denied: ${path}`);
-  return error instanceof Error ? error : new Error(String(error));
 }
 
 export async function readTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string) {

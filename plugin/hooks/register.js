@@ -6,7 +6,7 @@ const ENDPOINT = {"url":"","token":"","cwd":"","tuiRoot":"","helper":"","extraDi
 const RESERVED = new Set(["tool", "tool_use_id", "agentId", "consent", "requestMeta"]);
 
 const WORKSPACE_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit", "Bash", "PowerShell"]);
-const DEFERRED_TOOLS = new Set(["LSP", "Monitor", "EnterWorktree", "ExitWorktree", "SendFile", "SendUserFile"]);
+const DEFERRED_TOOLS = new Set(["Monitor", "EnterWorktree", "ExitWorktree", "SendFile", "SendUserFile"]);
 const HYDRATE_TOOLS = new Set(["Artifact", "DesignSync"]);
 
 function isLocalTool(tool) {
@@ -71,6 +71,31 @@ function taskNotification(frame) {
     ? `Command completed (exit code ${code})`
     : `Command failed with exit code ${code}`;
   const toolUseId = frame.callId || String(frame.pid ?? "");
+  return [
+    "<task-notification>",
+    `<tool-use-id>${xmlText(toolUseId)}</tool-use-id>`,
+    `<status>${status}</status>`,
+    `<summary>${xmlText(summary)}</summary>`,
+    "</task-notification>",
+  ].join("\n");
+}
+
+function monitorNotification(frame) {
+  const toolUseId = frame.callId || "";
+  if (frame.status === "event") {
+    return [
+      "<monitor-event>",
+      `<tool-use-id>${xmlText(toolUseId)}</tool-use-id>`,
+      `<summary>${xmlText(frame.line)}</summary>`,
+      "</monitor-event>",
+    ].join("\n");
+  }
+  const expired = frame.status === "expired";
+  const code = Number(frame.exitCode);
+  const status = expired ? "failed" : code === 0 ? "completed" : "failed";
+  const summary = expired
+    ? `Monitor expired after ${Number(frame.timeoutMs) || 0}ms with no further events.`
+    : `Monitor ended (exit code ${Number.isFinite(code) ? code : "?"})`;
   return [
     "<task-notification>",
     `<tool-use-id>${xmlText(toolUseId)}</tool-use-id>`,
@@ -168,6 +193,11 @@ export function register(on) {
                 const text = drainPending();
                 if (text) await $.prompt.submit({ text });
               }
+            }
+            if (frame.type === "notify" && frame.kind === "monitor") {
+              pending.push(monitorNotification(frame));
+              const text = drainPending();
+              if (text) await $.prompt.submit({ text });
             }
           }
         }
