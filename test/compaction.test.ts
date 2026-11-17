@@ -85,3 +85,26 @@ test("client session.compaction {} is the ACP v1 advertisement", () => {
     { type: "system", subtype: "compact_boundary", uuid: "b1" },
   ])).toHaveLength(1);
 });
+
+test("compact summary is recovered from the boundary anchor when the SDK drops isCompactSummary", () => {
+  const events = compactEventsFromMessages([
+    {
+      type: "system",
+      subtype: "compact_boundary",
+      uuid: "b1",
+      compactMetadata: {
+        trigger: "manual",
+        preservedSegment: { anchorUuid: "s1" },
+      },
+    },
+    {
+      type: "user",
+      uuid: "s1",
+      message: { role: "user", content: [{ type: "text", text: "Earlier we built the relay." }] },
+    },
+  ]);
+  expect(events).toEqual([
+    expect.objectContaining({ kind: "boundary", uuid: "b1" }),
+    { kind: "summary", uuid: "s1", text: "Earlier we built the relay." },
+  ]);
+});

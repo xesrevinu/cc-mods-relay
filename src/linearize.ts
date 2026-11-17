@@ -219,7 +219,12 @@ export async function defaultGetMessages(
   opts?: { dir?: string },
 ): Promise<SessionMessage[]> {
   const sdk = await import("@anthropic-ai/claude-agent-sdk");
-  return sdk.getSessionMessages(sessionId, opts) as Promise<SessionMessage[]>;
+  return sdk.getSessionMessages(sessionId, {
+    ...opts,
+    // compact_boundary is a system record; without this, live /compact never
+    // reaches ACP compaction_update or Grok auto_compact_* notifications.
+    includeSystemMessages: true,
+  }) as Promise<SessionMessage[]>;
 }
 
 export interface FallbackOptions {

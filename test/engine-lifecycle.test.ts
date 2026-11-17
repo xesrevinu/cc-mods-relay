@@ -11,6 +11,22 @@ test("resume keeps the same session id and does not spawn a fresh claude", () =>
   expect(cmd).not.toContain("||");
 });
 
+test("resume passes --model from extraFlags so the TUI keeps the session model", () => {
+  const [, cmd] = buildResumeArgv(
+    SOURCE,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { model: "haiku" },
+  );
+  expect(cmd).toContain(`--resume "${SOURCE}"`);
+  expect(cmd).toContain(" --model haiku");
+});
+
 test("resume rejects a session id that is not a UUID", () => {
   expect(() => buildResumeArgv("not-a-uuid")).toThrow(/not a UUID/);
 });

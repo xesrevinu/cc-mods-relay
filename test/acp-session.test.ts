@@ -90,6 +90,7 @@ function harness(opts: {
   writes?: string[];
   immediate?: boolean;
   discoverAgents?: () => Array<{ value: string; displayName: string }>;
+  findTranscript?: (sessionId: string) => string[];
 } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), "cc-mods-acp-"));
   const updates: SessionNotification[] = [];
@@ -133,6 +134,7 @@ function harness(opts: {
     },
     fastModeProbe: () => false,
     getPlanUsage: opts.getPlanUsage ?? (async () => undefined),
+    findTranscript: opts.findTranscript,
     forkHistoryWaitMs: opts.forkHistoryWaitMs ?? 0,
     ...(opts.immediate
       ? {
@@ -390,6 +392,38 @@ test("session/load of a stored id after the agent is gone spawns claude --resume
     replayOnly: false,
     sessionId,
   });
+});
+
+test("session/load restores the transcript model instead of the catalog default", async () => {
+  const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-resume-model-"));
+  const transcript = join(dir, `${sessionId}.jsonl`);
+  writeFileSync(
+    transcript,
+    [
+      JSON.stringify({ type: "user", cwd: dir, message: { role: "user", content: "hi" } }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", model: "claude-haiku-5-5", content: [] },
+      }),
+      "",
+    ].join("\n"),
+  );
+  const { agent, cwd, starts } = harness({
+    findTranscript: (id) => (id === sessionId ? [transcript] : []),
+  });
+  live.push(agent);
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  const loaded = await agent.loadSession({
+    sessionId,
+    cwd,
+    mcpServers: [],
+    _meta: { modelId: "default", yoloMode: true },
+  });
+  expect(starts).toHaveLength(1);
+  expect(starts[0]?.resume).toBe(true);
+  expect(starts[0]?.extraFlags?.model).toBe("haiku");
+  expect(loaded.configOptions?.find((o) => o.id === "model")?.currentValue).toBe("haiku");
 });
 
 test("session/load replays history for a live session without spawning again", async () => {
@@ -929,6 +963,81 @@ test("interject without an in-flight turn is rejected", async () => {
   await expect(
     agent.handleGrokInterject({ sessionId: created.sessionId, text: "later" }),
   ).rejects.toThrow(/no turn in progress/);
+});
+
+test("/compact injects the TUI command and notifies the ACP client", async () => {
+  let history: Array<{ uuid?: string; [k: string]: unknown }> = [];
+  const { agent, cwd, starts, updates, extNotes, writes } = harness({
+    immediate: true,
+    getMessages: async () => history,
+  });
+  live.push(agent);
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { session: { compaction: {} } },
+  });
+  const created = await agent.newSession({ cwd, mcpServers: [] });
+  updates.length = 0;
+  extNotes.length = 0;
+
+  const pending = agent.prompt(slashPrompt(created.sessionId, "/compact"));
+  await flush();
+  expect(writes.join("")).toContain("/compact");
+  const grokStarted = extNotes
+    .filter((note) => note.method === "x.ai/session_notification")
+    .map((note) => (note.params as { update?: { sessionUpdate?: string } }).update?.sessionUpdate);
+  expect(grokStarted).toContain("auto_compact_started");
+  expect(
+    updates.some(
+      (note) =>
+        (note.update as { sessionUpdate?: string; status?: string }).sessionUpdate ===
+          "compaction_update" &&
+        (note.update as { status?: string }).status === "in_progress",
+    ),
+  ).toBe(true);
+
+  history = [
+    {
+      type: "system",
+      subtype: "compact_boundary",
+      uuid: "boundary-live",
+      compactMetadata: { trigger: "manual", preTokens: 90_000, postTokens: 8_000 },
+    },
+    {
+      type: "user",
+      uuid: "summary-live",
+      isCompactSummary: true,
+      message: { role: "user", content: [{ type: "text", text: "We compacted the earlier turns." }] },
+    },
+  ];
+  starts[0]?.onEvent?.(created.sessionId);
+  expect(await pending).toEqual({ stopReason: "end_turn" });
+  for (let i = 0; i < 20; i++) {
+    if (
+      updates.some(
+        (note) =>
+          (note.update as { sessionUpdate?: string; status?: string }).sessionUpdate ===
+            "compaction_update" &&
+          (note.update as { status?: string }).status === "completed",
+      )
+    ) {
+      break;
+    }
+    await flush();
+  }
+  const grok = extNotes
+    .filter((note) => note.method === "x.ai/session_notification")
+    .map((note) => (note.params as { update?: { sessionUpdate?: string } }).update?.sessionUpdate);
+  expect(grok).toContain("auto_compact_completed");
+  expect(extNotes.some((note) => note.method === "pi/ui/compaction_summary")).toBe(true);
+  expect(
+    updates.some(
+      (note) =>
+        (note.update as { sessionUpdate?: string; status?: string }).sessionUpdate ===
+          "compaction_update" &&
+        (note.update as { status?: string }).status === "completed",
+    ),
+  ).toBe(true);
 });
 
 test("compact_boundary replay is a Grok compaction banner, not a user message", async () => {

@@ -8,6 +8,7 @@ type TranscriptRecord = {
   permissionMode?: unknown;
   origin?: { kind?: unknown };
   attachment?: { type?: unknown };
+  message?: { model?: unknown };
 };
 
 class PermissionModeScan {
@@ -40,6 +41,20 @@ class PermissionModeScan {
   }
 }
 
+class ModelScan {
+  model: string | undefined;
+
+  visit(line: Buffer): boolean {
+    if (line.indexOf('"assistant"') < 0 || line.indexOf('"model"') < 0) return false;
+    const record = parseMainThreadRecord(line);
+    if (record?.type !== "assistant") return false;
+    const model = record.message?.model;
+    if (typeof model !== "string" || model.trim() === "") return false;
+    this.model = model.trim();
+    return true;
+  }
+}
+
 function parseMainThreadRecord(line: Buffer): TranscriptRecord | null {
   let entry: unknown;
   try {
@@ -52,14 +67,17 @@ function parseMainThreadRecord(line: Buffer): TranscriptRecord | null {
   return record.isSidechain === true ? null : record;
 }
 
-export async function readTranscriptPermissionMode(filePath: string): Promise<string | undefined> {
+async function scanTranscriptTail(
+  filePath: string,
+  visit: (line: Buffer) => boolean,
+  done: () => string | undefined,
+): Promise<string | undefined> {
   let handle;
   try {
     handle = await open(filePath, "r");
   } catch {
     return undefined;
   }
-  const scan = new PermissionModeScan();
   try {
     let end = (await handle.stat()).size;
     let pending: Buffer[] = [];
@@ -68,18 +86,28 @@ export async function readTranscriptPermissionMode(filePath: string): Promise<st
       let chunk = Buffer.alloc(end - start);
       await handle.read(chunk, 0, chunk.length, start);
       for (let at = chunk.lastIndexOf(0x0a); at >= 0; at = chunk.lastIndexOf(0x0a)) {
-        if (scan.visit(Buffer.concat([chunk.subarray(at + 1), ...pending]))) return scan.mode;
+        if (visit(Buffer.concat([chunk.subarray(at + 1), ...pending]))) return done();
         pending = [];
         chunk = chunk.subarray(0, at);
       }
       pending.unshift(chunk);
       end = start;
     }
-    scan.visit(Buffer.concat(pending));
-    return scan.mode;
+    visit(Buffer.concat(pending));
+    return done();
   } catch {
     return undefined;
   } finally {
     await handle.close();
   }
+}
+
+export async function readTranscriptPermissionMode(filePath: string): Promise<string | undefined> {
+  const scan = new PermissionModeScan();
+  return scanTranscriptTail(filePath, (line) => scan.visit(line), () => scan.mode);
+}
+
+export async function readTranscriptModel(filePath: string): Promise<string | undefined> {
+  const scan = new ModelScan();
+  return scanTranscriptTail(filePath, (line) => scan.visit(line), () => scan.model);
 }

@@ -52,11 +52,27 @@ export function compactEventFromMessage(message: SessionMessage): CompactEvent |
 
 export function compactEventsFromMessages(messages: SessionMessage[]): CompactEvent[] {
   const events: CompactEvent[] = [];
-  for (const message of messages) {
+  for (const message of withCompactSummaryHints(messages)) {
     const event = compactEventFromMessage(message);
     if (event) events.push(event);
   }
   return events;
+}
+
+/** SDK getSessionMessages may drop `isCompactSummary`; recover it from the boundary relink. */
+export function withCompactSummaryHints(messages: SessionMessage[]): SessionMessage[] {
+  const anchors = new Set<string>();
+  for (const message of messages) {
+    if (!isCompactBoundary(message)) continue;
+    const anchor = compactAnchorUuid(message);
+    if (anchor) anchors.add(anchor);
+  }
+  if (anchors.size === 0) return messages;
+  return messages.map((message) => {
+    if (typeof message.uuid !== "string" || !anchors.has(message.uuid)) return message;
+    if (isCompactSummaryMessage(message)) return message;
+    return { ...message, isCompactSummary: true };
+  });
 }
 
 export function compactSummaryText(message: SessionMessage): string {
@@ -162,28 +178,47 @@ function compactMetadataOf(message: SessionMessage): {
   tokensBefore?: number;
   tokensAfter?: number;
 } {
+  const raw = compactMetadataRecord(message);
+  if (!raw) return {};
+  const trigger = typeof raw.trigger === "string" ? raw.trigger : undefined;
+  const tokensBefore = firstNumber(
+    raw.preTokens,
+    raw.pre_tokens,
+    raw.tokensBefore,
+    raw.preCompactTokens,
+    raw.preCompactTokenCount,
+  );
+  const tokensAfter = firstNumber(
+    raw.postTokens,
+    raw.post_tokens,
+    raw.tokensAfter,
+    raw.promptTokens,
+  );
+  return { trigger, tokensBefore, tokensAfter };
+}
+
+function compactMetadataRecord(message: SessionMessage): Record<string, unknown> | undefined {
   const rec = message as {
     compactMetadata?: unknown;
     compact_metadata?: unknown;
   };
   const raw = rec.compactMetadata ?? rec.compact_metadata;
-  if (!raw || typeof raw !== "object") return {};
-  const meta = raw as Record<string, unknown>;
-  const trigger = typeof meta.trigger === "string" ? meta.trigger : undefined;
-  const tokensBefore = firstNumber(
-    meta.preTokens,
-    meta.pre_tokens,
-    meta.tokensBefore,
-    meta.preCompactTokens,
-    meta.preCompactTokenCount,
-  );
-  const tokensAfter = firstNumber(
-    meta.postTokens,
-    meta.post_tokens,
-    meta.tokensAfter,
-    meta.promptTokens,
-  );
-  return { trigger, tokensBefore, tokensAfter };
+  if (!raw || typeof raw !== "object") return undefined;
+  return raw as Record<string, unknown>;
+}
+
+function compactAnchorUuid(message: SessionMessage): string | undefined {
+  const raw = compactMetadataRecord(message);
+  if (!raw) return undefined;
+  const segment = asRecord(raw.preservedSegment) ?? asRecord(raw.preserved_segment);
+  const preserved = asRecord(raw.preservedMessages) ?? asRecord(raw.preserved_messages);
+  const anchor = segment?.anchorUuid ?? segment?.anchor_uuid ?? preserved?.anchorUuid ?? preserved?.anchor_uuid;
+  return typeof anchor === "string" && anchor.length > 0 ? anchor : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
 }
 
 function firstNumber(...values: unknown[]): number | undefined {

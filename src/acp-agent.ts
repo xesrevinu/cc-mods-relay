@@ -97,7 +97,7 @@ import type { LocateOptions } from "./jsonl.js";
 import { linearizeTurns, readOrderedMessages, defaultGetMessages } from "./linearize.js";
 import { createDiffEnrichedReader } from "./diff-enriched-reader.js";
 import { backgroundTaskEnds, type BackgroundTaskEnd } from "./background-task-end.js";
-import { readTranscriptPermissionMode } from "./resumed-permission-mode.js";
+import { readTranscriptModel, readTranscriptPermissionMode } from "./resumed-permission-mode.js";
 import type { DiffEnrichedReaderOptions } from "./diff-enriched-reader.js";
 import { withPrecompactHistory, type PrecompactHistoryOptions } from "./compacted-history.js";
 import {
@@ -109,6 +109,7 @@ import {
   grokAutoCompactStarted,
   grokCompactionSummary,
   isCompactSummaryMessage,
+  withCompactSummaryHints,
   type CompactEvent,
 } from "./compaction.js";
 import {
@@ -162,6 +163,7 @@ import {
   modelSelectorDescription,
   DEFAULT_MODEL_INFO,
   REASONING_EFFORT_LEVELS,
+  catalogValueFromTranscriptModel,
   resolveCatalogValueFromModelId,
   isFastModeCapableModel,
   classifyFastModeSignal,
@@ -1819,6 +1821,18 @@ export class ClaudeAcpAgent {
     sessionRecord.turnTempImagePaths = turnTempImagePaths;
     const payload = promptToClaude(params, this.logger, turnTempImagePaths);
     const slash = parseSlashPrompt(payload);
+    if (slash?.name === "compact") {
+      try {
+        return await this.runCompactPrompt(
+          params.sessionId,
+          sessionRecord,
+          slash.args ? `/compact ${slash.args}` : "/compact",
+        );
+      } finally {
+        cleanupMaterializedImages(sessionRecord.turnTempImagePaths);
+        sessionRecord.turnTempImagePaths = undefined;
+      }
+    }
     if (slash && isAdvertisedSlash(slash.name)) {
       try {
         return await this.replyToSlash(params.sessionId, sessionRecord, slash.name, slash.args);
@@ -1991,6 +2005,53 @@ export class ClaudeAcpAgent {
       });
     }
     return { stopReason: "end_turn" };
+  }
+
+  private async runCompactPrompt(
+    sessionId: string,
+    session: Session,
+    command: string,
+  ): Promise<PromptResponse> {
+    const compactionId = randomUUID();
+    session.compactionLive = {
+      id: compactionId,
+      tokensBefore: session.lastContextUsed || undefined,
+      startedAt: Date.now(),
+    };
+    await this.publishCompactStarted(sessionId, session, {
+      trigger: "manual",
+      tokensUsed: session.lastContextUsed,
+    });
+
+    const { detector, promise, cancel } = createTurnResolver({
+      schedule: this.schedule,
+      sessionId,
+      logger: this.logger,
+      onTurnResolved: () => void this.emitSessionTitleUpdate(sessionId),
+    });
+    session.turnDetector = detector;
+    session.turnCancel = cancel;
+    detector.beginTurn();
+    detector.hold("compact");
+    try {
+      sendPrompt(session.pty, command, this.schedule);
+    } catch (error) {
+      detector.release("compact");
+      detector.markCancelled();
+      session.turnDetector = undefined;
+      session.turnCancel = undefined;
+      session.compactionLive = undefined;
+      throw error;
+    }
+    try {
+      return await promise;
+    } finally {
+      session.turnDetector?.release("compact");
+      session.turnDetector = undefined;
+      session.turnCancel = undefined;
+      session.subagentWatcher?.stop();
+      session.subagentWatcher = undefined;
+    }
   }
 
   private async emitSessionTitleUpdate(sessionId: string): Promise<void> {
@@ -3248,9 +3309,11 @@ export class ClaudeAcpAgent {
 
     session.interacted = true;
     if (session.liveFromMod || this.modsConnected()) {
-      const messages = await readOrderedMessages(sessionId, session.cwd, {
-        getMessages: this.getMessages,
-      });
+      const messages = withCompactSummaryHints(
+        await readOrderedMessages(sessionId, session.cwd, {
+          getMessages: this.getMessages,
+        }),
+      );
       const fed = messages.slice(session.detectorCursor ?? 0);
       session.detectorCursor = messages.length;
       if (session.turnDetector) {
@@ -3258,6 +3321,10 @@ export class ClaudeAcpAgent {
           session.turnDetector.observe(m as never);
           const content = (m as { message?: { content?: unknown } }).message?.content;
           if (statusCommandOutput(content)) session.turnDetector.finish("end_turn");
+          if (compactEventFromMessage(m)) {
+            session.turnDetector.release("compact");
+            session.turnDetector.finish("end_turn");
+          }
         }
       }
       if (session.gate) {
@@ -3269,9 +3336,11 @@ export class ClaudeAcpAgent {
       return;
     }
 
-    const messages = await readOrderedMessages(sessionId, session.cwd, {
-      getMessages: this.getMessages,
-    });
+    const messages = withCompactSummaryHints(
+      await readOrderedMessages(sessionId, session.cwd, {
+        getMessages: this.getMessages,
+      }),
+    );
 
     if (!session.guardChecked) {
       session.guardChecked = true;
@@ -3305,6 +3374,10 @@ export class ClaudeAcpAgent {
         session.turnDetector.observe(m as never);
         const content = (m as { message?: { content?: unknown } }).message?.content;
         if (statusCommandOutput(content)) session.turnDetector.finish("end_turn");
+        if (compactEventFromMessage(m)) {
+          session.turnDetector.release("compact");
+          session.turnDetector.finish("end_turn");
+        }
       }
     }
 
@@ -3391,12 +3464,43 @@ export class ClaudeAcpAgent {
     live: boolean,
   ): Promise<void> {
     session.emittedCompaction ??= new Set();
-    for (const message of messages) {
+    for (const message of withCompactSummaryHints(messages)) {
       const event = compactEventFromMessage(message);
       if (!event) continue;
       if (session.emittedCompaction.has(event.uuid)) continue;
       session.emittedCompaction.add(event.uuid);
       await this.publishCompactEvent(sessionId, session, event, live);
+    }
+  }
+
+  private async publishCompactStarted(
+    sessionId: string,
+    session: Session,
+    opts: { trigger?: string; tokensUsed?: number } = {},
+  ): Promise<void> {
+    const compactionId = session.compactionLive?.id;
+    if (!compactionId) return;
+    const window = session.contextWindowSize || DEFAULT_CONTEXT_WINDOW;
+    const tokensUsed = opts.tokensUsed ?? session.lastContextUsed;
+    const percentage = compactPercentage(tokensUsed, window);
+    await this.publishGrokExt(
+      grokAutoCompactStarted({
+        sessionId,
+        tokensUsed,
+        contextWindow: window,
+        percentage,
+        reason: opts.trigger === "manual" ? "Manual compact" : `Context window ${percentage}% full`,
+      }),
+    );
+    if (clientSupportsCompaction(this.clientCapabilities)) {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "compaction_update",
+          compactionId,
+          status: "in_progress",
+        },
+      });
     }
   }
 
@@ -3406,46 +3510,39 @@ export class ClaudeAcpAgent {
     event: CompactEvent,
     live: boolean,
   ): Promise<void> {
-    const window = session.contextWindowSize || DEFAULT_CONTEXT_WINDOW;
     if (event.kind === "boundary") {
-      const tokensUsed = event.tokensBefore ?? session.lastContextUsed;
-      const tokensAfter = event.tokensAfter ?? session.lastContextUsed;
-      const percentage = compactPercentage(tokensUsed, window);
-      session.compactionLive = {
-        id: event.uuid,
-        tokensBefore: event.tokensBefore,
-        startedAt: Date.now(),
-      };
+      if (event.tokensAfter !== undefined) session.lastContextUsed = event.tokensAfter;
       if (live) {
-        await this.publishGrokExt(
-          grokAutoCompactStarted({
-            sessionId,
-            tokensUsed,
-            contextWindow: window,
-            percentage,
-            reason:
-              event.trigger === "manual"
-                ? "Manual compact"
-                : `Context window ${percentage}% full`,
-          }),
-        );
+        if (!session.compactionLive) {
+          session.compactionLive = {
+            id: event.uuid,
+            tokensBefore: event.tokensBefore,
+            startedAt: Date.now(),
+          };
+          await this.publishCompactStarted(sessionId, session, {
+            trigger: event.trigger,
+            tokensUsed: event.tokensBefore ?? session.lastContextUsed,
+          });
+        } else {
+          session.compactionLive.tokensBefore ??= event.tokensBefore;
+        }
+        return;
       }
+      const tokensAfter = event.tokensAfter ?? session.lastContextUsed;
       await this.publishGrokExt(
         grokAutoCompactCompleted({
           sessionId,
           tokensBefore: event.tokensBefore,
           tokensAfter,
-          summaryPreview: undefined,
         }),
       );
-      if (event.tokensAfter !== undefined) session.lastContextUsed = event.tokensAfter;
       if (clientSupportsCompaction(this.clientCapabilities)) {
         await this.client.sessionUpdate({
           sessionId,
           update: {
             sessionUpdate: "compaction_update",
             compactionId: event.uuid,
-            status: live ? "in_progress" : "completed",
+            status: "completed",
           },
         });
       }
@@ -3453,17 +3550,17 @@ export class ClaudeAcpAgent {
     }
 
     const compactionId = session.compactionLive?.id ?? event.uuid;
-    const hadBoundary = session.compactionLive !== undefined;
+    const started = session.compactionLive;
     session.compactionLive = undefined;
-    if (!hadBoundary) {
-      await this.publishGrokExt(
-        grokAutoCompactCompleted({
-          sessionId,
-          tokensAfter: session.lastContextUsed,
-          summaryPreview: event.text.slice(0, 100) || undefined,
-        }),
-      );
-    }
+    await this.publishGrokExt(
+      grokAutoCompactCompleted({
+        sessionId,
+        tokensBefore: started?.tokensBefore,
+        tokensAfter: session.lastContextUsed,
+        elapsedMs: started ? Date.now() - started.startedAt : undefined,
+        summaryPreview: event.text.slice(0, 100) || undefined,
+      }),
+    );
     await this.publishGrokExt(grokCompactionSummary(sessionId, event.text));
     if (clientSupportsCompaction(this.clientCapabilities)) {
       await this.client.sessionUpdate({
@@ -3782,8 +3879,23 @@ export class ClaudeAcpAgent {
         : allowBypass
           ? "bypassPermissions"
           : "default");
-    const extraFlags = extraFlagsWithModel(this.relayFlags, seed.model);
-    const seededModel = seed.model ?? DEFAULT_MODEL_INFO.value;
+    const restoreFrom = creationOpts.forkSession ? creationOpts.resume : isResume || creationOpts.replayOnly ? requestedSessionId : undefined;
+    let recordedModel: string | undefined;
+    if (restoreFrom) {
+      const peeked = peekTranscript(restoreFrom, {
+        glob: this.locateTranscriptFiles,
+        preferCwd: tuiCwd,
+      });
+      if (peeked?.transcriptPath) {
+        recordedModel = catalogValueFromTranscriptModel(
+          await readTranscriptModel(peeked.transcriptPath),
+          liveModelCatalog,
+        );
+      }
+    }
+    const spawnModel = restoreFrom ? recordedModel ?? seed.model : seed.model;
+    const extraFlags = extraFlagsWithModel(this.relayFlags, spawnModel);
+    let seededModel = spawnModel ?? DEFAULT_MODEL_INFO.value;
 
     const taskState: TaskState = new Map();
 
@@ -3869,6 +3981,13 @@ export class ClaudeAcpAgent {
       const recorded = await readTranscriptPermissionMode(started.transcriptPath);
       if (recorded !== undefined && availableModes.some((m) => m.id === recorded)) {
         currentModeId = recorded as PermissionMode;
+      }
+      if (!recordedModel) {
+        const fromFile = catalogValueFromTranscriptModel(
+          await readTranscriptModel(started.transcriptPath),
+          liveModelCatalog,
+        );
+        if (fromFile) seededModel = fromFile;
       }
     }
     const modes: SessionModeState = {

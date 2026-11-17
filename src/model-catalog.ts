@@ -87,6 +87,20 @@ export function resolveCatalogValueFromModelId(id: string): string | null {
   return null;
 }
 
+/** Map a JSONL assistant `message.model` onto a catalog alias for spawn and ACP. */
+export function catalogValueFromTranscriptModel(
+  raw: string | undefined,
+  catalog: ModelInfo[] = MODEL_CATALOG,
+): string | undefined {
+  if (!raw) return undefined;
+  const id = raw.trim();
+  if (!id) return undefined;
+  if (catalog.some((m) => m.value === id)) return id;
+  const mapped = resolveCatalogValueFromModelId(id);
+  if (mapped && catalog.some((m) => m.value === mapped)) return mapped;
+  return undefined;
+}
+
 export function modelSelectorDescription(info: ModelInfo): string {
   return info.description ?? "";
 }
