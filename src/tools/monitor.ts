@@ -1,8 +1,9 @@
+import type { MonitorOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { sessionCwd } from "./bash.js";
 import { spawnEnv, withDirenv } from "./direnv.js";
 import { finishJob, registerJob, wasCancelled } from "./jobs.js";
 import { asNumber, asString, rewriteRemoteText } from "./paths.js";
-import { abortedShellResult, clampTimeout, killTree, type Send, type ToolFrame } from "./runtime.js";
+import { clampTimeout, killTree, type Send, type ToolFrame } from "./runtime.js";
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MIN_TIMEOUT_MS = 1_000;
@@ -14,8 +15,8 @@ function timeoutSpec(input: Record<string, unknown>): { timeoutMs: number; persi
   return { timeoutMs: clampTimeout(raw, DEFAULT_TIMEOUT_MS, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS), persistent: false };
 }
 
-function startedResult(id: string, timeoutMs: number, persistent: boolean): Record<string, unknown> {
-  return { taskId: id, timeoutMs: persistent ? 0 : timeoutMs, ...(persistent ? { persistent: true } : {}) };
+function startedResult(id: string, timeoutMs: number, persistent: boolean): MonitorOutput {
+  return { taskId: id, timeoutMs: persistent ? 0 : timeoutMs, ...(persistent ? { persistent: true as const } : {}) };
 }
 
 function assertWsUrl(url: string): string {
@@ -99,8 +100,9 @@ function startWsMonitor(
   ms: number,
   persistent: boolean,
   notify: Send,
-): Record<string, unknown> {
+): MonitorOutput {
   const callId = frame.callId ?? "";
+  if (wasCancelled(callId)) throw new Error("Tool call was cancelled");
   const ws = protocols && protocols.length ? new WebSocket(url, protocols) : new WebSocket(url);
   let socket: WebSocket | undefined = ws;
   let events = 0;
@@ -156,13 +158,11 @@ async function startCommandMonitor(
   ms: number,
   persistent: boolean,
   notify: Send,
-): Promise<Record<string, unknown>> {
+): Promise<MonitorOutput> {
   const callId = frame.callId ?? "";
   const cwd = sessionCwd(frame, workspace);
   const env = await withDirenv(cwd, process.env);
-  if (wasCancelled(callId)) {
-    return abortedShellResult();
-  }
+  if (wasCancelled(callId)) throw new Error("Tool call was cancelled");
   const proc = Bun.spawn(["bash", "-c", command], {
     cwd,
     stdin: "ignore",
@@ -217,7 +217,7 @@ export async function monitorTool(
   frame: ToolFrame,
   input: Record<string, unknown>,
   notify: Send,
-): Promise<Record<string, unknown>> {
+): Promise<MonitorOutput> {
   const { timeoutMs: ms, persistent } = timeoutSpec(input);
   const ws = input.ws;
   const command = rewriteRemoteText(asString(input.command), workspace, frame.tuiRoot);

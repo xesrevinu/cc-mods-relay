@@ -9,7 +9,7 @@ import { monitorTool } from "./tools/monitor.js";
 import { notebookEditTool } from "./tools/notebook.js";
 import { mapPath, mergeRoots } from "./tools/paths.js";
 import { readTool } from "./tools/read.js";
-import { abortedShellResult, SHELL_TOOLS, type Send, type ToolFrame } from "./tools/runtime.js";
+import { abortedShellResult, nativeToolResult, SHELL_TOOLS, type Send, type ToolFrame } from "./tools/runtime.js";
 import { enterWorktreeTool, exitWorktreeTool } from "./tools/worktree.js";
 import { writeTool } from "./tools/write.js";
 
@@ -19,7 +19,15 @@ const fail = (send: Send, frame: ToolFrame, code: string, message: string) =>
   send({ v: 1, type: "result", id: frame.id, callId: frame.callId, sessionId: frame.sessionId, ok: false, error: { code, message } });
 
 const ok = (send: Send, frame: ToolFrame, value: unknown) =>
-  send({ v: 1, type: "result", id: frame.id, callId: frame.callId, sessionId: frame.sessionId, ok: true, result: value });
+  send({
+    v: 1,
+    type: "result",
+    id: frame.id,
+    callId: frame.callId,
+    sessionId: frame.sessionId,
+    ok: true,
+    result: nativeToolResult(frame.tool, value, frame.input ?? {}),
+  });
 
 export { mapPath, cancelBash as cancelCall, cancelSession };
 

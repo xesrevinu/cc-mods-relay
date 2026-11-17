@@ -32,6 +32,11 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).toContain("DEFERRED_TOOLS");
   expect(src).toContain("failResult");
   expect(src).toContain("deny:");
+  expect(src).toContain("objectResult");
+  expect(src).not.toContain('if (tool === "Grep" || tool === "Glob")');
+  expect(src).toContain('if (tool === "Grep") return { numFiles: 0, filenames: [] }');
+  expect(src).toContain('if (tool === "Glob") return { durationMs: 0, numFiles: 0, filenames: [], truncated: false }');
+  expect(src).not.toContain("{ value: text }");
   expect(src).not.toContain("isError: true");
   expect(src).not.toContain("if (e.agentId && !parent) return next(e)");
   expect(src).toContain("classic.Stop");

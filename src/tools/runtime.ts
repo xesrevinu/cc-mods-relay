@@ -1,3 +1,16 @@
+import type {
+  BashOutput,
+  EnterWorktreeOutput,
+  ExitWorktreeOutput,
+  FileEditOutput,
+  FileReadOutput,
+  FileWriteOutput,
+  GlobOutput,
+  GrepOutput,
+  MonitorOutput,
+  NotebookEditOutput,
+} from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+
 export type ToolFrame = {
   id?: string;
   callId?: string;
@@ -13,7 +26,109 @@ export type Send = (frame: Record<string, unknown>) => void;
 
 export const SHELL_TOOLS = new Set(["Bash", "PowerShell"]);
 
-export function abortedShellResult(stdout = "", stderr = ""): Record<string, unknown> {
+function asText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function asObject(value: object): Record<string, unknown> {
+  return value as Record<string, unknown>;
+}
+
+function inputPath(input: Record<string, unknown>): string {
+  for (const key of ["file_path", "path", "notebook_path"] as const) {
+    const value = input[key];
+    if (typeof value === "string") return value;
+  }
+  return "";
+}
+
+/**
+ * Mods `tool.call` `{ result }` must match Claude Agent SDK ToolOutputSchemas.
+ * A string is rejected (`expected object, received string`) and the builtin
+ * runs on the TUI host.
+ */
+export function nativeToolResult(
+  tool: string | undefined,
+  result: unknown,
+  input: Record<string, unknown> = {},
+): Record<string, unknown> {
+  if (result && typeof result === "object" && !Array.isArray(result)) return result as Record<string, unknown>;
+  const text = asText(result);
+  const filePath = inputPath(input);
+  if (tool === "Read") {
+    const lines = text.split("\n");
+    return asObject({
+      type: "text",
+      file: { filePath, content: text, numLines: lines.length, startLine: 1, totalLines: lines.length },
+    } satisfies FileReadOutput);
+  }
+  if (tool === "Write") {
+    return asObject({
+      type: "create",
+      filePath,
+      content: text,
+      structuredPatch: [],
+      originalFile: null,
+    } satisfies FileWriteOutput);
+  }
+  if (tool === "Edit") {
+    return asObject({
+      filePath,
+      oldString: "",
+      newString: text,
+      originalFile: null,
+      structuredPatch: [],
+      userModified: false,
+      replaceAll: false,
+    } satisfies FileEditOutput);
+  }
+  if (tool === "Bash" || tool === "PowerShell") {
+    return asObject({ stdout: text, stderr: "", interrupted: false } satisfies BashOutput);
+  }
+  if (tool === "Grep") {
+    return asObject({ numFiles: 0, filenames: [] } satisfies GrepOutput);
+  }
+  if (tool === "Glob") {
+    return asObject({ durationMs: 0, numFiles: 0, filenames: [], truncated: false } satisfies GlobOutput);
+  }
+  if (tool === "NotebookEdit") {
+    return asObject({
+      new_source: text,
+      cell_type: "code",
+      language: "python",
+      edit_mode: "replace",
+      notebook_path: filePath,
+      original_file: "",
+      updated_file: "",
+    } satisfies NotebookEditOutput);
+  }
+  if (tool === "Monitor") {
+    return asObject({ taskId: "", timeoutMs: 0 } satisfies MonitorOutput);
+  }
+  if (tool === "EnterWorktree") {
+    return asObject({ worktreePath: "", message: text } satisfies EnterWorktreeOutput);
+  }
+  if (tool === "ExitWorktree") {
+    return asObject({
+      action: "keep",
+      originalCwd: "",
+      worktreePath: "",
+      message: text,
+    } satisfies ExitWorktreeOutput);
+  }
+  if (tool === "SendFile" || tool === "SendUserFile") {
+    return { filePath, bytes: 0 };
+  }
+  return asObject({ stdout: text, stderr: "", interrupted: false } satisfies BashOutput);
+}
+
+export function abortedShellResult(stdout = "", stderr = ""): BashOutput {
   const extra = "Command was aborted before completion";
   const merged = stderr ? `${stderr.trimEnd()}\n${extra}` : extra;
   return { stdout, stderr: merged, interrupted: true };

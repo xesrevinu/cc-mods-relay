@@ -1,3 +1,4 @@
+import type { EnterWorktreeOutput, ExitWorktreeOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { persistCwd, resetSessionCwd, sessionCwd } from "./bash.js";
@@ -53,7 +54,7 @@ export async function enterWorktreeTool(
   frame: ToolFrame,
   input: Record<string, unknown>,
   extraDirs: string[] = [],
-): Promise<Record<string, unknown>> {
+): Promise<EnterWorktreeOutput> {
   const sessionId = frame.sessionId || "";
   const roots = mergeRoots(extraDirs);
   const named = asString(input.name);
@@ -93,7 +94,7 @@ export async function exitWorktreeTool(
   workspace: string,
   frame: ToolFrame,
   input: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
+): Promise<ExitWorktreeOutput> {
   const sessionId = frame.sessionId || "";
   const action = asString(input.action);
   if (action !== "keep" && action !== "remove") throw new Error('action must be "keep" or "remove"');

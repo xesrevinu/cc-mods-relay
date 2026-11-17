@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { cancelCall, execute } from "../src/exec.js";
 import { applyModEvent } from "../src/mod-live.js";
 import { mapPath, rewriteRemoteText } from "../src/tools/paths.js";
+import { nativeToolResult } from "../src/tools/runtime.js";
 
 function run(
   dir: string,
@@ -26,6 +27,132 @@ function run(
     );
   });
 }
+
+test("nativeToolResult wraps a string so Mods sees an object", () => {
+  const read = nativeToolResult("Read", "hello\nworld", { file_path: "/tmp/a.txt" });
+  expect(Array.isArray(read)).toBe(false);
+  expect(read.type).toBe("text");
+  expect((read.file as { content: string }).content).toBe("hello\nworld");
+  const write = nativeToolResult("Write", "body", { file_path: "/tmp/a.txt" });
+  expect(write.type).toBe("create");
+  const obj = { type: "text", file: { content: "keep" } };
+  expect(nativeToolResult("Read", obj)).toBe(obj);
+});
+
+test("nativeToolResult fallbacks match Claude Agent SDK per-tool objects", () => {
+  const glob = nativeToolResult("Glob", "oops");
+  expect(glob).toEqual({ durationMs: 0, numFiles: 0, filenames: [], truncated: false });
+  const grep = nativeToolResult("Grep", "oops");
+  expect(grep).toEqual({ numFiles: 0, filenames: [] });
+  expect("mode" in glob).toBe(false);
+  expect("durationMs" in grep).toBe(false);
+  const notebook = nativeToolResult("NotebookEdit", "print(1)", { notebook_path: "/tmp/n.ipynb" });
+  expect(notebook).toMatchObject({
+    new_source: "print(1)",
+    cell_type: "code",
+    notebook_path: "/tmp/n.ipynb",
+    original_file: "",
+    updated_file: "",
+  });
+  const monitor = nativeToolResult("Monitor", "oops");
+  expect(monitor).toEqual({ taskId: "", timeoutMs: 0 });
+  const enter = nativeToolResult("EnterWorktree", "oops");
+  expect(enter).toMatchObject({ worktreePath: "", message: "oops" });
+  const exit = nativeToolResult("ExitWorktree", "oops");
+  expect(exit).toMatchObject({ action: "keep", originalCwd: "", worktreePath: "", message: "oops" });
+  expect(nativeToolResult("Bash", "hi")).toEqual({ stdout: "hi", stderr: "", interrupted: false });
+  expect("value" in nativeToolResult("Unknown", "x")).toBe(false);
+});
+
+test("workspace tools return Claude Agent SDK required fields", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-sdk-"));
+  writeFileSync(join(dir, "a.ts"), "hello\n");
+  writeFileSync(
+    join(dir, "n.ipynb"),
+    JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      cells: [{ id: "c1", cell_type: "code", source: ["print(1)\n"], metadata: {}, outputs: [], execution_count: null }],
+    }),
+  );
+
+  const read = await run(dir, "Read", { file_path: join(dir, "a.ts") });
+  expect(read.ok).toBe(true);
+  expect(read.result).toEqual(expect.objectContaining({
+    type: "text",
+    file: expect.objectContaining({
+      filePath: expect.any(String),
+      content: expect.any(String),
+      numLines: expect.any(Number),
+      startLine: expect.any(Number),
+      totalLines: expect.any(Number),
+    }),
+  }));
+
+  const wrote = await run(dir, "Write", { file_path: join(dir, "b.ts"), content: "x\n" });
+  expect(wrote.result).toEqual(expect.objectContaining({
+    type: "create",
+    filePath: expect.any(String),
+    content: "x\n",
+    structuredPatch: expect.any(Array),
+    originalFile: null,
+  }));
+
+  const edited = await run(dir, "Edit", { file_path: join(dir, "b.ts"), old_string: "x", new_string: "y" });
+  expect(edited.result).toEqual(expect.objectContaining({
+    filePath: expect.any(String),
+    oldString: "x",
+    newString: "y",
+    originalFile: "x\n",
+    structuredPatch: expect.any(Array),
+    userModified: false,
+    replaceAll: false,
+  }));
+
+  const glob = await run(dir, "Glob", { pattern: "*.ts" });
+  expect(glob.result).toEqual(expect.objectContaining({
+    durationMs: expect.any(Number),
+    numFiles: expect.any(Number),
+    filenames: expect.any(Array),
+    truncated: false,
+  }));
+
+  const grep = await run(dir, "Grep", { pattern: "hello" });
+  expect(grep.ok).toBe(true);
+  expect(typeof grep.result.numFiles).toBe("number");
+  expect(Array.isArray(grep.result.filenames)).toBe(true);
+
+  const bash = await run(dir, "Bash", { command: "printf hi" });
+  expect(bash.result).toEqual(expect.objectContaining({
+    stdout: expect.any(String),
+    stderr: expect.any(String),
+    interrupted: false,
+  }));
+
+  const nb = await run(dir, "NotebookEdit", {
+    notebook_path: join(dir, "n.ipynb"),
+    cell_id: "c1",
+    new_source: "print(2)",
+    edit_mode: "replace",
+  });
+  expect(nb.ok).toBe(true);
+  expect(nb.result).toEqual(expect.objectContaining({
+    new_source: "print(2)",
+    cell_type: "code",
+    language: expect.any(String),
+    edit_mode: "replace",
+    notebook_path: expect.any(String),
+    original_file: expect.any(String),
+    updated_file: expect.any(String),
+  }));
+
+  const mon = await run(dir, "Monitor", { command: "true", timeout_ms: 5_000 }, { callId: "sdk-mon" });
+  expect(mon.result).toEqual(expect.objectContaining({
+    taskId: expect.any(String),
+    timeoutMs: 5_000,
+  }));
+  cancelCall("sdk-mon");
+});
 
 test("Read honors offset/limit, rejects directories, and returns native text schema", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));

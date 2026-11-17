@@ -1,3 +1,4 @@
+import type { NotebookEditOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { asString, mapPath } from "./paths.js";
 import { randomUUID } from "node:crypto";
 
@@ -14,7 +15,7 @@ type Notebook = { cells: Cell[]; nbformat?: number; nbformat_minor?: number };
 const cellId = (cell: Cell, index: number) => cell.id ?? `cell-${index}`;
 const asLines = (source: string) => source.split(/(?<=\n)/);
 
-export async function notebookEditTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string) {
+export async function notebookEditTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string): Promise<NotebookEditOutput> {
   const path = mapPath(cwd, tuiRoot, asString(input.notebook_path), extraDirs, project);
   if (!path.endsWith(".ipynb")) throw new Error("File must be a Jupyter notebook (.ipynb file). For editing other file types, use the Edit tool.");
   const file = Bun.file(path);

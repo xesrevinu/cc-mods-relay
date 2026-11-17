@@ -1,3 +1,4 @@
+import type { GrepOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { finishJob, registerJob, wasCancelled } from "./jobs.js";
 import { asBool, asNumber, asString, mapPath } from "./paths.js";
 
@@ -50,7 +51,7 @@ export async function grepTool(
   callId = "",
   sessionId = "",
   project?: string,
-) {
+): Promise<GrepOutput> {
   const mode: Mode = asString(input.output_mode) === "content" || asString(input.output_mode) === "count"
     ? asString(input.output_mode) as Mode
     : "files_with_matches";

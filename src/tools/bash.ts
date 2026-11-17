@@ -1,3 +1,4 @@
+import type { BashOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,7 +66,7 @@ function append(stderr: string, line: string): string {
   return `${stderr}${stderr ? "\n" : ""}${line}`;
 }
 
-function abortedResult(stdout = "", stderr = ""): Record<string, unknown> {
+function abortedResult(stdout = "", stderr = ""): BashOutput {
   return abortedShellResult(clip(stdout.trimEnd()), clip(stderr.trimEnd()));
 }
 
@@ -80,7 +81,7 @@ function abortRunning(
   pwdFile: string,
   stdout: string,
   stderr: string,
-): Record<string, unknown> {
+): BashOutput {
   killTree(proc.pid);
   finishJob(callId);
   void Bun.file(pwdFile).delete().catch(() => {});
@@ -168,7 +169,7 @@ export async function bashTool(
   frame: ToolFrame,
   input: Record<string, unknown>,
   notify: Send,
-): Promise<Record<string, unknown>> {
+): Promise<BashOutput> {
   const extraDirs = mergeRoots(frame.extraDirs);
   const command = rewriteRemoteText(asString(input.command), workspace, frame.tuiRoot);
   const cwd = sessionCwd(frame, workspace);
@@ -247,7 +248,7 @@ function background(
   env: NodeJS.ProcessEnv,
   notify: Send,
   timeoutMs: number,
-): Record<string, unknown> {
+): BashOutput {
   const output = join(tmpdir(), `cc-mods-bg-${process.pid}-${Date.now()}.log`);
   mkdirSync(tmpdir(), { recursive: true });
   const proc = Bun.spawn(["bash", "-c", `exec >>"$OUT" 2>&1\n${command}`], {

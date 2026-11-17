@@ -17,6 +17,36 @@ function isLocalTool(tool) {
 function failResult(message) {
   return { deny: String(message) };
 }
+
+/** Mods `{ result }` must match Claude Agent SDK ToolOutputSchemas. A string skips the hook and runs the builtin on the TUI host. */
+function objectResult(tool, result, input) {
+  if (result && typeof result === "object" && !Array.isArray(result)) return result;
+  const text = typeof result === "string" ? result : result == null ? "" : JSON.stringify(result);
+  const filePath =
+    typeof input.file_path === "string" ? input.file_path
+    : typeof input.path === "string" ? input.path
+    : typeof input.notebook_path === "string" ? input.notebook_path
+    : "";
+  if (tool === "Read") {
+    const lines = text.split("\n");
+    return { type: "text", file: { filePath, content: text, numLines: lines.length, startLine: 1, totalLines: lines.length } };
+  }
+  if (tool === "Write") return { type: "create", filePath, content: text, structuredPatch: [], originalFile: null };
+  if (tool === "Edit") {
+    return { filePath, oldString: "", newString: text, originalFile: null, structuredPatch: [], userModified: false, replaceAll: false };
+  }
+  if (tool === "Bash" || tool === "PowerShell") return { stdout: text, stderr: "", interrupted: false };
+  if (tool === "Grep") return { numFiles: 0, filenames: [] };
+  if (tool === "Glob") return { durationMs: 0, numFiles: 0, filenames: [], truncated: false };
+  if (tool === "NotebookEdit") {
+    return { new_source: text, cell_type: "code", language: "python", edit_mode: "replace", notebook_path: filePath, original_file: "", updated_file: "" };
+  }
+  if (tool === "Monitor") return { taskId: "", timeoutMs: 0 };
+  if (tool === "EnterWorktree") return { worktreePath: "", message: text };
+  if (tool === "ExitWorktree") return { action: "keep", originalCwd: "", worktreePath: "", message: text };
+  if (tool === "SendFile" || tool === "SendUserFile") return { filePath, bytes: 0 };
+  return { stdout: text, stderr: "", interrupted: false };
+}
 let extraDirs = [];
 let permissionSeq = 0;
 
@@ -311,8 +341,9 @@ export function register(on) {
         finish(true);
         return failResult("empty tool result");
       }
-      finish(false, frame.result);
-      return { result: frame.result };
+      const result = objectResult(e.tool, frame.result, input);
+      finish(false, result);
+      return { result };
     }
 
     if (HYDRATE_TOOLS.has(e.tool) && typeof input.file_path === "string" && input.file_path) {

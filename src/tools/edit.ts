@@ -1,9 +1,10 @@
+import type { FileEditOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { asBool, asString, mapPath } from "./paths.js";
 import { structuredPatch } from "./patch.js";
 
-export async function editTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string) {
+export async function editTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string): Promise<FileEditOutput> {
   const path = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const oldString = asString(input.old_string);
   const newString = asString(input.new_string);
