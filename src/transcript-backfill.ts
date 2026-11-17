@@ -11,6 +11,9 @@ export type TranscriptBackfillOpts = {
   run?: BackfillRun;
   now?: () => string;
   configDir?: string;
+  /** Extra attempts after the first. Default 1. */
+  retries?: number;
+  retryDelayMs?: number;
 };
 
 async function spawnRsync(argv: string[]): Promise<{ code: number; stderr: string }> {
@@ -46,7 +49,13 @@ export async function backfillTranscripts(
   mkdirSync(dest, { recursive: true });
   const argv = rsyncBackfillArgv(opts.host, dest);
   const run = opts.run ?? spawnRsync;
-  const ran = await run(argv);
+  const retries = Math.max(0, opts.retries ?? 1);
+  const retryDelayMs = Math.max(0, opts.retryDelayMs ?? 250);
+  let ran = await run(argv);
+  for (let attempt = 0; attempt < retries && ran.code !== 0; attempt++) {
+    if (retryDelayMs > 0) await Bun.sleep(retryDelayMs);
+    ran = await run(argv);
+  }
   if (ran.code !== 0) {
     throw new Error(`rsync transcript backfill failed (${ran.code}): ${ran.stderr.trim() || "no stderr"}`);
   }
@@ -54,6 +63,6 @@ export async function backfillTranscripts(
     now: opts.now,
     configDir: opts.configDir,
   });
-  debug("transcript rsync-backfill", { host: opts.host, files: stamped.files });
+  debug("transcript rsync-backfill", { files: stamped.files });
   return stamped;
 }

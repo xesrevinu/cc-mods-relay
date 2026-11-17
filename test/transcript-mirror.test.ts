@@ -89,6 +89,21 @@ test("applyTranscriptChunk writes jsonl, sidecar, and cursor", () => {
   }
 });
 
+test("applyTranscriptChunk skips a gap past EOF", () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-mods-mirror-gap-"));
+  const cfg = mkdtempSync(join(tmpdir(), "cc-mods-cfg-"));
+  const rel = "-Users-alice-app/cccccccccccccccccccccccccccccccc.jsonl";
+  try {
+    applyTranscriptChunk(root, rel, 0, Buffer.from("abc"), { configDir: cfg });
+    expect(applyTranscriptChunk(root, rel, 10, Buffer.from("x"), { configDir: cfg })).toBeUndefined();
+    expect(readFileSync(join(root, rel), "utf8")).toBe("abc");
+    expect(loadTranscriptCursors(cfg)["cccccccccccccccccccccccccccccccc"]?.offset).toBe(3);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(cfg, { recursive: true, force: true });
+  }
+});
+
 test("applyTranscriptChunk offset 0 replaces the file", () => {
   const root = mkdtempSync(join(tmpdir(), "cc-mods-mirror-z-"));
   const cfg = mkdtempSync(join(tmpdir(), "cc-mods-cfg-"));
@@ -183,6 +198,61 @@ test("turn.complete flushes immediately and again after idle", async () => {
   }
 });
 
+test("turn.start flushes late bytes instead of cancelling the idle tail", () => {
+  const claude = mkdtempSync(join(tmpdir(), "cc-mods-claude-start-"));
+  const folder = encodeProjectDir("/Users/alice/app");
+  const rel = `${folder}/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl`;
+  mkdirSync(join(claude, "projects", folder), { recursive: true });
+  const path = join(claude, "projects", rel);
+  writeFileSync(path, "a\n");
+  const frames: TranscriptAppendFrame[] = [];
+  const sync = startTranscriptSync({
+    claudeConfigDir: claude,
+    send: (msg) => frames.push(msg),
+    watch: false,
+    idleMs: 0,
+  });
+  try {
+    const afterStart = frames.length;
+    writeFileSync(path, "a\nb\n");
+    sync.onTurnStart();
+    expect(frames.length).toBeGreaterThan(afterStart);
+  } finally {
+    sync.stop();
+    rmSync(claude, { recursive: true, force: true });
+  }
+});
+
+test("flush with client cursors resends dropped bytes", () => {
+  const claude = mkdtempSync(join(tmpdir(), "cc-mods-claude-rewind-"));
+  const folder = encodeProjectDir("/Users/alice/app");
+  const sessionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const rel = `${folder}/${sessionId}.jsonl`;
+  mkdirSync(join(claude, "projects", folder), { recursive: true });
+  const path = join(claude, "projects", rel);
+  writeFileSync(path, "one\ntwo\n");
+  const frames: TranscriptAppendFrame[] = [];
+  const sync = startTranscriptSync({
+    claudeConfigDir: claude,
+    send: (msg) => frames.push(msg),
+    watch: false,
+    idleMs: 0,
+  });
+  try {
+    expect(frames.length).toBeGreaterThan(0);
+    const before = frames.length;
+    sync.flush();
+    expect(frames.length).toBe(before);
+    sync.flush({ [sessionId]: { rel, offset: 4 } });
+    expect(frames.length).toBeGreaterThan(before);
+    expect(frames.at(-1)?.offset).toBe(4);
+    expect(Buffer.from(frames.at(-1)!.data, "base64").toString()).toBe("two\n");
+  } finally {
+    sync.stop();
+    rmSync(claude, { recursive: true, force: true });
+  }
+});
+
 test("rsync backfill stamps sidecars and cursors", async () => {
   const dest = mkdtempSync(join(tmpdir(), "cc-mods-rsync-dest-"));
   const cfg = mkdtempSync(join(tmpdir(), "cc-mods-rsync-cfg-"));
@@ -209,6 +279,55 @@ test("rsync backfill stamps sidecars and cursors", async () => {
     expect(result.cursors["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]?.offset).toBe(
       '{"cwd":"/Users/alice/app"}\n'.length,
     );
+  } finally {
+    rmSync(dest, { recursive: true, force: true });
+    rmSync(cfg, { recursive: true, force: true });
+  }
+});
+
+test("rsync backfill retries once then throws", async () => {
+  const dest = mkdtempSync(join(tmpdir(), "cc-mods-rsync-fail-"));
+  let n = 0;
+  try {
+    await expect(
+      backfillTranscripts({
+        host: "tui-host",
+        dest,
+        retryDelayMs: 0,
+        run: async () => {
+          n += 1;
+          return { code: 1, stderr: "denied" };
+        },
+      }),
+    ).rejects.toThrow(/rsync transcript backfill failed \(1\): denied/);
+    expect(n).toBe(2);
+  } finally {
+    rmSync(dest, { recursive: true, force: true });
+  }
+});
+
+test("rsync backfill succeeds on the retry", async () => {
+  const dest = mkdtempSync(join(tmpdir(), "cc-mods-rsync-retry-"));
+  const cfg = mkdtempSync(join(tmpdir(), "cc-mods-rsync-cfg-"));
+  const folder = "-Users-alice-app";
+  mkdirSync(join(dest, folder), { recursive: true });
+  const rel = `${folder}/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl`;
+  writeFileSync(join(dest, rel), '{"cwd":"/Users/alice/app"}\n');
+  let n = 0;
+  try {
+    const result = await backfillTranscripts({
+      host: "tui-host",
+      dest,
+      configDir: cfg,
+      retryDelayMs: 0,
+      run: async () => {
+        n += 1;
+        if (n === 1) return { code: 1, stderr: "busy" };
+        return { code: 0, stderr: "" };
+      },
+    });
+    expect(n).toBe(2);
+    expect(result.files).toBe(1);
   } finally {
     rmSync(dest, { recursive: true, force: true });
     rmSync(cfg, { recursive: true, force: true });
@@ -248,6 +367,16 @@ test("instance.start mirrors host jsonl onto the client over the session socket"
     const more = await messages.next();
     expect(more.type).toBe("transcript.append");
     expect(Number(more.offset)).toBeGreaterThan(0);
+    ws.send(
+      JSON.stringify({
+        v: 1,
+        type: "transcript.flush",
+        transcriptCursors: { [sessionId]: { rel: `${folder}/${sessionId}.jsonl`, offset: 0 } },
+      }),
+    );
+    const resent = await messages.next();
+    expect(resent.type).toBe("transcript.append");
+    expect(Number(resent.offset)).toBe(0);
     const applied = applyTranscriptChunk(
       clientProjects,
       String(append.rel),

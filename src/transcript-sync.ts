@@ -4,6 +4,7 @@ import {
   cursorOffsetFor,
   isSafeTranscriptRel,
   listProjectJsonl,
+  sessionIdFromRel,
   TRANSCRIPT_CHUNK_BYTES,
   TRANSCRIPT_SIDECAR_SUFFIX,
   type TranscriptCursors,
@@ -31,7 +32,8 @@ export type TranscriptSyncOpts = {
 };
 
 export type TranscriptSync = {
-  flush(): void;
+  /** Optional client offsets rewind `sent` so a dropped WS frame is resent. */
+  flush(cursors?: TranscriptCursors): void;
   onTurnStart(): void;
   onTurnComplete(): void;
   stop(): void;
@@ -99,16 +101,20 @@ export function startTranscriptSync(opts: TranscriptSyncOpts): TranscriptSync {
   let stopped = false;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
+  const fileSize = (rel: string): number | undefined => {
+    try {
+      return statSync(join(projectsRoot, rel.split("/").join(sep))).size;
+    } catch {
+      return undefined;
+    }
+  };
+
   const flushRel = (rel: string) => {
     if (stopped || !isSafeTranscriptRel(rel)) return;
     const path = join(projectsRoot, rel.split("/").join(sep));
     if (!existsSync(path)) return;
-    let size = 0;
-    try {
-      size = statSync(path).size;
-    } catch {
-      return;
-    }
+    const size = fileSize(rel);
+    if (size === undefined) return;
     const have = sent.get(rel) ?? cursorOffsetFor(cursors, rel, size);
     if (have >= size) {
       sent.set(rel, have);
@@ -117,20 +123,29 @@ export function startTranscriptSync(opts: TranscriptSyncOpts): TranscriptSync {
     sent.set(rel, sendFile(projectsRoot, rel, have, opts.send, chunkBytes));
   };
 
-  const flush = () => {
-    if (stopped) return;
-    for (const rel of listProjectJsonl(projectsRoot)) flushRel(rel);
-  };
-
-  const onTurnStart = () => {
-    if (idleTimer) {
-      clearTimeout(idleTimer);
-      idleTimer = undefined;
+  const adoptCursors = (client: TranscriptCursors) => {
+    const rels = new Set(listProjectJsonl(projectsRoot));
+    for (const rel of sent.keys()) rels.add(rel);
+    for (const rel of rels) {
+      if (!isSafeTranscriptRel(rel)) continue;
+      const size = fileSize(rel);
+      if (size === undefined) {
+        sent.delete(rel);
+        continue;
+      }
+      const have = cursorOffsetFor(client, rel, size);
+      sent.set(rel, have);
+      cursors[sessionIdFromRel(rel)] = { rel, offset: have };
     }
   };
 
-  const onTurnComplete = () => {
-    flush();
+  const flush = (clientCursors?: TranscriptCursors) => {
+    if (stopped) return;
+    if (clientCursors) adoptCursors(clientCursors);
+    for (const rel of listProjectJsonl(projectsRoot)) flushRel(rel);
+  };
+
+  const armIdle = () => {
     if (stopped || idleMs <= 0) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -138,6 +153,16 @@ export function startTranscriptSync(opts: TranscriptSyncOpts): TranscriptSync {
       flush();
     }, idleMs);
     if (typeof idleTimer === "object" && "unref" in idleTimer) idleTimer.unref();
+  };
+
+  const onTurnStart = () => {
+    flush();
+    armIdle();
+  };
+
+  const onTurnComplete = () => {
+    flush();
+    armIdle();
   };
 
   flush();

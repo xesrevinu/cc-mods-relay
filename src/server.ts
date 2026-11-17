@@ -347,7 +347,8 @@ export function startServer(opts: ServeOpts) {
       return;
     }
     if (frame.type === "transcript.flush") {
-      inst.transcript?.flush();
+      const raw = frame.transcriptCursors;
+      inst.transcript?.flush(raw === undefined ? undefined : parseTranscriptCursors(raw));
       return;
     }
   };

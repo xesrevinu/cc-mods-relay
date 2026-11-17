@@ -5,7 +5,6 @@ import { applyTranscriptFrame, loadTranscriptCursors } from "./transcript-mirror
 import { backfillTranscripts } from "./transcript-backfill.js";
 import { classify, parseWsJson, readNdjsonStream } from "./mux.js";
 import { configuredHost, configuredToken, configuredUrl, httpUrlFromWs } from "./config.js";
-import { debug } from "./debug.js";
 import { startServer } from "./server.js";
 import { createToolExecutor } from "./tool-executor.js";
 import { randomUUID } from "node:crypto";
@@ -90,31 +89,30 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
     try {
       await backfillTranscripts({ host });
     } catch (error) {
-      debug("transcript rsync-backfill skipped", { error: error instanceof Error ? error.message : String(error) });
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`cc-mods-relay: transcript rsync-backfill failed: ${message}`);
     }
   }
 
   await waitOpen(ws);
 
   let idleFlush: ReturnType<typeof setTimeout> | undefined;
+  const flushNow = () => {
+    send(ws, { v: 1, type: "transcript.flush", transcriptCursors: loadTranscriptCursors() });
+  };
   const requestFlush = (delayMs = 0) => {
     if (delayMs <= 0) {
-      send(ws, { v: 1, type: "transcript.flush" });
+      flushNow();
       return;
     }
     if (idleFlush) clearTimeout(idleFlush);
     idleFlush = setTimeout(() => {
       idleFlush = undefined;
-      send(ws, { v: 1, type: "transcript.flush" });
+      flushNow();
     }, delayMs);
   };
-  executor.onTurn((frame) => {
-    if (frame.type === "turn.start") {
-      if (idleFlush) clearTimeout(idleFlush);
-      idleFlush = undefined;
-      return;
-    }
-    if (frame.type === "turn.complete") requestFlush(0);
+  executor.onTurn(() => {
+    requestFlush(0);
     requestFlush(1_000);
   });
 
@@ -132,7 +130,8 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
     }
     const frame = msg as { type?: string; rel?: unknown; offset?: unknown; data?: unknown };
     if (frame.type === "transcript.append") {
-      applyTranscriptFrame(frame);
+      const applied = applyTranscriptFrame(frame);
+      if (!applied && typeof frame.offset === "number" && frame.offset > 0) requestFlush(0);
       return;
     }
     if (frame.type === "call" || frame.type === "cancel" || frame.type === "turn.start" || frame.type === "turn.complete") {
