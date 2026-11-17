@@ -336,8 +336,9 @@ export function startServer(opts: ServeOpts) {
     if (frame.type === "result") {
       const callId = typeof frame.callId === "string" ? frame.callId : undefined;
       const plugin = callId ? inst.pendingCalls.get(callId) : undefined;
-      if (plugin) {
-        inst.pendingCalls.delete(callId!);
+      if (plugin && callId) {
+        inst.pendingCalls.delete(callId);
+        plugin.data.calls.delete(callId);
         sendJson(plugin, msg);
       }
       return;
@@ -459,6 +460,8 @@ export function startServer(opts: ServeOpts) {
           const inst = instances.get(ws.data.instanceId);
           if (!inst) return;
           inst.pluginSockets.delete(ws);
+          // Only in-flight calls: a result already detached the id so background
+          // Bash/Monitor keep running after the helper closes this socket.
           for (const callId of ws.data.calls) {
             inst.pendingCalls.delete(callId);
             sendClient(inst, { v: 1, type: "cancel", callId, sessionId: inst.id });

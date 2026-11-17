@@ -324,3 +324,72 @@ test("plugin loopback call is forwarded to the client WS and the result comes ba
     await server.stop();
   }
 });
+
+test("plugin helper close after a result does not cancel the call on the client", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-inst-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const { ws, started } = await startClient(server, dir);
+    const inst = server.instances.get(started.instanceId)!;
+    const plugin = await openWs(server.toolsUrl);
+    const phello = nextJson(plugin);
+    plugin.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await phello).ok).toBe(true);
+
+    const clientCall = nextJson(ws);
+    plugin.send(JSON.stringify({
+      v: 1, type: "call", id: "bg", callId: "bg-1", tool: "Bash",
+      input: { command: "sleep 30", run_in_background: true },
+    }));
+    expect((await clientCall).callId).toBe("bg-1");
+
+    const result = nextJson(plugin);
+    ws.send(JSON.stringify({
+      v: 1, type: "result", id: "bg", callId: "bg-1", ok: true,
+      result: { stdout: "running", stderr: "", interrupted: false, backgroundTaskId: "9" },
+    }));
+    expect((await result).ok).toBe(true);
+
+    const cancelled = new Promise<any>((resolve) => {
+      ws.addEventListener("message", (event) => {
+        const frame = JSON.parse(String(event.data));
+        if (frame.type === "cancel") resolve(frame);
+      });
+    });
+    plugin.close();
+    const raced = await Promise.race([cancelled, Bun.sleep(200).then(() => null)]);
+    expect(raced).toBeNull();
+    ws.close();
+  } finally {
+    await server.stop();
+  }
+});
+
+test("dropping the plugin socket before a result still cancels the in-flight call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-inst-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const { ws, started } = await startClient(server, dir);
+    const inst = server.instances.get(started.instanceId)!;
+    const plugin = await openWs(server.toolsUrl);
+    const phello = nextJson(plugin);
+    plugin.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await phello).ok).toBe(true);
+
+    const clientCall = nextJson(ws);
+    plugin.send(JSON.stringify({
+      v: 1, type: "call", id: "fg", callId: "fg-1", tool: "Bash",
+      input: { command: "sleep 30" },
+    }));
+    expect((await clientCall).callId).toBe("fg-1");
+
+    const cancelled = nextJson(ws);
+    plugin.close();
+    const frame = await cancelled;
+    expect(frame.type).toBe("cancel");
+    expect(frame.callId).toBe("fg-1");
+    ws.close();
+  } finally {
+    await server.stop();
+  }
+});
