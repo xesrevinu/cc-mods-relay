@@ -295,6 +295,109 @@ test("Read is not blocked by a concurrent long Bash", async () => {
   }
 });
 
+async function openToolSocket(url: string, token: string, cwd: string): Promise<WebSocket> {
+  const ws = new WebSocket(url);
+  await new Promise<void>((resolve, reject) => {
+    ws.onopen = () => resolve();
+    ws.onerror = () => reject(new Error("socket failed"));
+  });
+  const hello = new Promise<any>((resolve) => {
+    ws.onmessage = (event) => resolve(JSON.parse(String(event.data)));
+  });
+  ws.send(JSON.stringify({ v: 1, type: "hello", token, cwd, tuiRoot: cwd }));
+  expect((await hello).ok).toBe(true);
+  return ws;
+}
+
+test("background Bash survives the plugin helper closing its socket", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-"));
+  const relay = startRelay();
+  relay.bind("s1", dir);
+  try {
+    const listen = await openToolSocket(relay.url, relay.token, dir);
+    const notes: any[] = [];
+    const exited = new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("background notify timed out")), 8_000);
+      listen.onmessage = (event) => {
+        const frame = JSON.parse(String(event.data));
+        notes.push(frame);
+        if (frame.type === "notify" && frame.kind === "background" && frame.status === "exited") {
+          clearTimeout(timer);
+          resolve(frame);
+        }
+      };
+    });
+
+    const helper = join(import.meta.dir, "../plugin/hooks/ws-client.js");
+    const callId = `bg-survive-${process.pid}-${Date.now()}`;
+    const proc = Bun.spawn(["bun", helper], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await proc.stdin.write(JSON.stringify({
+      url: relay.url,
+      token: relay.token,
+      cwd: dir,
+      tuiRoot: dir,
+      type: "call",
+      id: "bg",
+      callId,
+      tool: "Bash",
+      input: { command: "sleep 0.35; echo survived", run_in_background: true },
+    }));
+    proc.stdin.end();
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    expect(await proc.exited, `stdout=${stdout}\nstderr=${stderr}`).toBe(0);
+    const result = JSON.parse(stdout.trim().split("\n").at(-1)!);
+    expect(result.ok).toBe(true);
+    expect(result.result.backgroundTaskId).toBeDefined();
+
+    const note = await exited;
+    expect(note.callId).toBe(callId);
+    expect(note.interrupted).toBe(false);
+    expect(note.exitCode).toBe(0);
+    expect(note.output).toContain("survived");
+    listen.close();
+  } finally {
+    relay.stop();
+  }
+});
+
+test("dropping the call socket still kills in-flight foreground Bash", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-"));
+  const pidFile = join(dir, "pid");
+  const relay = startRelay();
+  relay.bind("s1", dir);
+  try {
+    const ws = await openToolSocket(relay.url, relay.token, dir);
+    ws.send(JSON.stringify({
+      v: 1, type: "call", id: "bash", callId: `fg-drop-${process.pid}-${Date.now()}`, tool: "Bash",
+      input: { command: `echo $$ > "${pidFile}"; sleep 30` },
+    }));
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && !existsSync(pidFile)) await Bun.sleep(20);
+    const pid = Number((await Bun.file(pidFile).text()).trim());
+    expect(pid).toBeGreaterThan(1);
+    ws.close();
+    const gone = Date.now() + 2_000;
+    let alive = true;
+    while (Date.now() < gone) {
+      try {
+        process.kill(pid, 0);
+        await Bun.sleep(20);
+      } catch {
+        alive = false;
+        break;
+      }
+    }
+    expect(alive).toBe(false);
+  } finally {
+    relay.stop();
+  }
+});
+
 test("cancel stops an in-flight Bash over the tool socket", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-mods-"));
   const relay = startRelay();

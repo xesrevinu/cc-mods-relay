@@ -63,6 +63,11 @@ export function startRelay() {
           return;
         }
         const send = (out: Record<string, unknown>) => {
+          // The plugin helper closes this socket after the first result.
+          // Background Bash/Monitor keep running and notify on the listen socket.
+          if (out.type === "result" && typeof out.callId === "string") {
+            ws.data.calls.delete(out.callId);
+          }
           if (ws.data?.alive !== false) ws.send(JSON.stringify(out));
         };
         const callId = executor.handle(frame, send, broadcast);
