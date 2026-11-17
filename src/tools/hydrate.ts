@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
-import { asString, mapPath } from "./paths.js";
+import { asString, mapReadPath } from "./paths.js";
 
 export function miniRelative(cwd: string, abs: string, extraDirs: string[] = []): string {
   const fromCwd = relative(cwd, abs);
@@ -27,7 +27,7 @@ export async function hydrateTool(
   extraDirs: string[] = [],
   project?: string,
 ) {
-  const abs = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
+  const abs = mapReadPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const file = Bun.file(abs);
   if (!(await file.exists())) throw new Error(`File does not exist: ${abs}`);
   const buf = Buffer.from(await file.arrayBuffer());

@@ -1,6 +1,6 @@
 import type { FileReadOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { compressImage, IMAGE_MAX_SOURCE_BYTES, type ImageMime } from "./image-compress.js";
-import { asBool, asNumber, asString, mapPath } from "./paths.js";
+import { asBool, asNumber, asString, mapReadPath } from "./paths.js";
 import { ioMessage } from "./runtime.js";
 
 const IMAGES: Record<string, ImageMime> = {
@@ -35,7 +35,7 @@ function isProbablyBinary(buf: Uint8Array): boolean {
 }
 
 export async function readTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string): Promise<FileReadOutput> {
-  const path = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
+  const path = mapReadPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const file = Bun.file(path);
   let info: { isDirectory(): boolean; size: number };
   try {

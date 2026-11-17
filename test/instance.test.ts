@@ -393,3 +393,26 @@ test("dropping the plugin socket before a result still cancels the in-flight cal
     await server.stop();
   }
 });
+
+test("plugin cancel without sessionId is stamped with the instance id", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-inst-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const { ws, started } = await startClient(server, dir);
+    const inst = server.instances.get(started.instanceId)!;
+    const plugin = await openWs(server.toolsUrl);
+    const phello = nextJson(plugin);
+    plugin.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await phello).ok).toBe(true);
+
+    const cancelled = nextJson(ws);
+    plugin.send(JSON.stringify({ v: 1, type: "cancel" }));
+    const frame = await cancelled;
+    expect(frame.type).toBe("cancel");
+    expect(frame.sessionId).toBe(inst.id);
+    ws.close();
+    plugin.close();
+  } finally {
+    await server.stop();
+  }
+});

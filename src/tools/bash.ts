@@ -1,11 +1,11 @@
 import type { BashOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnEnv, withDirenv } from "./direnv.js";
 import { cancelCall, finishJob, registerJob, wasCancelled } from "./jobs.js";
 import { classifyBashIntent } from "./bash-intent.js";
-import { asBool, asNumber, asString, mapCwd, mergeRoots, rewriteRemoteText } from "./paths.js";
+import { asBool, asNumber, asString, encodeClaudeDir, insideWriteRoot, mapCwd, mergeRoots, rewriteRemoteText } from "./paths.js";
 import { abortedShellResult, clampTimeout, killTree, type Send, type ToolFrame } from "./runtime.js";
 
 const MAX_OUTPUT = 30_000;
@@ -19,6 +19,52 @@ const CWD_BUILTIN = /\b(?:cd|pushd|popd|chdir)\b/;
 const CWD_HINT_TAIL = "directory changes made by the backgrounded command do not apply to subsequent commands.";
 
 export { cancelCall };
+
+export { encodeClaudeDir as encodeClaudeTaskDir };
+
+export function claudeTaskOutputPath(cwd: string, sessionId: string, pid: number, uid: number): string {
+  return join("/tmp", `claude-${uid}`, encodeClaudeDir(cwd), sessionId, "tasks", `${pid}.output`);
+}
+
+function tuiUserId(frame: ToolFrame): number | undefined {
+  const raw = frame.tuiUid;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw >= 0) return raw;
+  if (typeof raw === "string" && /^\d+$/.test(raw)) return Number(raw);
+  return undefined;
+}
+
+function taskDirCwd(frame: ToolFrame, workspace: string): string {
+  return frame.tuiRoot || frame.cwd || workspace;
+}
+
+function taskOutputPath(frame: ToolFrame, workspace: string, pid: number): string | undefined {
+  const sessionId = frame.claudeSessionId;
+  const uid = tuiUserId(frame);
+  if (!sessionId || uid === undefined || process.platform === "win32") return undefined;
+  return claudeTaskOutputPath(taskDirCwd(frame, workspace), sessionId, pid, uid);
+}
+
+function startTaskTee(
+  path: string | undefined,
+  buffers: { stdout: { text: string }; stderr: { text: string } },
+): () => void {
+  if (!path) return () => {};
+  mkdirSync(dirname(path), { recursive: true });
+  const write = () => {
+    const text = `${buffers.stdout.text}${buffers.stderr.text ? `\n${buffers.stderr.text}` : ""}`;
+    try {
+      writeFileSync(path, text);
+    } catch {
+      /* task dir may be unwritable; Monitor/until then keep waiting */
+    }
+  };
+  write();
+  const timer = setInterval(write, 250);
+  return () => {
+    clearInterval(timer);
+    write();
+  };
+}
 
 export function sessionCwd(frame: ToolFrame, workspace: string): string {
   const id = frame.sessionId;
@@ -37,11 +83,19 @@ function real(path: string): string {
   }
 }
 
-export function persistCwd(workspace: string, sessionId: string, next: string, extraDirs: string[] = []): void {
+export function persistCwd(
+  workspace: string,
+  sessionId: string,
+  next: string,
+  extraDirs: string[] = [],
+  trusted = false,
+): void {
   if (!sessionId) return;
   try {
     const root = real(workspace);
-    cwdBySession.set(sessionId, mapCwd(root, undefined, real(next), extraDirs, root));
+    const mapped = mapCwd(root, undefined, real(next), extraDirs, root);
+    if (!trusted && !insideWriteRoot(mapped, root, extraDirs)) return;
+    cwdBySession.set(sessionId, mapped);
   } catch {
   }
 }
@@ -124,6 +178,7 @@ function notifyExit(
   exitCode: number | null,
   aborted: boolean,
   output: string,
+  outputFile?: string,
 ): void {
   notify({
     v: 1,
@@ -132,10 +187,12 @@ function notifyExit(
     status: "exited",
     callId: frame.callId ?? "",
     sessionId: frame.sessionId,
+    agentId: frame.agentId,
     pid,
     exitCode: aborted ? 137 : exitCode,
     interrupted: aborted,
     output: output.slice(-8000),
+    outputFile,
   });
 }
 
@@ -146,12 +203,16 @@ function watchBackground(
   buffers: { stdout: { text: string }; stderr: { text: string } },
   notify: Send,
   remainingMs: number,
+  workspace: string,
 ): void {
   const callId = frame.callId ?? "";
+  const outputFile = taskOutputPath(frame, workspace, proc.pid);
+  const stopTee = startTaskTee(outputFile, buffers);
   const timer = setTimeout(() => killTree(proc.pid), remainingMs);
   proc.unref();
   void finished.then(async () => {
     clearTimeout(timer);
+    stopTee();
     const aborted = finishJob(callId);
     const code = typeof proc.exitCode === "number" ? proc.exitCode : await proc.exited;
     notifyExit(
@@ -161,6 +222,7 @@ function watchBackground(
       aborted ? 137 : code,
       aborted,
       `${buffers.stdout.text}${buffers.stderr.text ? `\n${buffers.stderr.text}` : ""}`,
+      outputFile,
     );
   });
 }
@@ -199,7 +261,7 @@ export async function bashTool(
     detached: process.platform !== "win32",
     env: spawnEnv({ ...env, __CC_PWD: pwdFile }),
   });
-  registerJob(callId, sessionId, () => killTree(proc.pid));
+  registerJob(callId, sessionId, () => killTree(proc.pid), frame.agentId);
   if (wasCancelled(callId)) {
     killTree(proc.pid);
     finishJob(callId);
@@ -216,7 +278,7 @@ export async function bashTool(
     if (wasCancelled(callId)) return abortRunning(proc, callId, pwdFile, stdout.text, stderrBuf.text);
     await waitWithTimeout(DRAIN_AFTER_TIMEOUT_MS, finished);
     if (wasCancelled(callId)) return abortRunning(proc, callId, pwdFile, stdout.text, stderrBuf.text);
-    watchBackground(proc, finished, frame, { stdout, stderr: stderrBuf }, notify, BG_TIMEOUT_DEFAULT);
+    watchBackground(proc, finished, frame, { stdout, stderr: stderrBuf }, notify, BG_TIMEOUT_DEFAULT, workspace);
     await Bun.file(pwdFile).delete().catch(() => {});
     return {
       stdout: clip(stdout.text.trimEnd()),
@@ -253,11 +315,20 @@ function background(
   notify: Send,
   timeoutMs: number,
 ): BashOutput {
-  const output = join(tmpdir(), `cc-mods-bg-${process.pid}-${Date.now()}.log`);
-  mkdirSync(tmpdir(), { recursive: true });
-  const proc = Bun.spawn(["bash", "-c", `exec >>"$OUT" 2>&1\n${command}`], {
+  const uid = tuiUserId(frame);
+  const claudeSessionId = frame.claudeSessionId;
+  const taskDir =
+    claudeSessionId && uid !== undefined && process.platform !== "win32"
+      ? join("/tmp", `claude-${uid}`, encodeClaudeDir(taskDirCwd(frame, cwd)), claudeSessionId, "tasks")
+      : undefined;
+  const staging = join(tmpdir(), `cc-mods-bg-${process.pid}-${Date.now()}.log`);
+  mkdirSync(taskDir ?? tmpdir(), { recursive: true });
+  const script = taskDir
+    ? `mkdir -p "$TASK_DIR"\nexec >>"$TASK_DIR/$$.output" 2>&1\n${command}`
+    : `exec >>"$OUT" 2>&1\n${command}`;
+  const proc = Bun.spawn(["bash", "-c", script], {
     cwd,
-    env: spawnEnv({ ...env, OUT: output }),
+    env: spawnEnv({ ...env, ...(taskDir ? { TASK_DIR: taskDir } : { OUT: staging }) }),
     stdin: "ignore",
     stdout: "ignore",
     stderr: "ignore",
@@ -266,14 +337,15 @@ function background(
   const callId = frame.callId ?? "";
   const sessionId = frame.sessionId || "";
   const id = String(proc.pid);
-  registerJob(callId, sessionId, () => killTree(proc.pid));
+  const output = taskDir ? join(taskDir, `${id}.output`) : staging;
+  registerJob(callId, sessionId, () => killTree(proc.pid), frame.agentId);
   const timer = setTimeout(() => killTree(proc.pid), timeoutMs);
   proc.unref();
   void proc.exited.then(async (exitCode) => {
     clearTimeout(timer);
     const aborted = finishJob(callId);
     const tail = await Bun.file(output).text().catch(() => "");
-    notifyExit(notify, frame, proc.pid, aborted ? 137 : exitCode, aborted, tail);
+    notifyExit(notify, frame, proc.pid, aborted ? 137 : exitCode, aborted, tail, output);
   });
   if (wasCancelled(callId)) {
     killTree(proc.pid);

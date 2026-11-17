@@ -68,7 +68,61 @@ test("classifyBashIntent keeps redirects, heredocs, find -delete, and real cd as
   expect(classifyBashIntent("git cat-file -p HEAD", cwd).action).toBe("run");
   expect(classifyBashIntent("cd /Users/me/other && cat a.ts", cwd).action).toBe("run");
   expect(classifyBashIntent("echo hi > out.txt && cat a.ts", cwd).action).toBe("run");
-  expect(classifyBashIntent("rg foo 2>/dev/null", cwd).action).toBe("run");
+  expect(classifyBashIntent("rg foo 2>/dev/null", cwd)).toMatchObject({ action: "prefer", tool: "Grep" });
+  expect(classifyBashIntent("python3 -c 'print(1)'", cwd).action).toBe("run");
+  expect(classifyBashIntent("sed -n 1,10p $N/nsh-base/src/listbox.rs", cwd).action).toBe("run");
+  expect(classifyBashIntent("sed -i 's/a/b/' a.mbt; direnv exec . moon test", cwd).action).toBe("run");
+});
+
+test("classifyBashIntent prefers Grep for rg type/glob flags used on MoonBit trees", () => {
+  const cwd = "/Users/me/proj";
+  expect(classifyBashIntent("rg -n foo --type-add 'mbt:*.mbt' -t mbt .", cwd).action).toBe("run");
+  const globbed = classifyBashIntent("rg -n Insert --glob '*.mbt' -A30 host/", cwd);
+  expect(globbed.action).toBe("prefer");
+  if (globbed.action === "prefer") expect(globbed.message).toMatch(/glob: \*\.mbt/);
+});
+
+test("classifyBashIntent prefers Edit for in-place python/perl/sed", () => {
+  const cwd = "/Users/me/proj";
+  expect(classifyBashIntent("sed -i '' 's/a/b/' a.mbt", cwd)).toMatchObject({ action: "prefer", tool: "Edit" });
+  expect(classifyBashIntent("perl -0pi -e 's/ts\\/Users\\/kee/ts~/g' a.mbt", cwd)).toMatchObject({
+    action: "prefer",
+    tool: "Edit",
+  });
+  expect(classifyBashIntent("python3 -c \"open('a.mbt','w').write('x')\"", cwd)).toMatchObject({
+    action: "prefer",
+    tool: "Edit",
+  });
+  const py = classifyBashIntent("python3 - <<'EOF'\nopen('a.mbt','w').write(s)\nEOF", cwd);
+  expect(py.action).toBe("run");
+  expect(classifyBashIntent("perl -version", cwd).action).toBe("run");
+  expect(classifyBashIntent("perl -pi.bak -e 's/a/b/' a.mbt", cwd)).toMatchObject({ action: "prefer", tool: "Edit" });
+});
+
+test("Bash rg with glob and python in-place writes are denied toward native tools", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-bash-intent-"));
+  const rg = await new Promise<any>((resolve) => {
+    void execute(
+      { tool: "Bash", input: { command: "rg -n foo --glob '*.mbt' ." }, cwd: dir, tuiRoot: dir, callId: "rg1" },
+      (next) => resolve(next),
+    );
+  });
+  expect(rg.ok).toBe(false);
+  expect(rg.error.message).toMatch(/Grep tool/);
+  const py = await new Promise<any>((resolve) => {
+    void execute(
+      {
+        tool: "Bash",
+        input: { command: "python3 -c \"open('a.mbt','w').write('x')\"" },
+        cwd: dir,
+        tuiRoot: dir,
+        callId: "py1",
+      },
+      (next) => resolve(next),
+    );
+  });
+  expect(py.ok).toBe(false);
+  expect(py.error.message).toMatch(/Edit or Write/);
 });
 
 test("Bash cat of one file is denied toward Read", async () => {

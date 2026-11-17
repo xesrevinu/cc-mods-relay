@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { cancelCall, execute } from "../src/exec.js";
+import { cancelAgent, cancelCall, execute } from "../src/exec.js";
 import { applyModEvent } from "../src/mod-live.js";
-import { mapPath, rewriteRemoteText } from "../src/tools/paths.js";
+import { encodeClaudeTaskDir, persistCwd, sessionCwd } from "../src/tools/bash.js";
+import { mapPath, mapReadPath, mapWritePath, rewriteRemoteText } from "../src/tools/paths.js";
 import { nativeToolResult } from "../src/tools/runtime.js";
 
 function run(
@@ -225,10 +226,29 @@ test("relative TUI paths map onto the client workspace", () => {
   expect(mapPath(cwd, tui, "/Users/bob/.cursor/artifacts/x.sh")).toBe(join(home, ".cursor/artifacts/x.sh"));
   expect(mapPath(cwd, tui, join(home, ".cursor/artifacts/x.sh"))).toBe(join(home, ".cursor/artifacts/x.sh"));
   expect(() => mapPath(cwd, tui, "/Users/bob/Workspace/other/x.ts")).toThrow(/outside/);
+  expect(() => mapPath(cwd, tui, "/etc/passwd")).toThrow(/outside/);
+  expect(mapReadPath(cwd, tui, join(home, ".local/share/references-repos/nsh/x.rs"))).toBe(
+    join(home, ".local/share/references-repos/nsh/x.rs"),
+  );
+  expect(mapReadPath(cwd, tui, "/Users/bob/.local/share/references-repos/nsh/x.rs")).toBe(
+    join(home, ".local/share/references-repos/nsh/x.rs"),
+  );
+  expect(() => mapReadPath(cwd, tui, "../.ssh/id_rsa")).toThrow(/outside/);
+  expect(() => mapReadPath(cwd, tui, "/etc/passwd")).toThrow(/outside/);
+  expect(mapWritePath(cwd, tui, join(home, ".claude/projects/-Users-me-app/memory/note.md"))).toBe(
+    join(home, ".claude/projects/-Users-me-app/memory/note.md"),
+  );
+  expect(() => mapWritePath(cwd, tui, join(home, ".claude/projects/-Users-me-app/sess.jsonl"))).toThrow(/outside/);
+  expect(() => mapWritePath(cwd, tui, join(home, ".local/share/references-repos/nsh/x.rs"))).toThrow(/outside/);
   expect(rewriteRemoteText("cd /Users/bob/Workspace/abc && ls", cwd, tui)).toBe("cd /Users/me/proj && ls");
   expect(rewriteRemoteText("cd /Users/bob/Workspace/abc-extra", cwd, tui)).toBe(`cd ${home}/Workspace/abc-extra`);
   expect(rewriteRemoteText("cd ~/Workspace/abc && pwd", cwd, tui)).toBe("cd /Users/me/proj && pwd");
   expect(rewriteRemoteText("cat ~/.cursor/artifacts/x.sh", cwd, tui)).toBe(`cat ${home}/.cursor/artifacts/x.sh`);
+  expect(rewriteRemoteText("cd ~ && ls", cwd, tui)).toBe(`cd ${home} && ls`);
+  expect(rewriteRemoteText("export PATH=~/bin:$HOME/bin", cwd, tui)).toBe(`export PATH=${home}/bin:${home}/bin`);
+  expect(rewriteRemoteText("token~ : Int32 = 0", cwd, tui)).toBe("token~ : Int32 = 0");
+  expect(rewriteRemoteText("[[ $x =~ foo ]]", cwd, tui)).toBe("[[ $x =~ foo ]]");
+  expect(rewriteRemoteText("rm file.txt~", cwd, tui)).toBe("rm file.txt~");
 });
 
 test("Bash returns stdout/stderr/interrupted; non-zero is still a result", async () => {
@@ -313,6 +333,63 @@ test("Bash cancel during run returns interrupted without waiting out the command
   expect(Date.now() - started).toBeLessThan(5_000);
 });
 
+test("aborting a subagent cancels only that agent's Bash", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const started = Date.now();
+  const pending = new Promise<any>((resolve) => {
+    void execute(
+      {
+        tool: "Bash",
+        input: { command: "sleep 8" },
+        cwd: dir,
+        tuiRoot: dir,
+        callId: "agent-sleep",
+        sessionId: "sess",
+        agentId: "agent-kill-me",
+      },
+      (frame) => resolve(frame),
+    );
+  });
+  await Bun.sleep(80);
+  cancelAgent("agent-kill-me");
+  const frame = await pending;
+  expect(frame.ok).toBe(true);
+  expect(frame.result.interrupted).toBe(true);
+  expect(Date.now() - started).toBeLessThan(5_000);
+});
+
+test("Read of an explicit $HOME path outside the project is allowed; Write is not", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const outside = join(homedir(), `.cc-mods-relay-read-${process.pid}.txt`);
+  writeFileSync(outside, "reference\n");
+  try {
+    const got = await run(dir, "Read", { file_path: outside });
+    expect(got.ok).toBe(true);
+    expect(got.result.file.content).toContain("reference");
+    const wrote = await run(dir, "Write", { file_path: outside, content: "nope\n" });
+    expect(wrote.ok).toBe(false);
+    expect(wrote.error.message).toMatch(/outside/);
+  } finally {
+    rmSync(outside, { force: true });
+  }
+});
+
+test("Write to Claude Code project memory is allowed; other home files are not", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const dest = join(homedir(), ".claude", "projects", "cc-mods-relay-test", "memory", "note.md");
+  const jsonl = join(homedir(), ".claude", "projects", "cc-mods-relay-test", "sess.jsonl");
+  try {
+    const wrote = await run(dir, "Write", { file_path: dest, content: "remember\n" }, { callId: "mem" });
+    expect(wrote.ok).toBe(true);
+    expect(await Bun.file(dest).text()).toBe("remember\n");
+    const blocked = await run(dir, "Write", { file_path: jsonl, content: "{}\n" }, { callId: "jsonl" });
+    expect(blocked.ok).toBe(false);
+    expect(blocked.error.message).toMatch(/outside/);
+  } finally {
+    rmSync(join(homedir(), ".claude", "projects", "cc-mods-relay-test"), { recursive: true, force: true });
+  }
+});
+
 test("Write to ~/.cursor/artifacts is allowed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
   const dest = join(homedir(), ".cursor", "artifacts", "cc-mods-relay-test", "out.txt");
@@ -333,6 +410,26 @@ test("Bash rewrites Mini TUI paths onto the client workspace", async () => {
   expect(frame.result.stdout).toContain("mapped");
   const home = await run(dir, "Bash", { command: `printf '%s' "$HOME"` }, { tuiRoot: tui, callId: "rw-home", sessionId: "rw" });
   expect(home.result.stdout).toBe(homedir());
+});
+
+test("Bash cd outside write roots is not persisted for later Write", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const outside = mkdtempSync(join(homedir(), ".cc-mods-relay-jail-"));
+  try {
+    const cd = await run(dir, "Bash", { command: `cd "${outside}"` }, { callId: "jail-cd", sessionId: "jail-sess" });
+    expect(cd.ok).toBe(true);
+    const write = await run(dir, "Write", { file_path: "pwn.txt", content: "nope" }, { callId: "jail-w", sessionId: "jail-sess" });
+    expect(write.ok).toBe(true);
+    expect(existsSync(join(outside, "pwn.txt"))).toBe(false);
+    expect(readFileSync(join(dir, "pwn.txt"), "utf8")).toBe("nope");
+    persistCwd(dir, "jail-direct", outside);
+    expect(sessionCwd({ sessionId: "jail-direct", cwd: dir }, dir)).toBe(dir);
+    mkdirSync(join(dir, "sub"));
+    persistCwd(dir, "jail-sub", join(dir, "sub"));
+    expect(sessionCwd({ sessionId: "jail-sub", cwd: dir }, dir)).toBe(realpathSync(join(dir, "sub")));
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+  }
 });
 
 test("session cwd after cd applies to later Read", async () => {
@@ -439,6 +536,133 @@ test("Bash foreground timeout auto-backgrounds instead of killing", async () => 
     await Bun.sleep(20);
   }
   expect(frames.some((f) => f.kind === "background" && String(f.output || "").includes("done"))).toBe(true);
+});
+
+test("encodeClaudeTaskDir matches Claude Code's /tmp/claude-<uid>/ folder", () => {
+  expect(encodeClaudeTaskDir("/Users/kee/.cursor/worktrees/holt/herdr-moonbit-migration")).toBe(
+    "-Users-kee--cursor-worktrees-holt-herdr-moonbit-migration",
+  );
+  expect(encodeClaudeTaskDir("/Users/alice/my_proj")).toBe("-Users-alice-my-proj");
+});
+
+test("Bash background writes Claude Code tasks/<pid>.output and stamps agentId on notify", async () => {
+  if (process.platform === "win32") return;
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const sessionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const uid = process.getuid!();
+  const frames: any[] = [];
+  const frame = await new Promise<any>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Bash did not return")), 6_000);
+    void execute(
+      {
+        tool: "Bash",
+        input: { command: "printf 'bg-ready\\n'", run_in_background: true },
+        cwd: dir,
+        tuiRoot: dir,
+        callId: "bg-task-file",
+        sessionId: "inst-1",
+        claudeSessionId: sessionId,
+        tuiUid: String(uid),
+        agentId: "agent-sub-1",
+      },
+      (next) => {
+        frames.push(next);
+        if (next.type === "result") {
+          clearTimeout(timer);
+          resolve(next);
+        }
+      },
+      (next) => frames.push(next),
+    );
+  });
+  expect(frame.ok).toBe(true);
+  const pid = String(frame.result.backgroundTaskId);
+  const expected = join("/tmp", `claude-${uid}`, encodeClaudeTaskDir(dir), sessionId, "tasks", `${pid}.output`);
+  expect(String(frame.result.stdout)).toContain(expected);
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && !frames.some((f) => f.kind === "background" && String(f.output || "").includes("bg-ready"))) {
+    await Bun.sleep(20);
+  }
+  const note = frames.find((f) => f.kind === "background");
+  expect(note?.agentId).toBe("agent-sub-1");
+  expect(note?.output).toContain("bg-ready");
+  expect(note?.outputFile).toBe(expected);
+  expect(existsSync(expected)).toBe(true);
+  expect(readFileSync(expected, "utf8")).toContain("bg-ready");
+  rmSync(join("/tmp", `claude-${uid}`, encodeClaudeTaskDir(dir), sessionId), { recursive: true, force: true });
+});
+
+test("Bash background task files encode Mini tuiRoot, not the Mac cwd", async () => {
+  if (process.platform === "win32") return;
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const tui = "/Users/bob/Workspace/abc";
+  const sessionId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const uid = process.getuid!();
+  const frames: any[] = [];
+  const frame = await new Promise<any>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Bash did not return")), 6_000);
+    void execute(
+      {
+        tool: "Bash",
+        input: { command: "printf 'tui-root\\n'", run_in_background: true },
+        cwd: dir,
+        tuiRoot: tui,
+        callId: "bg-tui-root",
+        sessionId: "inst-2",
+        claudeSessionId: sessionId,
+        tuiUid: String(uid),
+      },
+      (next) => {
+        frames.push(next);
+        if (next.type === "result") {
+          clearTimeout(timer);
+          resolve(next);
+        }
+      },
+      (next) => frames.push(next),
+    );
+  });
+  expect(frame.ok).toBe(true);
+  const pid = String(frame.result.backgroundTaskId);
+  const expected = join("/tmp", `claude-${uid}`, encodeClaudeTaskDir(tui), sessionId, "tasks", `${pid}.output`);
+  expect(String(frame.result.stdout)).toContain(expected);
+  expect(String(frame.result.stdout)).not.toContain(encodeClaudeTaskDir(dir));
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && !existsSync(expected)) await Bun.sleep(20);
+  expect(existsSync(expected)).toBe(true);
+  rmSync(join("/tmp", `claude-${uid}`, encodeClaudeTaskDir(tui), sessionId), { recursive: true, force: true });
+});
+
+test("Bash background does not guess Mac uid when tuiUid is missing", async () => {
+  if (process.platform === "win32") return;
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const sessionId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const uid = process.getuid!();
+  const frame = await new Promise<any>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Bash did not return")), 6_000);
+    void execute(
+      {
+        tool: "Bash",
+        input: { command: "printf 'no-uid\\n'", run_in_background: true },
+        cwd: dir,
+        tuiRoot: dir,
+        callId: "bg-no-uid",
+        sessionId: "inst-3",
+        claudeSessionId: sessionId,
+        tuiUid: "",
+      },
+      (next) => {
+        if (next.type === "result") {
+          clearTimeout(timer);
+          resolve(next);
+        }
+      },
+    );
+  });
+  expect(frame.ok).toBe(true);
+  const stdout = String(frame.result.stdout);
+  expect(stdout).not.toContain(`/tmp/claude-${uid}/`);
+  expect(stdout).toContain("cc-mods-bg-");
 });
 
 test("EnterWorktree path switches session cwd; ExitWorktree keep restores", async () => {

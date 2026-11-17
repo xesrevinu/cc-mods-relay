@@ -1,6 +1,6 @@
 import type { GlobOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { join } from "node:path";
-import { asString, mapPath } from "./paths.js";
+import { asString, mapReadPath } from "./paths.js";
 
 const LIMIT = 100;
 const SKIP = /(^|[\\/])(\.git|node_modules)[\\/]/;
@@ -8,7 +8,7 @@ const SKIP = /(^|[\\/])(\.git|node_modules)[\\/]/;
 export async function globTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string): Promise<GlobOutput> {
   const started = performance.now();
   const pattern = asString(input.pattern);
-  const root = mapPath(cwd, tuiRoot, asString(input.path, ".") || ".", extraDirs, project);
+  const root = mapReadPath(cwd, tuiRoot, asString(input.path, ".") || ".", extraDirs, project);
   const skip = !/\.git|node_modules/.test(pattern);
   const files: string[] = [];
   for await (const file of new Bun.Glob(pattern).scan({ cwd: root, dot: true, onlyFiles: true })) {

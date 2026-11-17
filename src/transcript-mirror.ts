@@ -2,6 +2,7 @@ import { closeSync, fstatSync, ftruncateSync, mkdirSync, openSync, readdirSync, 
 import { dirname, join, posix, sep } from "node:path";
 import { configDir } from "./config.js";
 import { claudeConfigDir } from "./jsonl.js";
+import { encodeClaudeDir } from "./tools/paths.js";
 
 /** Byte slices over the WebSocket. Matches `readFileTail`'s default window. */
 export const TRANSCRIPT_CHUNK_BYTES = 512 * 1024;
@@ -20,8 +21,7 @@ export type TranscriptSidecar = {
 
 /** Claude Code's `~/.claude/projects/<encoded cwd>/` folder name. */
 export function encodeProjectDir(cwd: string): string {
-  const trimmed = cwd.replace(/\/+$/, "");
-  return trimmed.replaceAll("/", "-");
+  return encodeClaudeDir(cwd);
 }
 
 export function sessionIdFromRel(rel: string): string {

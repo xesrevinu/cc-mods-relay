@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { debug } from "./debug.js";
-import { cancelCall, cancelSession, execute, type ToolFrame } from "./exec.js";
+import { cancelAgent, cancelCall, cancelSession, execute, type ToolFrame } from "./exec.js";
 
 export type TurnFrame = {
   type?: string;
@@ -154,8 +154,9 @@ export function createToolExecutor() {
         return callId;
       }
       if (frame.type === "cancel") {
-        debug("ws cancel", { callId: frame.callId, sessionId: frame.sessionId || sessionId });
+        debug("ws cancel", { callId: frame.callId, sessionId: frame.sessionId || sessionId, agentId: frame.agentId });
         if (frame.callId) cancelCall(frame.callId);
+        else if (frame.agentId) cancelAgent(frame.agentId);
         else cancelSession(frame.sessionId || sessionId);
         return;
       }

@@ -1,11 +1,11 @@
 import type { FileWriteOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { asString, mapPath } from "./paths.js";
+import { asString, mapWritePath } from "./paths.js";
 import { structuredPatch } from "./patch.js";
 
 export async function writeTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string): Promise<FileWriteOutput> {
-  const path = mapPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
+  const path = mapWritePath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const content = asString(input.content);
   const existed = await Bun.file(path).exists();
   const originalFile = existed ? await Bun.file(path).text() : null;

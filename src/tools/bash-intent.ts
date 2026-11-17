@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 
 export type BashIntent =
   | { action: "run"; command: string }
-  | { action: "prefer"; tool: "Read" | "Grep" | "Glob"; message: string };
+  | { action: "prefer"; tool: "Read" | "Grep" | "Glob" | "Edit"; message: string };
 
 const CD_PREFIX = /^\s*cd\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))\s*(?:&&|;)\s*/;
 
@@ -116,7 +116,23 @@ function base(cmd: string): string {
   return name;
 }
 
-const RG_OK = new Set(["-n", "-i", "-l", "-F", "-w", "--hidden", "--heading", "--no-heading", "--color=never", "--no-color"]);
+const RG_OK = new Set([
+  "-n",
+  "-i",
+  "-l",
+  "-F",
+  "-w",
+  "--hidden",
+  "--heading",
+  "--no-heading",
+  "--color=never",
+  "--no-color",
+  "--line-number",
+  "--files-with-matches",
+  "--fixed-strings",
+]);
+const RG_VALUE = new Set(["-e", "-g", "--glob", "--iglob", "-A", "-B", "-C", "-m", "-t", "--type"]);
+const RG_EQ = ["--glob=", "--iglob=", "--type="];
 
 function skipEnv(argv: string[]): string[] {
   let i = 0;
@@ -131,6 +147,56 @@ function ignorable(command: string): boolean {
   return bin === "true" || bin === ":" || bin === "pwd" || bin === "ls" || bin === "echo" || bin === "printf";
 }
 
+/** Drop stderr-discard so `rg foo 2>/dev/null` can still be Grep. */
+function stripIgnorableRedirects(command: string): string {
+  return command.replace(/\s+2>\s*\/dev\/null\b/g, "").trim();
+}
+
+function shellyPath(path: string): boolean {
+  return /[*$`?]/.test(path) || /\$\{?/.test(path);
+}
+
+function looksLikePythonWrite(command: string): boolean {
+  if (/open\s*\([^)]*['"]w/.test(command)) return true;
+  if (/\.write_text\s*\(|\.write_bytes\s*\(/.test(command)) return true;
+  return /open\s*\(/.test(command) && /\.write\s*\(/.test(command);
+}
+
+function sedInPlace(argv: string[]): boolean {
+  return argv.slice(1).some(
+    (t) => t === "-i" || t === "--in-place" || t.startsWith("--in-place=") || (t.startsWith("-i") && !t.startsWith("--")),
+  );
+}
+
+function perlInPlace(argv: string[]): boolean {
+  return argv.slice(1).some((t) => {
+    if (t === "-i" || t === "--in-place" || t.startsWith("--in-place=")) return true;
+    if (t.startsWith("-i") && !t.startsWith("--")) return true;
+    const clustered = t.match(/^-([0-9aceflnprw]*)i(?:\..+)?$/);
+    return Boolean(clustered);
+  });
+}
+
+/** python/perl/sed in-place rewrites should be Edit; heredocs skip stage splitting and stay Bash. */
+function preferMutation(command: string): Extract<BashIntent, { action: "prefer" }> | undefined {
+  if (/\bperl\b/.test(command)) {
+    const argv = skipEnv(tokens(command.replace(/<<[\s\S]*$/, "")));
+    if (base(argv[0] ?? "") === "perl" && perlInPlace(argv)) {
+      return { action: "prefer", tool: "Edit", message: "Use the Edit tool instead of perl -i." };
+    }
+  }
+  if (/\bsed\b/.test(command) && /(^|\s)(-i\b|--in-place\b)/.test(command)) {
+    const argv = skipEnv(tokens(command.replace(/<<[\s\S]*$/, "")));
+    if (base(argv[0] ?? "") === "sed" && sedInPlace(argv)) {
+      return { action: "prefer", tool: "Edit", message: "Use the Edit tool instead of sed -i." };
+    }
+  }
+  if (/\bpython3?\b/.test(command) && looksLikePythonWrite(command)) {
+    return { action: "prefer", tool: "Edit", message: "Use the Edit or Write tool instead of python to change files." };
+  }
+  return undefined;
+}
+
 function preferNative(command: string): Extract<BashIntent, { action: "prefer" }> | undefined {
   const argv = skipEnv(tokens(command));
   if (argv.length === 0) return undefined;
@@ -138,7 +204,7 @@ function preferNative(command: string): Extract<BashIntent, { action: "prefer" }
 
   if (bin === "cat") {
     const files = argv.slice(1).filter((t) => t !== "-n" && t !== "--");
-    if (files.length === 1 && !files[0]!.startsWith("-")) {
+    if (files.length === 1 && !files[0]!.startsWith("-") && !shellyPath(files[0]!)) {
       return { action: "prefer", tool: "Read", message: `Use the Read tool with file_path: ${files[0]} instead of cat.` };
     }
     return undefined;
@@ -164,14 +230,24 @@ function preferNative(command: string): Extract<BashIntent, { action: "prefer" }
       }
       file = t;
     }
-    if (!skip && file) {
+    if (!skip && file && !shellyPath(file)) {
       return { action: "prefer", tool: "Read", message: `Use the Read tool with file_path: ${file} instead of head.` };
     }
     return undefined;
   }
 
   if (bin === "sed") {
-    if (argv[1] === "-n" && argv.length === 4 && /^(\d+),(\d+)p$/.test(argv[2] ?? "") && argv[3] && !argv[3].startsWith("-")) {
+    if (sedInPlace(argv)) {
+      return { action: "prefer", tool: "Edit", message: "Use the Edit tool instead of sed -i." };
+    }
+    if (
+      argv[1] === "-n" &&
+      argv.length === 4 &&
+      /^(\d+),(\d+)p$/.test(argv[2] ?? "") &&
+      argv[3] &&
+      !argv[3].startsWith("-") &&
+      !shellyPath(argv[3])
+    ) {
       return { action: "prefer", tool: "Read", message: `Use the Read tool with file_path: ${argv[3]} instead of sed.` };
     }
     return undefined;
@@ -179,6 +255,7 @@ function preferNative(command: string): Extract<BashIntent, { action: "prefer" }
 
   if (bin === "rg" || bin === "grep") {
     let pattern: string | undefined;
+    let glob: string | undefined;
     let skip = false;
     for (let i = 1; i < argv.length; i++) {
       const t = argv[i]!;
@@ -186,15 +263,22 @@ function preferNative(command: string): Extract<BashIntent, { action: "prefer" }
         pattern = argv[i + 1];
         break;
       }
-      if (t === "-e" || t === "-g" || t === "--glob" || t === "-A" || t === "-B" || t === "-C" || t === "-m") {
+      if (RG_VALUE.has(t)) {
         if (!argv[i + 1]) {
           skip = true;
           break;
         }
+        if (t === "-g" || t === "--glob" || t === "--iglob") glob = argv[i + 1];
         i += 1;
         continue;
       }
-      if (RG_OK.has(t) || t.startsWith("--glob=")) continue;
+      const eq = RG_EQ.find((p) => t.startsWith(p));
+      if (eq) {
+        if (eq === "--glob=" || eq === "--iglob=") glob = t.slice(eq.length);
+        continue;
+      }
+      if (/^-[ABC]\d+$/.test(t) || /^-m\d+$/.test(t)) continue;
+      if (RG_OK.has(t)) continue;
       if (t.startsWith("-")) {
         skip = true;
         break;
@@ -205,7 +289,12 @@ function preferNative(command: string): Extract<BashIntent, { action: "prefer" }
       }
     }
     if (!skip && pattern) {
-      return { action: "prefer", tool: "Grep", message: `Use the Grep tool with pattern: ${pattern} instead of ${bin}.` };
+      const globBit = glob ? ` glob: ${glob}` : "";
+      return {
+        action: "prefer",
+        tool: "Grep",
+        message: `Use the Grep tool with pattern: ${pattern}${globBit} instead of ${bin}.`,
+      };
     }
     return undefined;
   }
@@ -265,13 +354,18 @@ function joinPrefers(prefers: Extract<BashIntent, { action: "prefer" }>[]): Bash
  * Pipes, `||`, substitutions, and any non-native stage stay Bash.
  */
 export function classifyBashIntent(command: string, cwd: string): BashIntent {
-  const stripped = stripRedundantCd(command.trim(), cwd);
+  const stripped = stripRedundantCd(stripIgnorableRedirects(command.trim()), cwd);
   if (!stripped) return { action: "run", command: "true" };
   const stages = splitSequential(stripped);
   if (!stages) return { action: "run", command: stripped };
   const prefers: Extract<BashIntent, { action: "prefer" }>[] = [];
   for (const stage of stages) {
     if (ignorable(stage)) continue;
+    const mutate = preferMutation(stage);
+    if (mutate) {
+      prefers.push(mutate);
+      continue;
+    }
     const prefer = preferNative(stage);
     if (!prefer) return { action: "run", command: stripped };
     prefers.push(prefer);

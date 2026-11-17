@@ -124,7 +124,7 @@ if (msg.type === "hello") {
 }
 
 if (msg.type === "turn.complete" || msg.type === "turn.start" || msg.type === "cancel") {
-  session.send({ v: 1, type: msg.type, callId: msg.callId, sessionId: msg.sessionId, answer: msg.answer, isAborted: msg.isAborted });
+  session.send({ v: 1, type: msg.type, callId: msg.callId, sessionId: msg.sessionId, agentId: msg.agentId, answer: msg.answer, isAborted: msg.isAborted });
   session.ws.close();
   process.exit(0);
 }
@@ -135,6 +135,9 @@ session.send({
   id: msg.id,
   callId: msg.callId,
   sessionId: msg.sessionId,
+  claudeSessionId: msg.claudeSessionId,
+  agentId: msg.agentId,
+  tuiUid: msg.tuiUid,
   tool: msg.tool,
   input: msg.input,
   cwd: msg.cwd,

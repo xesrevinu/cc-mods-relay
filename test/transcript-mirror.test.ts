@@ -47,8 +47,9 @@ function inbox(ws: WebSocket) {
 
 test("encodeProjectDir matches Claude Code's projects folder name", () => {
   expect(encodeProjectDir("/Users/alice/.cursor/worktrees/wt/app")).toBe(
-    "-Users-alice-.cursor-worktrees-wt-app",
+    "-Users-alice--cursor-worktrees-wt-app",
   );
+  expect(encodeProjectDir("/Users/alice/my_proj")).toBe("-Users-alice-my-proj");
   expect(isSafeTranscriptRel("-Users-alice-app/s.jsonl")).toBe(true);
   expect(isSafeTranscriptRel("../etc/passwd.jsonl")).toBe(false);
   expect(isSafeTranscriptRel("/abs.jsonl")).toBe(false);

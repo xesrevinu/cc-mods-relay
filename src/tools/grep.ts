@@ -1,6 +1,6 @@
 import type { GrepOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { finishJob, registerJob, wasCancelled } from "./jobs.js";
-import { asBool, asNumber, asString, mapPath } from "./paths.js";
+import { asBool, asNumber, asString, mapReadPath } from "./paths.js";
 
 type Mode = "content" | "files_with_matches" | "count";
 
@@ -51,16 +51,17 @@ export async function grepTool(
   callId = "",
   sessionId = "",
   project?: string,
+  agentId?: string,
 ): Promise<GrepOutput> {
   const mode: Mode = asString(input.output_mode) === "content" || asString(input.output_mode) === "count"
     ? asString(input.output_mode) as Mode
     : "files_with_matches";
-  const path = mapPath(cwd, tuiRoot, asString(input.path, ".") || ".", extraDirs, project);
+  const path = mapReadPath(cwd, tuiRoot, asString(input.path, ".") || ".", extraDirs, project);
   if (wasCancelled(callId)) throw new Error("Tool call was cancelled");
   const proc = Bun.spawn(argv(input, mode, path), { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   registerJob(callId, sessionId, () => {
     try { proc.kill(); } catch { /* already gone */ }
-  });
+  }, agentId);
   let out = "";
   let error = "";
   let code: number | null = 0;

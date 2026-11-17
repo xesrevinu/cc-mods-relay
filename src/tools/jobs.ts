@@ -1,4 +1,4 @@
-type Job = { kill: () => void; sessionId: string };
+type Job = { kill: () => void; sessionId: string; agentId?: string };
 
 const jobs = new Map<string, Job>();
 const cancelled = new Set<string>();
@@ -20,9 +20,16 @@ export function cancelSession(sessionId: string): void {
   }
 }
 
-export function registerJob(callId: string, sessionId: string, kill: () => void): void {
+export function cancelAgent(agentId: string): void {
+  if (!agentId) return;
+  for (const [id, job] of jobs) {
+    if (job.agentId === agentId) cancelCall(id);
+  }
+}
+
+export function registerJob(callId: string, sessionId: string, kill: () => void, agentId?: string): void {
   if (!callId) return;
-  jobs.set(callId, { kill, sessionId });
+  jobs.set(callId, { kill, sessionId, agentId });
   if (cancelled.has(callId)) kill();
 }
 

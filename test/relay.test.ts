@@ -39,6 +39,26 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).not.toContain("{ value: text }");
   expect(src).not.toContain("isError: true");
   expect(src).not.toContain("if (e.agentId && !parent) return next(e)");
+  expect(src).toContain("$.session.send");
+  expect(src).toContain("$.session.id()");
+  expect(src).not.toContain("$.session &&");
+  expect(src).not.toContain("id.call($.session)");
+  expect(src.match(/\$\.session(?!\.(?:id|send)\()/g) || []).toEqual([]);
+  expect(src).toContain("claudeSessionId");
+  expect(src).toContain("deliverTaskText");
+  expect(src).toContain("isDelivered");
+  expect(src).toContain("agentGone");
+  expect(src).toContain("enqueue($, text, frame.agentId)");
+  expect(src).toContain("flushPending($, e.agentId)");
+  expect(src).toMatch(/^function enqueue\(/m);
+  expect(src).toMatch(/^function kickFlush\(/m);
+  expect(src).toMatch(/^async function flushPending\(/m);
+  expect(src).toContain("pending.length >= 100");
+  expect(src).toContain("<task-notification>");
+  expect(src).toContain("kickFlush");
+  expect(src).toContain("after($, 1_500)");
+  expect(src).toContain("await sessionIdOf");
+  expect(src).toContain("type: \"cancel\", agentId:");
   expect(src).toContain("classic.Stop");
   expect(src).toContain("classic.PermissionRequest");
   expect(src).toContain("HYDRATE_TOOLS");
@@ -157,6 +177,7 @@ test("tool calls run here; unknown tools fail closed; calls need hello", async (
     });
     ws.send(JSON.stringify({
       v: 1, type: "call", id: "bg", callId: "bash-1", tool: "Bash",
+      agentId: "agent-sub-relay",
       input: { command: "echo from-background", run_in_background: true },
     }));
     const both = await done;
@@ -165,6 +186,7 @@ test("tool calls run here; unknown tools fail closed; calls need hello", async (
     expect(result.result.backgroundTaskId).toBeDefined();
     expect(both.indexOf(result)).toBeLessThan(both.indexOf(note));
     expect(note.output).toContain("from-background");
+    expect(note.agentId).toBe("agent-sub-relay");
     ws.close();
   } finally {
     relay.stop();
@@ -184,6 +206,13 @@ test("staged plugin is minified and does not ship sources or types", async () =>
   const helper = readFileSync(join(staged, "hooks/ws-client.js"), "utf8");
   expect(register).toContain("ws://127.0.0.1:9/tools");
   expect(register).toContain("stage-token");
+  expect(register).toContain(".session.id()");
+  expect(register).not.toMatch(/\.session&&/);
+  expect(register).not.toMatch(/\.call\([^)]*session\)/);
+  const pendingCap = register.indexOf(">=100");
+  const registerFn = register.search(/function \w+\(\w\)\{let \w+=!1/);
+  expect(pendingCap).toBeGreaterThan(0);
+  expect(registerFn).toBeGreaterThan(pendingCap);
   expect(register).toMatch(/export\{[A-Za-z$][\w$]* as register\}/);
   expect(register).not.toContain("Mods forbids");
   expect(register).not.toContain("ENDPOINT");

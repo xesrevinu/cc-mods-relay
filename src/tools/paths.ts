@@ -42,6 +42,18 @@ export function scratchDirs(): string[] {
   return [...new Set(dirs.map((d) => resolve(d)))];
 }
 
+/** Claude Code folder names: every non-alphanumeric becomes `-` (`.cursor` → `-cursor`). */
+export function encodeClaudeDir(cwd: string): string {
+  return cwd.replace(/\/+$/, "").replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+/** Claude Code auto-memory: `~/.claude/projects/<encoded>/memory/*.md`. */
+export function isClaudeMemoryPath(abs: string): boolean {
+  const prefix = `${posixPath(homedir())}/.claude/projects/`;
+  const n = posixPath(abs);
+  return n.startsWith(prefix) && /\/memory\/[^/]+$/.test(n);
+}
+
 export function mergeRoots(extraDirs: string[] = []): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -77,10 +89,13 @@ export function pathAliases(project: string, tuiRoot?: string): [string, string]
   return byLongestFrom(aliases);
 }
 
+/** End of a path prefix: slash, EOS, or a character that cannot continue a path segment. */
+const PATH_TAIL = String.raw`(?:/|$|[^A-Za-z0-9._-])`;
+
 function replacePathPrefix(text: string, from: string, to: string): string {
   if (!from || !text.includes(from)) return text;
   const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return text.replace(new RegExp(`${escaped}(?=/|$|[^A-Za-z0-9._-])`, "g"), to);
+  return text.replace(new RegExp(`${escaped}(?=${PATH_TAIL})`, "g"), () => to);
 }
 
 function applyAliases(text: string, aliases: [string, string][]): string {
@@ -89,11 +104,22 @@ function applyAliases(text: string, aliases: [string, string][]): string {
   return out;
 }
 
+/**
+ * Tilde expansion only at the start of a path token (`~/x`, `cd ~`, `VAR=~/x`).
+ * Identifier suffixes (`token~`) and bash/perl `=~` are left alone.
+ */
+function expandTildeInText(text: string, home: string): string {
+  if (!text.includes("~")) return text;
+  return text.replace(
+    /(^|[^A-Za-z0-9._-])~(?=\/)|(^|[^A-Za-z0-9._=-])~(?=$|[^A-Za-z0-9._/-])/g,
+    (_full, slashLeft: string | undefined, bareLeft: string | undefined) => `${slashLeft ?? bareLeft}${home}`,
+  );
+}
+
 function expandRemoteHomesInText(text: string, tuiRoot?: string): string {
   const remote = remoteHome(tuiRoot) ?? localHome();
-  let out = replacePathPrefix(text, "$HOME", remote);
-  out = replacePathPrefix(out, "~", remote);
-  return out;
+  const out = replacePathPrefix(text, "$HOME", remote);
+  return expandTildeInText(out, remote);
 }
 
 function expandRemoteHome(path: string, tuiRoot?: string): string {
@@ -150,6 +176,48 @@ export function mapPath(
   return inside(rootProject, abs);
 }
 
+function homeQualified(path: string): boolean {
+  return (
+    isAbsolute(path) ||
+    path === "~" ||
+    path.startsWith("~/") ||
+    path === "$HOME" ||
+    path.startsWith("$HOME/") ||
+    path.startsWith("$HOME\\")
+  );
+}
+
+/**
+ * Read/Grep/Glob: workspace, extraDirs, scratch, or an explicit path under $HOME.
+ * Relative `../` still cannot walk out. Write/Edit keep using `mapPath`.
+ */
+export function mapReadPath(
+  cwd: string,
+  tuiRoot: string | undefined,
+  path: string,
+  extraDirs: string[] = [],
+  project?: string,
+): string {
+  try {
+    return mapPath(cwd, tuiRoot, path, extraDirs, project);
+  } catch (error) {
+    if (!homeQualified(path)) throw error;
+    const abs = resolve(rewriteRemotePath(path, project || cwd, tuiRoot));
+    if (under(homedir(), abs)) return abs;
+    throw error;
+  }
+}
+
+/** Workspace, extraDirs, and scratch — the roots Bash may persist as session cwd for later Write. */
+export function insideWriteRoot(abs: string, project: string, extraDirs: string[] = []): boolean {
+  const target = resolve(abs);
+  if (under(resolve(project), target)) return true;
+  for (const extra of mergeRoots(extraDirs)) {
+    if (under(resolve(extra), target)) return true;
+  }
+  return false;
+}
+
 /** Like mapPath, but a directory under $HOME is allowed (EnterWorktree / persisted pwd). */
 export function mapCwd(
   cwd: string,
@@ -163,6 +231,27 @@ export function mapCwd(
   } catch (error) {
     const abs = resolve(rewriteRemotePath(path, project || cwd, tuiRoot));
     if (under(homedir(), abs)) return abs;
+    throw error;
+  }
+}
+
+/**
+ * Write/Edit: workspace, extraDirs, scratch — plus Claude Code `memory/*.md`.
+ * Other `$HOME` paths stay jailed.
+ */
+export function mapWritePath(
+  cwd: string,
+  tuiRoot: string | undefined,
+  path: string,
+  extraDirs: string[] = [],
+  project?: string,
+): string {
+  try {
+    return mapPath(cwd, tuiRoot, path, extraDirs, project);
+  } catch (error) {
+    if (!homeQualified(path)) throw error;
+    const abs = resolve(rewriteRemotePath(path, project || cwd, tuiRoot));
+    if (isClaudeMemoryPath(abs)) return abs;
     throw error;
   }
 }

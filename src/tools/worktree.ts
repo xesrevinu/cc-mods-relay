@@ -68,7 +68,7 @@ export async function enterWorktreeTool(
     const abs = real(mapCwd(workspace, frame.tuiRoot, pathIn, roots, workspace));
     const hit = trees.find((t) => real(t.path) === abs);
     if (!hit) throw new Error(`Path is not in git worktree list: ${abs}`);
-    persistCwd(workspace, sessionId, abs, roots);
+    persistCwd(workspace, sessionId, abs, roots, true);
     states.set(sessionId, { originalCwd: workspace, worktreePath: abs, worktreeBranch: hit.branch, created: false });
     return {
       worktreePath: abs,
@@ -85,7 +85,7 @@ export async function enterWorktreeTool(
   if (ran.code !== 0) {
     throw new Error((ran.stderr || ran.stdout || "git worktree add failed").trim());
   }
-  persistCwd(workspace, sessionId, dest, roots);
+  persistCwd(workspace, sessionId, dest, roots, true);
   states.set(sessionId, { originalCwd: workspace, worktreePath: dest, created: true });
   return { worktreePath: dest, message: `Created and entered worktree ${dest}` };
 }

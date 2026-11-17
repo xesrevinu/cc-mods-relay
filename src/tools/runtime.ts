@@ -15,6 +15,12 @@ export type ToolFrame = {
   id?: string;
   callId?: string;
   sessionId?: string;
+  /** Claude Code session UUID (`$.session.id`); used for `tasks/<pid>.output`. */
+  claudeSessionId?: string;
+  /** Subagent that issued the call; `$.session.send` routes notify here. */
+  agentId?: string;
+  /** TUI host uid, so task files match `/tmp/claude-<uid>/...` on Mini. */
+  tuiUid?: string | number;
   cwd?: string;
   tuiRoot?: string;
   extraDirs?: string[];

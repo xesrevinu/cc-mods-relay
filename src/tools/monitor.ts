@@ -45,6 +45,7 @@ function notifyLine(notify: Send, frame: ToolFrame, line: string): void {
     status: "event",
     callId: frame.callId,
     sessionId: frame.sessionId,
+    agentId: frame.agentId,
     line,
   });
 }
@@ -62,6 +63,7 @@ function notifyEnd(
     status,
     callId: frame.callId,
     sessionId: frame.sessionId,
+    agentId: frame.agentId,
     ...extra,
   });
 }
@@ -133,7 +135,7 @@ function startWsMonitor(
     } catch {
       /* already gone */
     }
-  });
+  }, frame.agentId);
   ws.addEventListener("message", (event) => {
     events += 1;
     if (typeof event.data === "string") notifyLine(notify, frame, event.data);
@@ -183,7 +185,7 @@ async function startCommandMonitor(
   registerJob(callId, frame.sessionId || "", () => {
     stop();
     killTree(proc.pid);
-  });
+  }, frame.agentId);
   const onLine = (line: string) => {
     events += 1;
     notifyLine(notify, frame, line);

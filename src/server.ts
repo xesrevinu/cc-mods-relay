@@ -45,6 +45,7 @@ type CtrlFrame = {
   callId?: string;
   id?: string;
   sessionId?: string;
+  agentId?: string;
   tool?: string;
   input?: unknown;
 };
@@ -400,7 +401,14 @@ export function startServer(opts: ServeOpts) {
       return;
     }
     if (frame.type === "cancel") {
-      sendClient(inst, msg);
+      sendClient(inst, {
+        ...(msg as object),
+        v: 1,
+        type: "cancel",
+        callId: frame.callId,
+        sessionId: frame.sessionId || inst.id,
+        agentId: frame.agentId,
+      });
       return;
     }
     if (frame.type === "turn.start") {

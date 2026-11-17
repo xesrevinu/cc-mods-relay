@@ -1,4 +1,4 @@
-import { asString, mapPath } from "./paths.js";
+import { asString, mapReadPath } from "./paths.js";
 
 export async function sendFileTool(
   cwd: string,
@@ -7,7 +7,7 @@ export async function sendFileTool(
   extraDirs: string[] = [],
   project?: string,
 ): Promise<Record<string, unknown>> {
-  const path = mapPath(cwd, tuiRoot, asString(input.file_path) || asString(input.path), extraDirs, project);
+  const path = mapReadPath(cwd, tuiRoot, asString(input.file_path) || asString(input.path), extraDirs, project);
   const file = Bun.file(path);
   if (!(await file.exists())) throw new Error(`File does not exist: ${path}`);
   const stat = await file.stat();
