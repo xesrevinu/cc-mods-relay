@@ -112,9 +112,9 @@ The TUI cds into the client's working directory. The server creates that path wh
 | `~/.cursor/worktrees/wt/app` | `/Users/you/.cursor/worktrees/wt/app` (created if needed) |
 | your home directory (mkdir not allowed) | `~` |
 
-When the two paths differ, `instance.start` sends project `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`, and `.agents/`, plus user-level `~/.claude/{skills,commands,agents,.agents}` and `~/.agents/`. The server writes the project files into the TUI folder and the user-level files into the server `$HOME`, which is where Claude Code reads both scopes at session start. This machine keeps a content hash per server URL for the project cwd and for `$HOME`; an unchanged scope is not sent again. `.claude/projects`, `.claude/sessions`, `.claude/history.jsonl`, plugins, and credentials stay on this machine. File and shell tools still run here; `session/new` `cwd` is the local path. Tool inputs that use the server folder are mapped back onto this machine.
+When the two paths differ, `instance.start` sends project `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`, and `.agents/`, plus user-level `~/.claude/{skills,commands,agents,.agents}` and `~/.agents/`. The server writes the project files into the TUI folder and the user-level files into the server `$HOME`, which is where Claude Code reads both scopes at session start. This machine keeps a content hash per server URL for the project cwd and for `$HOME`; an unchanged scope is not sent again. Plugins and credentials stay on the server. File and shell tools still run here; `session/new` `cwd` is the local path. Tool inputs that use the server folder are mapped back onto this machine.
 
-Session JSONL stays on the server. Claude Code writes `~/.claude/projects/**/<session-id>.jsonl` there, same as a local Claude session. Resume, fork, and list read those files in place. Live ACP updates and workspace tools share the same WebSocket. The transcript is not copied to this machine.
+Session JSONL is written on the server (`~/.claude/projects/**/<session-id>.jsonl`) and copied here so local Claude history has the remote turns. Connect starts with an `rsync` of `~/.claude/projects/**/*.jsonl` from the SSH host (`via: rsync-backfill`). After that the same WebSocket tails new bytes: `instance.start`, plugin `turn.complete`, a 1s idle flush once the turn has settled on disk, and `session` teardown. Offsets live in `~/.config/cc-mods-relay/transcript-cursors.json`; a sidecar `*.jsonl.cc-mods-mirror` records the last size copied. Resume, fork, and list still read the files on the server. Live ACP updates and workspace tools share the WebSocket.
 
 `ws` is `home` by default. `opaque` and `path` layouts still use `dir` in `~/.config/cc-mods-relay/config.json`.
 
@@ -131,7 +131,7 @@ Measured 12 Nov 2026 on darwin-arm64, Bun 1.4.4:
 | Tool relay (this machine) | 24 MB RSS, 0.8 MB heap | WebSocket tool executor; no JSONL |
 | ACP agent on the server, session open | 78 MB RSS, 11 MB heap | No TUI in this sample. Claude Code is a separate process. |
 | Parse and hold a 5.5 MB transcript | 12 MB heap, 7 ms | Same size as the largest server JSONL today. Not done while a session is live. |
-| Server session JSONL on disk | 8 MB across 28 files | Mean 284 KB, largest 5.7 MB. Stays on the server. |
+| Server session JSONL on disk | 8 MB across 28 files | Mean 284 KB, largest 5.7 MB. Mirrored to this machine. |
 
 The compiled binary is about 95 MB on disk because it embeds the Bun runtime. That is file size, not resident memory. Idle Bun is 11 MB RSS.
 

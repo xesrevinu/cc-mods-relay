@@ -1,8 +1,11 @@
 import { collectForwardedEnv } from "./forwarded-env.js";
 import { readClientGit } from "./git-stub.js";
 import { collectHomeFiles, collectSessionFiles, rememberSessionSync, selectSyncFiles } from "./launch.js";
+import { applyTranscriptFrame, loadTranscriptCursors } from "./transcript-mirror.js";
+import { backfillTranscripts } from "./transcript-backfill.js";
 import { classify, parseWsJson, readNdjsonStream } from "./mux.js";
-import { configuredToken, configuredUrl, httpUrlFromWs } from "./config.js";
+import { configuredHost, configuredToken, configuredUrl, httpUrlFromWs } from "./config.js";
+import { debug } from "./debug.js";
 import { startServer } from "./server.js";
 import { createToolExecutor } from "./tool-executor.js";
 import { randomUUID } from "node:crypto";
@@ -74,7 +77,69 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
   const outbound = (msg: unknown) => send(ws, msg);
   const broadcast = (msg: unknown) => send(ws, msg);
 
+  const loopback = (() => {
+    try {
+      const hostname = new URL(opts.url).hostname;
+      return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+    } catch {
+      return false;
+    }
+  })();
+  const host = loopback ? undefined : await configuredHost();
+  if (host) {
+    try {
+      await backfillTranscripts({ host });
+    } catch (error) {
+      debug("transcript rsync-backfill skipped", { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
   await waitOpen(ws);
+
+  let idleFlush: ReturnType<typeof setTimeout> | undefined;
+  const requestFlush = (delayMs = 0) => {
+    if (delayMs <= 0) {
+      send(ws, { v: 1, type: "transcript.flush" });
+      return;
+    }
+    if (idleFlush) clearTimeout(idleFlush);
+    idleFlush = setTimeout(() => {
+      idleFlush = undefined;
+      send(ws, { v: 1, type: "transcript.flush" });
+    }, delayMs);
+  };
+  executor.onTurn((frame) => {
+    if (frame.type === "turn.start") {
+      if (idleFlush) clearTimeout(idleFlush);
+      idleFlush = undefined;
+      return;
+    }
+    if (frame.type === "turn.complete") requestFlush(0);
+    requestFlush(1_000);
+  });
+
+  ws.addEventListener("message", (event) => {
+    let msg: unknown;
+    try {
+      msg = parseWsJson(String(event.data));
+    } catch {
+      return;
+    }
+    const kind = classify(msg);
+    if (kind === "acp") {
+      process.stdout.write(`${JSON.stringify(msg)}\n`);
+      return;
+    }
+    const frame = msg as { type?: string; rel?: unknown; offset?: unknown; data?: unknown };
+    if (frame.type === "transcript.append") {
+      applyTranscriptFrame(frame);
+      return;
+    }
+    if (frame.type === "call" || frame.type === "cancel" || frame.type === "turn.start" || frame.type === "turn.complete") {
+      executor.handle(frame, outbound, broadcast);
+    }
+  });
+
   const hello = waitCtrl(ws, "hello");
   send(ws, { v: 1, type: "hello", token: opts.token });
   await hello;
@@ -91,6 +156,7 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
     extraDirs: opts.extraDirs ?? [],
     env: collectForwardedEnv(env),
     git: readClientGit(cwd),
+    transcriptCursors: loadTranscriptCursors(),
     ...(sync.files ? { files: sync.files } : {}),
     ...(sync.homeFiles ? { homeFiles: sync.homeFiles } : {}),
   });
@@ -98,24 +164,6 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
   rememberSessionSync(opts.url, cwd, home, sync.projectHash, sync.homeHash);
   const tuiRoot = typeof started.tuiRoot === "string" && started.tuiRoot ? started.tuiRoot : opts.tuiRoot ?? cwd;
   executor.bind("", cwd, tuiRoot, opts.extraDirs ?? []);
-
-  ws.addEventListener("message", (event) => {
-    let msg: unknown;
-    try {
-      msg = parseWsJson(String(event.data));
-    } catch {
-      return;
-    }
-    const kind = classify(msg);
-    if (kind === "acp") {
-      process.stdout.write(`${JSON.stringify(msg)}\n`);
-      return;
-    }
-    const frame = msg as { type?: string };
-    if (frame.type === "call" || frame.type === "cancel" || frame.type === "turn.start" || frame.type === "turn.complete") {
-      executor.handle(frame, outbound, broadcast);
-    }
-  });
 
   const closed = new Promise<void>((resolve) => {
     ws.addEventListener("close", () => resolve());
@@ -127,6 +175,8 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
   });
 
   await Promise.race([closed, reading]);
+  if (idleFlush) clearTimeout(idleFlush);
+  requestFlush(0);
   executor.cancelAll();
   try {
     ws.close();

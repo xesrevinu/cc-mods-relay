@@ -11,6 +11,9 @@ import { applyGitStub, parseClientGit } from "./git-stub.js";
 import { collectForwardedEnv } from "./forwarded-env.js";
 import { stagePlugin, writeHomeFiles, writeSessionFiles, type SyncFile } from "./launch.js";
 import { acpStreamFromWs, classify, parseWsJson } from "./mux.js";
+import { claudeConfigDir } from "./jsonl.js";
+import { parseTranscriptCursors } from "./transcript-mirror.js";
+import { startTranscriptSync, type TranscriptSync } from "./transcript-sync.js";
 import { reapOrphanPluginProcesses } from "./tui-reap.js";
 
 export const SESSION_PATH = "/session";
@@ -38,6 +41,7 @@ type CtrlFrame = {
   files?: unknown;
   homeFiles?: unknown;
   git?: unknown;
+  transcriptCursors?: unknown;
   callId?: string;
   id?: string;
   sessionId?: string;
@@ -56,6 +60,7 @@ type Instance = {
   pendingCalls: Map<string, ServerWebSocket<SocketData>>;
   mux?: ReturnType<typeof acpStreamFromWs>;
   dispose?: () => Promise<void>;
+  transcript?: TranscriptSync;
   closing?: boolean;
   closed?: Promise<void>;
 };
@@ -68,6 +73,9 @@ export type ServeOpts = {
   boot?: boolean;
   /** Tests: wait after the instance is registered, before boot/ready. */
   pauseStart?: Promise<void>;
+  /** Tests: Claude config dir that holds project session JSONL. */
+  claudeConfigDir?: string;
+  idleMs?: number;
 };
 
 function rmTree(dir: string) {
@@ -160,6 +168,12 @@ export function startServer(opts: ServeOpts) {
     }
     inst.pluginSockets.clear();
     inst.pendingCalls.clear();
+    try {
+      inst.transcript?.flush();
+      inst.transcript?.stop();
+    } catch {
+      /* best-effort */
+    }
     debug("instance teardown", { instanceId: inst.id });
     inst.closed = (async () => {
       try {
@@ -194,6 +208,7 @@ export function startServer(opts: ServeOpts) {
     }
     writeSessionFiles(tuiRoot, filesOf(frame.files));
     writeHomeFiles(homedir(), filesOf(frame.homeFiles));
+    const transcriptCursors = parseTranscriptCursors(frame.transcriptCursors);
     const id = randomUUID();
     const pluginToken = randomUUID();
     const inst: Instance = {
@@ -213,12 +228,23 @@ export function startServer(opts: ServeOpts) {
     const mux = acpStreamFromWs((msg) => sendClient(inst, msg));
     inst.mux = mux;
 
+    const attachTranscript = () => {
+      if (!boot && !opts.claudeConfigDir) return;
+      inst.transcript = startTranscriptSync({
+        claudeConfigDir: opts.claudeConfigDir ?? claudeConfigDir(),
+        cursors: transcriptCursors,
+        send: (msg) => sendClient(inst, msg),
+        idleMs: opts.idleMs,
+      });
+    };
+
     try {
       if (opts.pauseStart) await opts.pauseStart;
       if (!live(inst)) return;
 
       if (!boot) {
         sendJson(ws, { v: 1, type: "instance.ready", instanceId: id, cwd, tuiRoot });
+        attachTranscript();
         return;
       }
 
@@ -256,6 +282,7 @@ export function startServer(opts: ServeOpts) {
         return;
       }
       sendJson(ws, { v: 1, type: "instance.ready", instanceId: id, cwd, tuiRoot });
+      attachTranscript();
     } catch (error) {
       await teardown(inst);
       throw error;
@@ -319,6 +346,10 @@ export function startServer(opts: ServeOpts) {
       for (const plugin of inst.pluginSockets) sendJson(plugin, msg);
       return;
     }
+    if (frame.type === "transcript.flush") {
+      inst.transcript?.flush();
+      return;
+    }
   };
 
   const handlePlugin = (ws: ServerWebSocket<SocketData>, msg: unknown) => {
@@ -367,6 +398,16 @@ export function startServer(opts: ServeOpts) {
       return;
     }
     if (frame.type === "cancel") {
+      sendClient(inst, msg);
+      return;
+    }
+    if (frame.type === "turn.start") {
+      inst.transcript?.onTurnStart();
+      sendClient(inst, msg);
+      return;
+    }
+    if (frame.type === "turn.complete") {
+      inst.transcript?.onTurnComplete();
       sendClient(inst, msg);
       return;
     }
