@@ -2,7 +2,8 @@
 export const IMAGE_JPEG_QUALITY = 85;
 /** Anthropic downscales the long edge past this, so extra pixels only cost context. */
 export const IMAGE_MAX_EDGE = 1568;
-export const IMAGE_MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
+/** Keep raw image bytes <= 2.5 MiB so base64 JSON stays below Mods' ~4 MiB hook-join limit. */
+export const IMAGE_MAX_OUTPUT_BYTES = Math.floor(2.5 * 1024 * 1024);
 export const IMAGE_MAX_SOURCE_BYTES = 40 * 1024 * 1024;
 const MAX_PIXELS = 8192 * 8192;
 
@@ -53,7 +54,7 @@ export async function compressImage(source: Buffer, mime: ImageMime): Promise<Co
     let encoded: Buffer | undefined;
     let displayWidth = 0;
     let displayHeight = 0;
-    for (const quality of [IMAGE_JPEG_QUALITY, 70, 55]) {
+    for (const quality of [IMAGE_JPEG_QUALITY, 70, 55, 40]) {
       const pipeline = new Bun.Image(source, { maxPixels: MAX_PIXELS, autoOrient: true })
         .resize(IMAGE_MAX_EDGE, IMAGE_MAX_EDGE, { fit: "inside", withoutEnlargement: true })
         .jpeg({ quality });

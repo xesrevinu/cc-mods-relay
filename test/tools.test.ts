@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { cancelAgent, cancelCall, execute } from "../src/exec.js";
+import { createSubagentWatcher } from "../src/subagent-watcher.js";
+import { IMAGE_MAX_OUTPUT_BYTES } from "../src/tools/image-compress.js";
 import {
   applyModEvent,
   isReplDispatchResult,
@@ -13,6 +15,7 @@ import {
 } from "../src/mod-live.js";
 import { toolInfoFromToolUse } from "../src/tools.js";
 import { encodeClaudeTaskDir, persistCwd, sessionCwd } from "../src/tools/bash.js";
+import { REDUNDANT_CD_HINT } from "../src/tools/bash-intent.js";
 import { mapPath, mapReadPath, mapWritePath, rewriteRemoteText } from "../src/tools/paths.js";
 import { READ_CONTENT_BYTE_CAP } from "../src/tools/read.js";
 import { nativeToolError, nativeToolResult } from "../src/tools/runtime.js";
@@ -21,7 +24,7 @@ function run(
   dir: string,
   tool: string,
   input: Record<string, unknown>,
-  opts: { callId?: string; sessionId?: string; tuiRoot?: string } = {},
+  opts: { callId?: string; sessionId?: string; tuiRoot?: string; tuiEnv?: Record<string, string> } = {},
 ) {
   return new Promise<any>((resolve) => {
     void execute(
@@ -32,6 +35,7 @@ function run(
         tuiRoot: opts.tuiRoot ?? dir,
         callId: opts.callId ?? "t",
         sessionId: opts.sessionId,
+        tuiEnv: opts.tuiEnv,
       },
       (frame) => resolve(frame),
     );
@@ -336,6 +340,64 @@ test("Bash returns stdout/stderr/interrupted; non-zero is still a result", async
   const fail = await run(dir, "Bash", { command: "exit 7" });
   expect(fail.ok).toBe(true);
   expect(fail.result.stderr).toContain("Exit code 7");
+});
+
+test("Bash keeps a redundant leading cd successful and notes it on stderr", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const kept = await run(dir, "Bash", { command: `cd '${dir}' && printf hi` }, { callId: "cd-hint" });
+  expect(kept.ok).toBe(true);
+  expect(kept.result.stdout).toBe("hi");
+  expect(kept.result.stderr).toContain(REDUNDANT_CD_HINT);
+  expect(kept.result.interrupted).toBe(false);
+  const only = await run(dir, "Bash", { command: `cd '${dir}'` }, { callId: "cd-only" });
+  expect(only.ok).toBe(true);
+  expect(only.result.stderr).toContain(REDUNDANT_CD_HINT);
+  const real = await run(dir, "Bash", { command: "cd /tmp && printf x" }, { callId: "cd-other" });
+  expect(real.ok).toBe(true);
+  expect(real.result.stdout).toBe("x");
+  expect(real.result.stderr).not.toContain(REDUNDANT_CD_HINT);
+});
+
+test("Bash overlays Mini TZ/LANG and drops client secrets", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const prev = {
+    AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+    TZ: process.env.TZ,
+    LANG: process.env.LANG,
+    LC_ALL: process.env.LC_ALL,
+    TERM: process.env.TERM,
+  };
+  process.env.AWS_SECRET_ACCESS_KEY = "client-secret";
+  process.env.TZ = "Asia/Shanghai";
+  process.env.LANG = "zh_CN.UTF-8";
+  process.env.LC_ALL = "zh_CN.UTF-8";
+  process.env.TERM = "dumb";
+  try {
+    const locale = await run(
+      dir,
+      "Bash",
+      { command: 'printf "%s %s %s %s %s" "$TZ" "$LANG" "${LC_ALL-}" "$TERM" "$(date +%z)"' },
+      {
+        tuiEnv: { TZ: "Asia/Tokyo", LANG: "en_US.UTF-8", TERM: "xterm-256color", COLORTERM: "truecolor", FORCE_COLOR: "3" },
+        callId: "locale",
+      },
+    );
+    expect(locale.ok).toBe(true);
+    expect(locale.result.stdout.trim()).toBe("Asia/Tokyo en_US.UTF-8  xterm-256color +0900");
+    const leak = await run(
+      dir,
+      "Bash",
+      { command: 'printenv AWS_SECRET_ACCESS_KEY || true' },
+      { tuiEnv: { TZ: "Asia/Tokyo" }, callId: "secret" },
+    );
+    expect(leak.ok).toBe(true);
+    expect(leak.result.stdout.trim()).toBe("");
+  } finally {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("Read returns native image schema and ACP image content", async () => {
@@ -895,4 +957,164 @@ test("ACP shows a failed Read as error text, not numbered file contents", async 
   const text = done?.content?.[0]?.content?.text as string;
   expect(text).toContain("File does not exist: /tmp/gone.md");
   expect(text).not.toMatch(/^1\t/);
+});
+
+test("Grep on a single file and with -C context returns clean filenames", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const file = join(dir, "single.ts");
+  writeFileSync(file, "one\nhit-alpha\ntwo\nthree\nfour\nhit-alpha\nfive\n");
+  try {
+    const content = await run(dir, "Grep", { pattern: "hit-alpha", path: file, output_mode: "content", "-C": 1 });
+    expect(content.ok).toBe(true);
+    expect(content.result.filenames).toEqual([file]);
+    const count = await run(dir, "Grep", { pattern: "hit-alpha", path: file, output_mode: "count" });
+    expect(count.ok).toBe(true);
+    expect(count.result.filenames).toEqual([file]);
+    expect(count.result.numMatches).toBe(2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("mapReadPath allows read-only SDK/toolchain dirs while keeping Write jailed", () => {
+  const cwd = "/Users/me/proj";
+  expect(mapReadPath(cwd, cwd, "/usr/include/stdio.h")).toBe("/usr/include/stdio.h");
+  expect(mapReadPath(cwd, cwd, "/Applications/Xcode.app/Contents/Developer/x.h")).toBe(
+    "/Applications/Xcode.app/Contents/Developer/x.h",
+  );
+  expect(() => mapReadPath(cwd, cwd, "/etc/passwd")).toThrow(/outside/);
+  expect(() => mapWritePath(cwd, cwd, "/usr/include/stdio.h")).toThrow(/outside/);
+  expect(() => mapWritePath(cwd, cwd, "/Applications/Xcode.app/Contents/x.h")).toThrow(/outside/);
+});
+
+test("Write and Edit drop large originalFile/diff from tool result while writing full content", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+  const big = "a".repeat(600_000);
+  const file = join(dir, "large.txt");
+  try {
+    const created = await run(dir, "Write", { file_path: file, content: `${big}1` });
+    expect(created.ok).toBe(true);
+    expect(created.result.originalFile).toBeNull();
+    expect(created.result.structuredPatch).toEqual([]);
+    expect(readFileSync(file, "utf8")).toBe(`${big}1`);
+    const edited = await run(dir, "Edit", { file_path: file, old_string: "a1", new_string: "a2" });
+    expect(edited.ok).toBe(true);
+    expect(edited.result.originalFile).toBeNull();
+    expect(edited.result.structuredPatch).toEqual([]);
+    expect(readFileSync(file, "utf8")).toBe(`${big}2`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("subagent Bash cd does not clobber parent session cwd", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "cc-tools-")));
+  const sub = join(dir, "sub");
+  mkdirSync(sub);
+  try {
+    const parentFrame = { tool: "Bash", input: { command: "pwd" }, cwd: dir, tuiRoot: dir, callId: "p1", sessionId: "iso-sub" };
+    const subFrame = { tool: "Bash", input: { command: `cd "${sub}" && pwd` }, cwd: dir, tuiRoot: dir, callId: "s1", sessionId: "iso-sub", agentId: "agent-1" };
+    const sRes = await new Promise<any>((resolve) => execute(subFrame, resolve));
+    expect(sRes.ok).toBe(true);
+    expect(sRes.result.stdout.trim()).toBe(realpathSync(sub));
+    const pRes = await new Promise<any>((resolve) => execute(parentFrame, resolve));
+    expect(pRes.ok).toBe(true);
+    expect(pRes.result.stdout.trim()).toBe(realpathSync(dir));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Glob respects .gitignore and skips common build dirs unless explicitly targeted", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-glob-ign-"));
+  try {
+    mkdirSync(join(dir, "src"), { recursive: true });
+    mkdirSync(join(dir, "target", "debug"), { recursive: true });
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(join(dir, ".gitignore"), "ignored-dir/\n*.log\n");
+    mkdirSync(join(dir, "ignored-dir"));
+    writeFileSync(join(dir, "src", "keep.ts"), "ok\n");
+    writeFileSync(join(dir, "ignored-dir", "drop.ts"), "no\n");
+    writeFileSync(join(dir, "debug.log"), "no\n");
+    writeFileSync(join(dir, "target", "debug", "build.ts"), "no\n");
+    writeFileSync(join(dir, "dist", "out.ts"), "no\n");
+
+    const all = await run(dir, "Glob", { pattern: "**/*.ts", path: dir });
+    expect(all.ok).toBe(true);
+    expect(all.result.filenames).toEqual([join(dir, "src", "keep.ts")]);
+
+    const targeted = await run(dir, "Glob", { pattern: "target/**/*.ts", path: dir });
+    expect(targeted.ok).toBe(true);
+    expect(targeted.result.filenames).toEqual([join(dir, "target", "debug", "build.ts")]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Read streams offset/limit cleanly on large files", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-read-stream-"));
+  const file = join(dir, "huge.log");
+  try {
+    const line = "x".repeat(400);
+    const body = Array.from({ length: 800 }, (_, i) => `L${i + 1}:${line}`).join("\n") + "\n"; // > 320 KiB
+    writeFileSync(file, body);
+    const page = await run(dir, "Read", { file_path: file, offset: 500, limit: 3 });
+    expect(page.ok).toBe(true);
+    expect(page.result.file.numLines).toBe(3);
+    expect(page.result.file.startLine).toBe(500);
+    expect(page.result.file.content).toContain("L500:");
+    expect(page.result.file.content).toContain("L502:");
+    expect(page.result.file.content).not.toContain("L503:");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("IMAGE_MAX_OUTPUT_BYTES stays under Mods ~4 MiB hook-join limit", () => {
+  expect(IMAGE_MAX_OUTPUT_BYTES).toBeLessThanOrEqual(2.5 * 1024 * 1024);
+});
+
+test("subagent-watcher stops polling after all spawned subagents complete and resumes on new spawn", async () => {
+  let listCalls = 0;
+  let activity = 0;
+  const openMsg = {
+    type: "assistant",
+    message: { content: [{ type: "tool_use", id: "ag1", name: "Agent", input: {} }] },
+  };
+  const closedMsg = {
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "ag1", content: "done" }] },
+  };
+  const watcher = createSubagentWatcher({
+    sessionId: "s-sub",
+    mainChain: [openMsg as any],
+    pollMs: 15,
+    listSubagents: async () => {
+      listCalls += 1;
+      return ["sub-1"];
+    },
+    getSubagentMessages: async () => [{ uuid: `u-${listCalls}`, type: "assistant" } as any],
+    onActivity: () => {
+      activity += 1;
+    },
+  });
+  try {
+    await Bun.sleep(55);
+    expect(listCalls).toBeGreaterThanOrEqual(2);
+    expect(activity).toBeGreaterThanOrEqual(1);
+    watcher.update([openMsg as any, closedMsg as any]);
+    await Bun.sleep(45);
+    const frozen = listCalls;
+    await Bun.sleep(60);
+    expect(listCalls).toBe(frozen);
+    watcher.update([
+      openMsg as any,
+      closedMsg as any,
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "ag2", name: "Agent", input: {} }] } } as any,
+    ]);
+    await Bun.sleep(45);
+    expect(listCalls).toBeGreaterThan(frozen);
+  } finally {
+    watcher.stop();
+  }
 });

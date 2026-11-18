@@ -157,12 +157,16 @@ export async function runPrintClaude(opts: {
     },
   );
   const timeoutMs = opts.timeoutMs ?? 60_000;
-  const timed = Bun.sleep(timeoutMs).then(() => {
-    proc.kill();
-    return "timeout" as const;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timed = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => {
+      proc.kill();
+      resolve("timeout");
+    }, timeoutMs);
   });
   const finished = proc.exited.then(() => "ok" as const);
   const outcome = await Promise.race([timed, finished]);
+  clearTimeout(timer);
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
   if (outcome === "timeout") {

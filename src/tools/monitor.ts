@@ -1,6 +1,7 @@
 import type { MonitorOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { sessionCwd } from "./bash.js";
 import { spawnEnv, withDirenv } from "./direnv.js";
+import { pinTuiLocale, workspaceSpawnEnv } from "./workspace-env.js";
 import { finishJob, registerJob, wasCancelled } from "./jobs.js";
 import { asNumber, asString, rewriteRemoteText } from "./paths.js";
 import { clampTimeout, killTree, type Send, type ToolFrame } from "./runtime.js";
@@ -163,7 +164,7 @@ async function startCommandMonitor(
 ): Promise<MonitorOutput> {
   const callId = frame.callId ?? "";
   const cwd = sessionCwd(frame, workspace);
-  const env = await withDirenv(cwd, process.env);
+  const env = pinTuiLocale(await withDirenv(cwd, workspaceSpawnEnv(process.env, frame.tuiEnv)), frame.tuiEnv);
   if (wasCancelled(callId)) throw new Error("Tool call was cancelled");
   const proc = Bun.spawn(["bash", "-c", command], {
     cwd,

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { withPlugin } from "../src/compose.js";
@@ -12,6 +12,7 @@ import {
   selectSyncFiles,
   sessionSyncPaths,
   writeHomeFiles,
+  writeSessionFiles,
 } from "../src/launch.js";
 import { debugOn, summarize } from "../src/debug.js";
 import { collectForwardedEnv } from "../src/forwarded-env.js";
@@ -316,4 +317,26 @@ test("Code Mode env is injected when the config override is on", () => {
 
 test("local-tool-forward stays off so it cannot race Mods intercept", () => {
   expect(isLocalToolForwardEnabled({ CLAUDE_TUI_LOCAL_TOOL_FORWARD: "1" })).toBe(false);
+});
+
+test("session sync skips .claude/worktrees and binaries and prunes deleted files", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cc-mods-sync-prune-"));
+  const tui = mkdtempSync(join(tmpdir(), "cc-mods-sync-tui-"));
+  mkdirSync(join(cwd, ".claude", "commands"), { recursive: true });
+  mkdirSync(join(cwd, ".claude", "worktrees", "wt-1"), { recursive: true });
+  writeFileSync(join(cwd, ".claude", "commands", "a.md"), "cmd-a\n");
+  writeFileSync(join(cwd, ".claude", "commands", "b.md"), "cmd-b\n");
+  writeFileSync(join(cwd, ".claude", "worktrees", "wt-1", "huge.ts"), "ignored\n");
+  writeFileSync(join(cwd, ".claude", "commands", "bin.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]));
+  const first = collectSessionFiles(cwd);
+  expect(first.map((f) => f.path).sort()).toEqual([".claude/commands/a.md", ".claude/commands/b.md"]);
+  writeSessionFiles(tui, first);
+  expect(existsSync(join(tui, ".claude/commands/a.md"))).toBe(true);
+  expect(existsSync(join(tui, ".claude/commands/b.md"))).toBe(true);
+
+  rmSync(join(cwd, ".claude", "commands", "b.md"));
+  const second = collectSessionFiles(cwd);
+  writeSessionFiles(tui, second);
+  expect(existsSync(join(tui, ".claude/commands/a.md"))).toBe(true);
+  expect(existsSync(join(tui, ".claude/commands/b.md"))).toBe(false);
 });

@@ -4,6 +4,18 @@ import { dirname } from "node:path";
 import { asBool, asString, mapWritePath } from "./paths.js";
 import { structuredPatch } from "./patch.js";
 
+const EDIT_DIFF_BYTE_CAP = 512 * 1024;
+const EDIT_ECHO_BYTE_CAP = 1_500_000;
+
+function capUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let end = Math.min(text.length, maxBytes);
+  while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > maxBytes) {
+    end = Math.max(0, end - 1024);
+  }
+  return `${text.slice(0, end)}\n… [truncated in tool result]`;
+}
+
 export async function editTool(cwd: string, tuiRoot: string | undefined, input: Record<string, unknown>, extraDirs: string[] = [], project?: string): Promise<FileEditOutput> {
   const path = mapWritePath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const oldString = asString(input.old_string);
@@ -16,12 +28,13 @@ export async function editTool(cwd: string, tuiRoot: string | undefined, input: 
     if (oldString !== "") throw new Error(`File does not exist: ${path}`);
     mkdirSync(dirname(path), { recursive: true });
     await Bun.write(path, newString);
+    const keepDiff = Buffer.byteLength(newString, "utf8") <= EDIT_DIFF_BYTE_CAP;
     return {
       filePath: path,
       oldString,
-      newString,
+      newString: capUtf8(newString, EDIT_ECHO_BYTE_CAP),
       originalFile: null,
-      structuredPatch: structuredPatch("", newString),
+      structuredPatch: keepDiff ? structuredPatch("", newString) : [],
       userModified: false,
       replaceAll,
     };
@@ -39,12 +52,13 @@ export async function editTool(cwd: string, tuiRoot: string | undefined, input: 
   }
   const next = replaceAll ? parts.join(newString) : parts[0] + newString + parts.slice(1).join(oldString);
   await Bun.write(path, next);
+  const keepDiff = Buffer.byteLength(originalFile, "utf8") + Buffer.byteLength(next, "utf8") <= EDIT_DIFF_BYTE_CAP;
   return {
     filePath: path,
-    oldString,
-    newString,
-    originalFile,
-    structuredPatch: structuredPatch(originalFile, next),
+    oldString: capUtf8(oldString, EDIT_ECHO_BYTE_CAP),
+    newString: capUtf8(newString, EDIT_ECHO_BYTE_CAP),
+    originalFile: keepDiff ? originalFile : null,
+    structuredPatch: keepDiff ? structuredPatch(originalFile, next) : [],
     userModified: false,
     replaceAll,
   };

@@ -1,11 +1,16 @@
 import { existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 export type BashIntent =
   | { action: "run"; command: string }
   | { action: "prefer"; tool: "Read" | "Grep" | "Glob" | "Edit"; message: string };
 
-const CD_PREFIX = /^\s*cd\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))\s*(?:&&|;)\s*/;
+const CD_PREFIX = /^\s*cd\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))\s*(?:&&|;|[ \t]*\n)\s*/;
+const CD_ONLY = /^\s*cd\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))\s*$/;
+
+/** Successful Bash still shows this so the model stops prefixing `cd` onto cwd. */
+export const REDUNDANT_CD_HINT = "Already in the working directory. Dropped a leading cd to this path.";
 
 function unquote(token: string): string {
   if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
@@ -23,16 +28,33 @@ function sameDir(a: string, b: string): boolean {
   return resolve(a) === resolve(b);
 }
 
-/** Drop `cd <cwd> &&` / `cd <cwd>;` when that directory is already the session cwd. */
+function expandUserPath(path: string, cwd: string): string {
+  let dest = unquote(path);
+  const home = homedir();
+  if (dest === "~" || dest === "$HOME") dest = home;
+  else if (dest.startsWith("~/")) dest = home + dest.slice(1);
+  else if (dest.startsWith("$HOME/") || dest.startsWith("$HOME\\")) dest = home + dest.slice("$HOME".length);
+  return resolve(cwd, dest);
+}
+
+/** Drop `cd <cwd> &&` / `cd <cwd>;` / a bare `cd <cwd>` when that directory is already the session cwd. */
 export function stripRedundantCd(command: string, cwd: string): string {
   let rest = command;
   for (;;) {
     const hit = rest.match(CD_PREFIX);
-    if (!hit) return rest;
-    const dest = resolve(cwd, unquote(hit[1] ?? ""));
-    if (!sameDir(dest, cwd)) return rest;
+    if (!hit) {
+      const only = rest.match(CD_ONLY);
+      if (!only) return rest;
+      if (!sameDir(expandUserPath(only[1] ?? "", cwd), cwd)) return rest;
+      return "";
+    }
+    if (!sameDir(expandUserPath(hit[1] ?? "", cwd), cwd)) return rest;
     rest = rest.slice(hit[0].length);
   }
+}
+
+export function droppedRedundantCd(command: string, cwd: string): boolean {
+  return stripRedundantCd(command, cwd) !== command;
 }
 
 /** Split on quote-aware `&&` / `;`. `||`, pipes, substitutions → undefined (keep Bash). */

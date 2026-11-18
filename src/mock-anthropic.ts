@@ -20,6 +20,8 @@ export type ScriptedTurn = {
   stopReason?: "end_turn" | "tool_use";
 };
 
+export type ScriptedTurnSource = ScriptedTurn | ((body: unknown) => ScriptedTurn);
+
 export type RecordedRequest = {
   method: string;
   path: string;
@@ -144,7 +146,7 @@ function isMainInference(req: Request, body: unknown): boolean {
 
 const AUX: ScriptedTurn = { blocks: [{ type: "text", text: "ok" }] };
 
-export function startMockAnthropic(turns: ScriptedTurn[]): MockAnthropic {
+export function startMockAnthropic(turns: ScriptedTurnSource[]): MockAnthropic {
   const queue = [...turns];
   const requests: RecordedRequest[] = [];
 
@@ -169,7 +171,8 @@ export function startMockAnthropic(turns: ScriptedTurn[]): MockAnthropic {
       const requestClass = req.headers.get("x-claude-code-request-class");
       requests.push({ method: req.method, path, requestClass, body });
       const model = typeof (body as { model?: unknown }).model === "string" ? (body as { model: string }).model : "mock";
-      const turn = isMainInference(req, body) ? queue.shift() ?? { blocks: [{ type: "text", text: "no scripted turn left" }] } : AUX;
+      const rawTurn = isMainInference(req, body) ? queue.shift() ?? { blocks: [{ type: "text", text: "no scripted turn left" }] } : AUX;
+      const turn = typeof rawTurn === "function" ? rawTurn(body) : rawTurn;
       const stream = (body as { stream?: unknown }).stream !== false;
       if (!stream) return Response.json(jsonMessage(turn, model));
       return new Response(scriptedEvents(turn, model), {

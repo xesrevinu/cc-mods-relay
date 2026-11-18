@@ -76,6 +76,7 @@ export async function notebookEditTool(cwd: string, tuiRoot: string | undefined,
   const meta = nb as Notebook & { metadata?: { language_info?: { name?: string }; kernelspec?: { language?: string } } };
   const language = meta.metadata?.language_info?.name || meta.metadata?.kernelspec?.language || "python";
   const cellType = (edited?.cell_type ?? (edit_mode === "delete" ? undefined : "code")) === "markdown" ? "markdown" as const : "code" as const;
+  const keepEcho = Buffer.byteLength(original_file, "utf8") + Buffer.byteLength(updated_file, "utf8") <= 1_500_000;
   return {
     new_source,
     old_source,
@@ -84,7 +85,7 @@ export async function notebookEditTool(cwd: string, tuiRoot: string | undefined,
     language,
     edit_mode,
     notebook_path: path,
-    original_file,
-    updated_file,
+    original_file: keepEcho ? original_file : "",
+    updated_file: keepEcho ? updated_file : "",
   };
 }

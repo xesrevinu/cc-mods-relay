@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyBashIntent, stripRedundantCd } from "../src/tools/bash-intent.js";
+import { classifyBashIntent, droppedRedundantCd, stripRedundantCd } from "../src/tools/bash-intent.js";
 import { execute } from "../src/exec.js";
 
 test("stripRedundantCd drops cd onto the session cwd and keeps a real directory change", () => {
@@ -10,6 +10,15 @@ test("stripRedundantCd drops cd onto the session cwd and keeps a real directory 
   expect(stripRedundantCd("cd /Users/me/proj && ls", cwd)).toBe("ls");
   expect(stripRedundantCd("cd '/Users/me/proj' && cat a.ts", cwd)).toBe("cat a.ts");
   expect(stripRedundantCd("cd /Users/me/other && ls", cwd)).toBe("cd /Users/me/other && ls");
+  expect(stripRedundantCd("cd /Users/me/proj", cwd)).toBe("");
+  expect(stripRedundantCd("cd . && ls", cwd)).toBe("ls");
+  const home = homedir();
+  const under = join(home, "proj");
+  expect(stripRedundantCd(`cd ~/proj && ls`, under)).toBe("ls");
+  expect(stripRedundantCd(`cd '$HOME/proj' && ls`, under)).toBe("ls");
+  expect(stripRedundantCd(`cd '${under}' && git status`, under)).toBe("git status");
+  expect(droppedRedundantCd(`cd '${under}' && git status`, under)).toBe(true);
+  expect(droppedRedundantCd("git status", under)).toBe(false);
 });
 
 test("classifyBashIntent prefers Read/Grep/Glob for single-purpose commands", () => {
@@ -55,6 +64,10 @@ test("classifyBashIntent strips a redundant cd then prefers Read", () => {
   expect(classifyBashIntent("cd /Users/me/proj && git status", cwd)).toEqual({
     action: "run",
     command: "git status",
+  });
+  expect(classifyBashIntent("cd /Users/me/proj", cwd)).toEqual({
+    action: "run",
+    command: "true",
   });
   expect(classifyBashIntent("FOO=1 cat macos/moon.pkg", cwd).action).toBe("prefer");
 });
@@ -163,4 +176,17 @@ test("Bash still runs printf, redirects, and git after the classifier", async ()
   expect(seq.ok).toBe(false);
   expect(seq.error.message).toMatch(/Read tool/);
   expect(seq.error.message).toMatch(/Grep tool/);
+});
+
+test("stripRedundantCd also drops a newline-separated leading cd onto cwd", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-bash-nl-"));
+  const ran = await new Promise<any>((resolve) => {
+    void execute(
+      { tool: "Bash", input: { command: `cd '${dir}'\nprintf nl-ok` }, cwd: dir, tuiRoot: dir, callId: "nl" },
+      (next) => resolve(next),
+    );
+  });
+  expect(ran.ok).toBe(true);
+  expect(ran.result.stdout).toBe("nl-ok");
+  expect(ran.result.stderr).toContain("Already in the working directory");
 });

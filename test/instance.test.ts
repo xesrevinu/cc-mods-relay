@@ -416,3 +416,64 @@ test("plugin cancel without sessionId is stamped with the instance id", async ()
     await server.stop();
   }
 });
+
+test("client with reconnectGraceMs survives abnormal WS close and reattaches", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-inst-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const ws1 = await openWs(server.sessionUrl);
+    const h1 = nextJson(ws1);
+    ws1.send(JSON.stringify({ v: 1, type: "hello", token: "secret" }));
+    expect((await h1).ok).toBe(true);
+    const r1 = nextJson(ws1);
+    ws1.send(JSON.stringify({ v: 1, type: "instance.start", cwd: dir, reconnectGraceMs: 5_000 }));
+    const ready = await r1;
+    expect(ready.instanceId).toBeTruthy();
+    expect(ready.resumeToken).toBeTruthy();
+
+    const inst = server.instances.get(String(ready.instanceId))!;
+    const plugin = await openWs(server.toolsUrl);
+    const ph = nextJson(plugin);
+    plugin.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await ph).ok).toBe(true);
+
+    // Drop client abnormally (not 1000); instance stays alive and buffers outbound calls.
+    ws1.close(4000, "wifi-drop");
+    await Bun.sleep(40);
+    expect(server.instances.has(inst.id)).toBe(true);
+
+    plugin.send(JSON.stringify({
+      v: 1, type: "call", id: "re1", callId: "re-c1", tool: "Read",
+      input: { file_path: join(dir, "hello.txt") },
+    }));
+    await Bun.sleep(20);
+
+    const ws2 = await openWs(server.sessionUrl);
+    const q2: any[] = [];
+    const wait2: ((msg: any) => void)[] = [];
+    ws2.addEventListener("message", (event) => {
+      const msg = JSON.parse(String(event.data));
+      const w = wait2.shift();
+      if (w) w(msg);
+      else q2.push(msg);
+    });
+    const pull2 = () => new Promise<any>((resolve) => (q2.length ? resolve(q2.shift()) : wait2.push(resolve)));
+    ws2.send(JSON.stringify({ v: 1, type: "hello", token: "secret" }));
+    expect((await pull2()).ok).toBe(true);
+    ws2.send(JSON.stringify({
+      v: 1, type: "instance.attach", instanceId: inst.id, resumeToken: ready.resumeToken,
+    }));
+    const reattached = await pull2();
+    expect(reattached.reattached).toBe(true);
+    const call = await pull2();
+    expect(call.type).toBe("call");
+    expect(call.callId).toBe("re-c1");
+
+    ws2.close(1000, "done");
+    for (let i = 0; i < 40 && server.instances.size > 0; i++) await Bun.sleep(10);
+    expect(server.instances.size).toBe(0);
+    plugin.close();
+  } finally {
+    await server.stop();
+  }
+});

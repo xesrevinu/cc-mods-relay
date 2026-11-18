@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { debug } from "./debug.js";
 import { cancelAgent, cancelCall, cancelSession, execute, type ToolFrame } from "./exec.js";
+import { resetSessionCwd } from "./tools/bash.js";
+import { rewriteRemotePath } from "./tools/paths.js";
 
 export type TurnFrame = {
   type?: string;
@@ -15,7 +17,22 @@ export type TurnFrame = {
 
 type Cached = { sig: string; payload: Record<string, unknown> };
 const DEDUPE_MAX = 500;
-const MUTATE = new Set(["Write", "Edit", "NotebookEdit", "hydrate"]);
+const MUTATE = new Set(["Write", "Edit", "NotebookEdit", "hydrate", "EnterWorktree", "ExitWorktree"]);
+
+function mutateKey(frame: ToolFrame, fallbackCwd: string, fallbackTuiRoot: string): string | undefined {
+  const tool = String(frame.tool || "");
+  if (!MUTATE.has(tool)) return undefined;
+  if (tool === "EnterWorktree" || tool === "ExitWorktree") return "__worktree__";
+  const input = frame.input ?? {};
+  const raw =
+    typeof input.file_path === "string" ? input.file_path
+    : typeof input.notebook_path === "string" ? input.notebook_path
+    : "";
+  if (!raw) return "__mutate__";
+  const proj = frame.cwd || fallbackCwd;
+  const normalized = rewriteRemotePath(raw, proj, frame.tuiRoot || fallbackTuiRoot);
+  return `file:${normalized}`;
+}
 
 function signature(frame: ToolFrame): string {
   return createHash("sha256").update(JSON.stringify({ tool: frame.tool, input: frame.input })).digest("hex");
@@ -27,17 +44,27 @@ export function createToolExecutor() {
   let cwd = process.cwd();
   let tuiRoot = cwd;
   let extraDirs: string[] = [];
+  let tuiEnv: Record<string, string> | undefined;
   let sessionId = "";
   let onTurn: (frame: TurnFrame) => void = () => {};
   let onTool: (frame: TurnFrame) => void = () => {};
   const dedupe = new Map<string, Cached>();
   const inflight = new Map<string, Promise<Record<string, unknown> | undefined>>();
   const calls = new Set<string>();
-  let mutateTail = Promise.resolve();
+  const mutateTails = new Map<string, Promise<void>>();
 
-  const runMutating = (work: () => Promise<void>) => {
-    const run = mutateTail.then(work, work);
-    mutateTail = run.then(() => undefined, () => undefined);
+  const runMutating = (key: string, work: () => Promise<void>) => {
+    const prev = mutateTails.get(key) ?? Promise.resolve();
+    const run = prev.then(work, work);
+    const tail = run.then(
+      () => {
+        if (mutateTails.get(key) === tail) mutateTails.delete(key);
+      },
+      () => {
+        if (mutateTails.get(key) === tail) mutateTails.delete(key);
+      },
+    );
+    mutateTails.set(key, tail);
     return run;
   };
 
@@ -48,11 +75,14 @@ export function createToolExecutor() {
       tuiRoot = nextTuiRoot;
       extraDirs = nextExtra;
     },
-    hello(frame: { cwd?: string; tuiRoot?: string; extraDirs?: unknown }) {
+    hello(frame: { cwd?: string; tuiRoot?: string; extraDirs?: unknown; tuiEnv?: unknown }) {
       if (frame.cwd) cwd = frame.cwd;
       if (typeof frame.tuiRoot === "string" && frame.tuiRoot) tuiRoot = frame.tuiRoot;
       if (Array.isArray(frame.extraDirs)) {
         extraDirs = frame.extraDirs.filter((d): d is string => typeof d === "string");
+      }
+      if (frame.tuiEnv && typeof frame.tuiEnv === "object" && !Array.isArray(frame.tuiEnv)) {
+        tuiEnv = frame.tuiEnv as Record<string, string>;
       }
     },
     onTurn(handler: (frame: TurnFrame) => void) {
@@ -72,6 +102,7 @@ export function createToolExecutor() {
           cwd: frame.cwd || cwd,
           tuiRoot: frame.tuiRoot || tuiRoot,
           extraDirs: Array.isArray(frame.extraDirs) ? frame.extraDirs.filter((d): d is string => typeof d === "string") : extraDirs,
+          tuiEnv: frame.tuiEnv ?? tuiEnv,
           sessionId: frame.sessionId || sessionId,
           callId: frame.callId || frame.id || randomUUID(),
         };
@@ -135,9 +166,10 @@ export function createToolExecutor() {
           }
           return result;
         };
-        const pending = MUTATE.has(String(stamped.tool))
+        const mKey = mutateKey(stamped, cwd, tuiRoot);
+        const pending = mKey
           ? new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
-              void runMutating(async () => {
+              void runMutating(mKey, async () => {
                 try {
                   resolve(await work());
                 } catch (error) {
@@ -165,7 +197,10 @@ export function createToolExecutor() {
     },
     cancelAll() {
       for (const id of calls) cancelCall(id);
-      if (sessionId) cancelSession(sessionId);
+      if (sessionId) {
+        cancelSession(sessionId);
+        resetSessionCwd(sessionId);
+      }
     },
   };
 }

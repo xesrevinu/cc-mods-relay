@@ -1,14 +1,17 @@
 import type { BashOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnEnv, withDirenv } from "./direnv.js";
+import { pinTuiLocale, workspaceSpawnEnv } from "./workspace-env.js";
 import { cancelCall, finishJob, registerJob, wasCancelled } from "./jobs.js";
-import { classifyBashIntent } from "./bash-intent.js";
+import { classifyBashIntent, droppedRedundantCd, REDUNDANT_CD_HINT } from "./bash-intent.js";
 import { asBool, asNumber, asString, encodeClaudeDir, insideWriteRoot, mapCwd, mergeRoots, rewriteRemoteText } from "./paths.js";
 import { abortedShellResult, clampTimeout, killTree, type Send, type ToolFrame } from "./runtime.js";
 
 const MAX_OUTPUT = 30_000;
+const MAX_STREAM_HEAD = MAX_OUTPUT + 4_096;
+const MAX_STREAM_TAIL = 16_384;
 const FG_TIMEOUT_DEFAULT = 120_000;
 const FG_TIMEOUT_MAX = 600_000;
 const BG_TIMEOUT_DEFAULT = 1_800_000;
@@ -17,6 +20,30 @@ const DRAIN_AFTER_TIMEOUT_MS = 2_000;
 const cwdBySession = new Map<string, string>();
 const CWD_BUILTIN = /\b(?:cd|pushd|popd|chdir)\b/;
 const CWD_HINT_TAIL = "directory changes made by the backgrounded command do not apply to subsequent commands.";
+
+type StreamBuffer = {
+  text: string;
+  tail: string;
+  onChunk?: (chunk: string) => void;
+};
+
+function makeStreamBuffer(): StreamBuffer {
+  return { text: "", tail: "" };
+}
+
+function appendStream(buf: StreamBuffer, chunk: string): void {
+  if (!chunk) return;
+  if (buf.text.length < MAX_STREAM_HEAD) {
+    const take = MAX_STREAM_HEAD - buf.text.length;
+    buf.text += chunk.slice(0, take);
+  }
+  buf.tail = (buf.tail + chunk).slice(-MAX_STREAM_TAIL);
+  buf.onChunk?.(chunk);
+}
+
+function streamSnapshot(buf: StreamBuffer): string {
+  return buf.tail.length > buf.text.length || buf.text.length >= MAX_STREAM_HEAD ? buf.tail : buf.text;
+}
 
 export { cancelCall };
 
@@ -46,29 +73,52 @@ function taskOutputPath(frame: ToolFrame, workspace: string, pid: number): strin
 
 function startTaskTee(
   path: string | undefined,
-  buffers: { stdout: { text: string }; stderr: { text: string } },
+  buffers: { stdout: StreamBuffer; stderr: StreamBuffer },
 ): () => void {
   if (!path) return () => {};
   mkdirSync(dirname(path), { recursive: true });
-  const write = () => {
-    const text = `${buffers.stdout.text}${buffers.stderr.text ? `\n${buffers.stderr.text}` : ""}`;
+  let pending = `${streamSnapshot(buffers.stdout)}${buffers.stderr.tail ? `\n${streamSnapshot(buffers.stderr)}` : ""}`;
+  try {
+    writeFileSync(path, pending);
+    pending = "";
+  } catch {
+    /* task dir may be unwritable; Monitor/until then keep waiting */
+  }
+  const onChunk = (chunk: string) => {
+    if (pending.length < 256 * 1024) pending += chunk;
+  };
+  buffers.stdout.onChunk = onChunk;
+  buffers.stderr.onChunk = onChunk;
+  const flush = () => {
+    if (!pending) return;
+    const chunk = pending;
+    pending = "";
     try {
-      writeFileSync(path, text);
+      appendFileSync(path, chunk);
     } catch {
-      /* task dir may be unwritable; Monitor/until then keep waiting */
+      /* task dir may be unwritable */
     }
   };
-  write();
-  const timer = setInterval(write, 250);
+  const timer = setInterval(flush, 250);
   return () => {
     clearInterval(timer);
-    write();
+    buffers.stdout.onChunk = undefined;
+    buffers.stderr.onChunk = undefined;
+    flush();
   };
+}
+
+function cwdKey(sessionId: string, agentId?: string): string {
+  return agentId ? `${sessionId}:${agentId}` : sessionId;
 }
 
 export function sessionCwd(frame: ToolFrame, workspace: string): string {
   const id = frame.sessionId;
   if (id) {
+    if (frame.agentId) {
+      const own = cwdBySession.get(cwdKey(id, frame.agentId));
+      if (own) return own;
+    }
     const next = cwdBySession.get(id);
     if (next) return next;
   }
@@ -89,19 +139,29 @@ export function persistCwd(
   next: string,
   extraDirs: string[] = [],
   trusted = false,
+  agentId?: string,
 ): void {
   if (!sessionId) return;
   try {
     const root = real(workspace);
     const mapped = mapCwd(root, undefined, real(next), extraDirs, root);
     if (!trusted && !insideWriteRoot(mapped, root, extraDirs)) return;
-    cwdBySession.set(sessionId, mapped);
+    cwdBySession.set(cwdKey(sessionId, agentId), mapped);
   } catch {
   }
 }
 
-export function resetSessionCwd(sessionId: string): void {
-  if (sessionId) cwdBySession.delete(sessionId);
+export function resetSessionCwd(sessionId: string, agentId?: string): void {
+  if (!sessionId) return;
+  if (agentId) {
+    cwdBySession.delete(cwdKey(sessionId, agentId));
+    return;
+  }
+  cwdBySession.delete(sessionId);
+  const prefix = `${sessionId}:`;
+  for (const key of cwdBySession.keys()) {
+    if (key.startsWith(prefix)) cwdBySession.delete(key);
+  }
 }
 
 function shellArgv(tool: string, command: string): string[] {
@@ -143,16 +203,16 @@ function abortRunning(
   return abortedResult(stdout, stderr);
 }
 
-async function pump(stream: ReadableStream<Uint8Array> | undefined, into: { text: string }): Promise<void> {
+async function pump(stream: ReadableStream<Uint8Array> | undefined, into: StreamBuffer): Promise<void> {
   if (!stream) return;
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    into.text += decoder.decode(value, { stream: true });
+    appendStream(into, decoder.decode(value, { stream: true }));
   }
-  into.text += decoder.decode();
+  appendStream(into, decoder.decode());
 }
 
 function waitWithTimeout<T>(ms: number, task: Promise<T>): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
@@ -200,7 +260,7 @@ function watchBackground(
   proc: Bun.Subprocess,
   finished: Promise<unknown>,
   frame: ToolFrame,
-  buffers: { stdout: { text: string }; stderr: { text: string } },
+  buffers: { stdout: StreamBuffer; stderr: StreamBuffer },
   notify: Send,
   remainingMs: number,
   workspace: string,
@@ -221,7 +281,7 @@ function watchBackground(
       proc.pid,
       aborted ? 137 : code,
       aborted,
-      `${buffers.stdout.text}${buffers.stderr.text ? `\n${buffers.stderr.text}` : ""}`,
+      `${buffers.stdout.tail}${buffers.stderr.tail ? `\n${buffers.stderr.tail}` : ""}`,
       outputFile,
     );
   });
@@ -239,15 +299,19 @@ export async function bashTool(
   const intent = frame.tool === "PowerShell" ? { action: "run" as const, command: rewritten } : classifyBashIntent(rewritten, cwd);
   if (intent.action === "prefer") throw new Error(intent.message);
   const command = intent.command;
+  const noteRedundantCd = frame.tool !== "PowerShell" && droppedRedundantCd(rewritten, cwd);
   const callId = frame.callId ?? "";
   const sessionId = frame.sessionId || "";
   const sandbox = asBool(input.dangerouslyDisableSandbox) === true ? { dangerouslyDisableSandbox: true } : {};
 
   if (wasCancelled(callId)) return abortedResult();
-  const env = await withDirenv(cwd, process.env);
+  const env = pinTuiLocale(await withDirenv(cwd, workspaceSpawnEnv(process.env, frame.tuiEnv)), frame.tuiEnv);
   if (wasCancelled(callId)) return abortedResult();
   if (asBool(input.run_in_background)) {
-    return background(frame, command, cwd, env, notify, clampTimeout(asNumber(input.timeout), BG_TIMEOUT_DEFAULT, 1, BG_TIMEOUT_MAX));
+    return withRedundantCdHint(
+      background(frame, command, cwd, env, notify, clampTimeout(asNumber(input.timeout), BG_TIMEOUT_DEFAULT, 1, BG_TIMEOUT_MAX)),
+      noteRedundantCd,
+    );
   }
 
   const pwdFile = join(tmpdir(), `cc-mods-pwd-${process.pid}-${callId || Date.now()}`);
@@ -269,8 +333,8 @@ export async function bashTool(
     return abortedResult();
   }
 
-  const stdout = { text: "" };
-  const stderrBuf = { text: "" };
+  const stdout = makeStreamBuffer();
+  const stderrBuf = makeStreamBuffer();
   const finished = Promise.all([pump(proc.stdout, stdout), pump(proc.stderr, stderrBuf), proc.exited]);
   const raced = await waitWithTimeout(timeoutMs, finished);
 
@@ -280,7 +344,7 @@ export async function bashTool(
     if (wasCancelled(callId)) return abortRunning(proc, callId, pwdFile, stdout.text, stderrBuf.text);
     watchBackground(proc, finished, frame, { stdout, stderr: stderrBuf }, notify, BG_TIMEOUT_DEFAULT, workspace);
     await Bun.file(pwdFile).delete().catch(() => {});
-    return {
+    return withRedundantCdHint({
       stdout: clip(stdout.text.trimEnd()),
       stderr: clip(stderrBuf.text.trimEnd()),
       interrupted: false,
@@ -288,23 +352,28 @@ export async function bashTool(
       timedOutAfterMs: timeoutMs,
       ...backgroundCwdHint(command, cwd),
       ...sandbox,
-    };
+    }, noteRedundantCd);
   }
 
   const aborted = finishJob(callId);
   const nextCwd = (await Bun.file(pwdFile).text().catch(() => "")).trim();
-  if (nextCwd) persistCwd(workspace, sessionId, nextCwd, extraDirs);
+  if (nextCwd) persistCwd(workspace, sessionId, nextCwd, extraDirs, false, frame.agentId);
   await Bun.file(pwdFile).delete().catch(() => {});
   const code = raced.value[2];
   let stderr = clip(stderrBuf.text);
   if (aborted) stderr = append(stderr, "Command was aborted before completion");
   else if (code !== 0) stderr = append(stderr, `Exit code ${code}`);
-  return {
+  return withRedundantCdHint({
     stdout: clip(stdout.text.trimEnd()),
     stderr: stderr.trimEnd(),
     interrupted: aborted,
     ...sandbox,
-  };
+  }, noteRedundantCd);
+}
+
+function withRedundantCdHint(result: BashOutput, dropped: boolean): BashOutput {
+  if (!dropped) return result;
+  return { ...result, stderr: append(result.stderr, REDUNDANT_CD_HINT) };
 }
 
 function background(
@@ -344,7 +413,11 @@ function background(
   void proc.exited.then(async (exitCode) => {
     clearTimeout(timer);
     const aborted = finishJob(callId);
-    const tail = await Bun.file(output).text().catch(() => "");
+    const file = Bun.file(output);
+    const st = await file.stat().catch(() => null);
+    const tail = st && st.size > MAX_STREAM_TAIL
+      ? await file.slice(st.size - MAX_STREAM_TAIL, st.size).text().catch(() => "")
+      : await file.text().catch(() => "");
     notifyExit(notify, frame, proc.pid, aborted ? 137 : exitCode, aborted, tail, output);
   });
   if (wasCancelled(callId)) {

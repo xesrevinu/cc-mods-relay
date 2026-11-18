@@ -21,7 +21,7 @@ Mined from this repo’s Cursor chats (Nov 11–18 2026), including the user que
 | Nov 14 | Bash / direnv | `bash -c` skips direnv; rewriting results onto the TUI-host home; ToolSearch fail-closed |
 | Nov 14–17 | Persistent WebSocket | Nix bun `SIGKILL`; Environment reminder is process cwd; do not set a custom API base URL to fake cwd; git stub; compact; JSONL rsync; Cursor worktree cleanup; string `{ result }` |
 | Nov 17 | Path replace | `~` expansion; read vs write jail; subagent background hang; `$.session` used as a value |
-| Nov 18 | Code Mode | `turn.complete` early; `{ deny }` vs business failure; hook-authored `isError` unloads the plugin; huge Read `{ result }` cannot be joined |
+| Nov 18 | Code Mode | `turn.complete` early; `{ deny }` vs business failure; hook-authored `isError` unloads the plugin; huge Read `{ result }` cannot be joined; local Bash env leaked client TZ/secrets |
 
 ---
 
@@ -50,7 +50,10 @@ The TUI shows `{ deny }` as permission denied. Mapping `TOOL_FAILED` / ENOENT / 
 
 `next` is fallthrough to the host process. Workspace tools must not `next` on the success path, or Write/Edit will mutate the TUI tree.
 
-The one exception: after this machine has confirmed a Read ENOENT (`File does not exist:`), `await next(e)` and return that value. The TUI builtin emits native `tool_result.is_error` text, which a hook cannot produce. Safe only because the call is read-only and the file is missing on both sides.
+Exceptions:
+
+- After this machine has confirmed a Read ENOENT (`File does not exist:`), `await next(e)` and return that value. The TUI builtin emits native `tool_result.is_error` text, which a hook cannot produce. Safe only because the call is read-only and the file is missing on both sides.
+- After this machine has started a background Bash, `next` a Mini-side waiter (`/tmp/cc-mods-wait/<callId>.done`) with `run_in_background: true`. The builtin owns that pid, so completion is origin `task-notification` and starts a turn immediately. `$.prompt.submit` of the same XML stays plugin-origin and queues as “Waiting to be delivered”. Do not `next` the original command.
 
 **Rule:** Do not `next()` Write or Edit. Do not `next()` a subagent workspace tool just because it has `agentId` and no parent. Catch path: if it is a workspace tool and `!next.called`, cancel and `{ deny }`; otherwise `next(e)`.
 
@@ -238,7 +241,7 @@ CC 2.1 on macOS/Linux drops dedicated Glob/Grep unless named. `--tools` is a whi
 
 A command-wide veto denied hundreds of heredocs that must run. Matching `sed` through the whole line, including redirects, classified `sed -i; <build>` as Edit. Glued `-A30` was not seen as a context flag. `--type-add` was sent to Grep. `perl -version` was treated as in-place.
 
-**Rule:** Per pipeline stage, mutation check then native-tool check. Split only quote-aware `&&` and `;`. Abort the split on unquoted `<` `>`, backticks, newline, `$()`, `|`, `||`, a lone `&`, or an unclosed quote. Heredocs and pipes stay Bash. A lone `sed -i` / `perl -i` prefers Edit; `sed -i` followed by another command stays Bash. `$N/foo` is not a Read path. Strip `2>/dev/null` before classifying. Ignorable-only commands (`ls` / `pwd` / `echo`) stay Bash. Do not rewrite the model’s command strings to “fix” `cd`. Persist cwd only for a completed foreground command in-session.
+**Rule:** Per pipeline stage, mutation check then native-tool check. Split only quote-aware `&&` and `;`. Abort the split on unquoted `<` `>`, backticks, newline, `$()`, `|`, `||`, a lone `&`, or an unclosed quote. Heredocs and pipes stay Bash. A lone `sed -i` / `perl -i` prefers Edit; `sed -i` followed by another command stays Bash. `$N/foo` is not a Read path. Strip `2>/dev/null` before classifying. Ignorable-only commands (`ls` / `pwd` / `echo`) stay Bash. A leading `cd` onto the session cwd is dropped and the rest still runs; put `Already in the working directory…` on stderr so the model can see it. Do not `{ deny }` that call. Persist cwd only for a completed foreground command in-session.
 
 ---
 
@@ -256,7 +259,7 @@ Claude Code tells the model that background output is `…/claude-<uid>/<encoded
 
 Pending items are `{ text, agentId }`. Flush that agent on its own `turn.complete`, on `turn.start`, and before the next listen delivery. Also retry on a 1.5s Mods timer (`$.clock.after`, not `setTimeout`). Cap at 100, but never evict a `<task-notification>` to store a Monitor line. `$.clock.after` depends on the Mods clock; that is a known low risk.
 
-Plugins cannot set prompt origin. `<task-notification>` from `$.prompt.submit` stays plugin-origin. `asUser` is still plugin-origin. Official background completion cannot be spoofed from a plugin.
+Plugins cannot set prompt origin. `<task-notification>` from `$.prompt.submit` stays plugin-origin. `asUser` is still plugin-origin. Official background completion cannot be spoofed from a plugin. For a Mac-side background Bash, hand a waiter to the TUI builtin instead of submitting that XML; keep `prompt.submit` only when `next` of the waiter is denied.
 
 ---
 
@@ -324,6 +327,8 @@ ToolSearch must work. Tools that Claude Code exposes by default must not fail cl
 
 Client fs/terminal caps off means ACP `fs/*` is not the tool path; Mods WebSocket is. Permission UI for host-native dialogs is `classic.PermissionRequest`. Submit prompts through the PTY. Reading structured events from Mods is fine; `$.prompt.submit` is not a real user turn.
 
+Mods forbids `WebSocket`, timers, and passing `$` into nested helpers, so the long-lived `listen` `ws-client.js` process owns the persistent WebSocket and binds a short Unix socket (`/tmp/cc-mods-rpc-*.sock`) for `$.http.fetch` (`/rpc` + 20s `/wait` slices for long Bash), falling back to `$.process.run` only when the listener is down. That also lets `ws-client.js` compute `tuiEnv` once on `listen` / `hello` instead of spawning `readlink` or `defaults` on every `Read` / `Edit`. Also guard `Read` ENOENT with `test -e` before `next(e)` so a stale file on Mini never satisfies a missing file on this machine, and intercept `TaskStop` for Mini waiter / Client `Monitor` tasks.
+
 ---
 
 ## Environment and credentials
@@ -331,6 +336,8 @@ Client fs/terminal caps off means ACP `fs/*` is not the tool path; Mods WebSocke
 `Bun.spawn({ env })` replaces the child env. Copying `process.env` leaks SSH and cloud secrets. `bash -lc` then sources a login profile and can put them back, or override `ANTHROPIC_*`.
 
 **Rule:** Inherit the TUI-host user session and strip billing vars and relay internals (`FORK_*`, `CLAUDE_TUI_*`, `HERDR_ENV` / `HERDR_SESSION`, `CC_MODS_*` except `CC_MODS_SOCKET`). Keep TERM, COLORTERM, FORCE_COLOR, PATH, locale, XDG, EDITOR, `SSH_AUTH_SOCK`. Spawn with `bash -c`, not `-lc`. Anthropic creds and `CLAUDE_CONFIG_DIR` are spawn-env only. ACP `initialize` has no env field; flags may ride `_meta`, secrets must not. Extra directories go in a sidecar file, not `process.env`.
+
+Local Bash / Monitor run on this machine, so a raw `process.env` copy would show this laptop’s timezone, language, Cursor/`TERM_PROGRAM`, SSH agent, and cloud tokens. macOS usually leaves `TZ` unset, so `date` follows `/etc/localtime` — overlaying only when Mini exported `TZ` left this laptop on its own timezone. The Mini helper must always send an IANA zone (`TZ` env, `readlink`/`realpath` of `/etc/localtime`, then `Intl.DateTimeFormat`), and `LANG` (`LANG` env, `AppleLocale`, then Intl). Wipe every client `TZ` / `LANG` / `LC_*` / `TERM` key before applying that snapshot, and pin again after direnv so a client `.envrc` cannot put the client timezone back. Also copy Mini `TERM` / `COLORTERM` / `FORCE_COLOR` (engine-pty sets `xterm-256color` / `truecolor` / `3`). PATH and HOME stay this machine’s — the tools have to run here. Do not rewrite `hostname`. `tuiEnv` may only carry those face keys; ignore `PATH` or other injection. Same-machine replay sets `CC_MODS_TUI_ENV` so the helper does not snapshot this laptop as if it were Mini.
 
 `CC_MODS_DEBUG` and `CC_MODS_DEBUG_FILE` are the TUI-host server’s environment. Logs opened on this machine stay empty.
 
@@ -345,7 +352,7 @@ Token comes from the config file, never argv, so it does not show up in `ps`.
 - Compile with Homebrew bun on this machine, then copy. A Nix-built bun dies on ICU. After copy, ad-hoc sign (`xattr -cr`, `codesign --force --sign - --timestamp=none`) or the binary is `SIGKILL` 137 even on `--version`.
 - Embed plugin text and the agent bundle at compile time. Bun compile does not keep sibling plugin files. Bake the endpoint before minify, or `ENDPOINT` is renamed. Register bundle target is `browser` (no `// @bun`); helpers are `bun`. Nested `$` helpers are rejected at load. Plugin load `/$bunfs/root/../plugin/...` means the embed path is wrong.
 - Unix `/hello` before the WebSocket. Tools upgrade is loopback-only; an `Origin` header on the session upgrade is rejected. ACP is `{ jsonrpc: "2.0" }`; custom frames are `{ v: 1 }`. `instance.start` is first. Await `connection.closed`. Teardown only if `inst.client === ws`. Log on stderr. Do not `process.stdin.resume()` after `Bun.stdin.stream()` (“ReadableStream is locked”).
-- `herdr pane run` types into the login shell. Pass `--env SHELL=/bin/sh`. A relative `bin/sh` does not exist. Ready text on 2.1.x is “auto mode on (shift+tab to cycle)”, not “for shortcuts”. Auto-dismiss first-run theme / API-key / trust / bypass dialogs; herdr’s one-shot Down+Enter does not dismiss folder-trust. `trustTuiCwd` patches the host Claude config and retries Enter.
+- `herdr pane run` types into the login shell. Pass `--env SHELL=/bin/sh`. A relative `bin/sh` does not exist. Ready text on 2.1.x is “auto mode on (shift+tab to cycle)”, not “for shortcuts”. Auto-dismiss first-run theme / API-key / trust / bypass / “Try the new fullscreen renderer?” dialogs (fullscreen prompt selects “Not now”); herdr’s one-shot Down+Enter does not dismiss folder-trust. `trustTuiCwd` patches the host Claude config and retries Enter.
 - Stale SSH ControlMaster hangs doctor. Skip loopback `-R` when the relay port is already bound. zsh does not treat `exec KEY=val cmd` as an assignment; use `exec env KEY=val bun`. For remote inspection, write a script and pipe it. Do not embed shell metacharacters in a heredoc the login shell parses.
 - The TUI probes a hardcoded first-party host and ignores `ANTHROPIC_BASE_URL` for the splash. `DISABLE_STARTUP_WORK_GATE` does not reroute it. Pre-approve the key suffix (last 20 characters) in `customApiKeyResponses.approved`, and pin base URL plus key in `settings.json` `env`. Mock must answer GET `/api/hello` with 200, not only HEAD. `CC_MODS_MOCK=1` refuses to start unless the base URL is loopback. With `CLAUDE_CONFIG_DIR` set, Claude 2.1 reads `configDir/.claude.json`, not the home one.
 - Handle SIGHUP with the same shutdown as SIGTERM. `ensureHerdr` `unref()`s the server, so panes are not in the SSH process tree. Mark TUI exit only when every seen pid is dead (bun still in the pane is not exit). Kill seen pids before `workspace close`. On the next agent start, reap stamped dead-agent panes, PPID-1 `claude --plugin-dir` / `ws-client.js`, and unstamped tui panes. SIGKILL still leaks until that next start. An empty herdr daemon after a clean exit is intentional. `ws-client.js` reconnects about every 500ms if left behind.

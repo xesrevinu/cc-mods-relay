@@ -23,6 +23,7 @@ export type TranscriptSyncOpts = {
   claudeConfigDir: string;
   cursors?: TranscriptCursors;
   send: (msg: TranscriptAppendFrame) => void;
+  canSend?: () => boolean;
   chunkBytes?: number;
   /** 0 (default) = event-driven only. Tests may poll. */
   pollMs?: number;
@@ -61,6 +62,7 @@ function sendFile(
   fromOffset: number,
   send: TranscriptSyncOpts["send"],
   chunkBytes: number,
+  canSend: () => boolean,
 ): number {
   const path = join(projectsRoot, rel.split("/").join(sep));
   let size = 0;
@@ -71,6 +73,7 @@ function sendFile(
   }
   let offset = fromOffset > size ? 0 : fromOffset;
   while (offset < size) {
+    if (!canSend()) break;
     const n = Math.min(chunkBytes, size - offset);
     const buf = readBytes(path, offset, n);
     if (buf.length === 0) break;
@@ -109,8 +112,10 @@ export function startTranscriptSync(opts: TranscriptSyncOpts): TranscriptSync {
     }
   };
 
+  const canSend = opts.canSend ?? (() => true);
+
   const flushRel = (rel: string) => {
-    if (stopped || !isSafeTranscriptRel(rel)) return;
+    if (stopped || !isSafeTranscriptRel(rel) || !canSend()) return;
     const path = join(projectsRoot, rel.split("/").join(sep));
     if (!existsSync(path)) return;
     const size = fileSize(rel);
@@ -120,7 +125,7 @@ export function startTranscriptSync(opts: TranscriptSyncOpts): TranscriptSync {
       sent.set(rel, have);
       return;
     }
-    sent.set(rel, sendFile(projectsRoot, rel, have, opts.send, chunkBytes));
+    sent.set(rel, sendFile(projectsRoot, rel, have, opts.send, chunkBytes, canSend));
   };
 
   const adoptCursors = (client: TranscriptCursors) => {
@@ -142,7 +147,10 @@ export function startTranscriptSync(opts: TranscriptSyncOpts): TranscriptSync {
   const flush = (clientCursors?: TranscriptCursors) => {
     if (stopped) return;
     if (clientCursors) adoptCursors(clientCursors);
-    for (const rel of listProjectJsonl(projectsRoot)) flushRel(rel);
+    for (const rel of listProjectJsonl(projectsRoot)) {
+      if (!canSend()) break;
+      flushRel(rel);
+    }
   };
 
   const armIdle = () => {

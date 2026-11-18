@@ -35,6 +35,9 @@ export function startRelay() {
       return new Response("upgrade required", { status: 426 });
     },
     websocket: {
+      perMessageDeflate: true,
+      idleTimeout: 120,
+      sendPings: true,
       open(ws) {
         sockets.add(ws);
       },

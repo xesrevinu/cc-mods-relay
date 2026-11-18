@@ -21,6 +21,8 @@ export type ToolFrame = {
   agentId?: string;
   /** TUI host uid, so task files match `/tmp/claude-<uid>/...` on Mini. */
   tuiUid?: string | number;
+  /** Mini timezone/locale snapshot; overlaid onto local Bash so `date`/`locale` match the TUI host. */
+  tuiEnv?: Record<string, string>;
   cwd?: string;
   tuiRoot?: string;
   extraDirs?: string[];

@@ -413,3 +413,32 @@ test("instance.start mirrors host jsonl onto the client over the session socket"
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("startTranscriptSync pauses under backpressure and resumes on flush", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-bp-"));
+  const folder = join(dir, "projects", "-p");
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, "s.jsonl"), "abcdef");
+  let allow = true;
+  const sent: any[] = [];
+  const sync = startTranscriptSync({
+    claudeConfigDir: dir,
+    chunkBytes: 2,
+    watch: false,
+    idleMs: 0,
+    canSend: () => allow,
+    send: (frame) => {
+      sent.push(frame);
+      if (sent.length >= 2) allow = false;
+    },
+  });
+  try {
+    expect(sent.map((f) => f.offset)).toEqual([0, 2]);
+    allow = true;
+    sync.flush();
+    expect(sent.map((f) => f.offset)).toEqual([0, 2, 4]);
+  } finally {
+    sync.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

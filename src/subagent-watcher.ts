@@ -2,6 +2,7 @@ import type { SessionMessage } from "./engine-watcher.js";
 import {
   hasSubagentSpawn,
   sourceSubagentRows,
+  spawnIdsOpen,
   type ListSubagents,
   type GetSubagentMessages,
 } from "./subagent-source.js";
@@ -45,9 +46,10 @@ export function createSubagentWatcher(opts: SubagentWatcherOptions): SubagentWat
   const seen = new Set<string>();
   let stopped = false;
   let cancelPending: (() => void) | undefined;
+  let idleAfterClose = false;
 
   const arm = (): void => {
-    if (stopped) return;
+    if (stopped || cancelPending) return;
     cancelPending = schedule(() => {
       cancelPending = undefined;
       void poll();
@@ -55,8 +57,9 @@ export function createSubagentWatcher(opts: SubagentWatcherOptions): SubagentWat
   };
 
   const poll = async (): Promise<void> => {
+    const open = spawnIdsOpen(mainChain);
     try {
-      if (hasSubagentSpawn(mainChain)) {
+      if (hasSubagentSpawn(mainChain) && (open || !idleAfterClose)) {
         const rows = await sourceSubagentRows(sessionId, mainChain, {
           dir,
           listSubagents,
@@ -75,6 +78,11 @@ export function createSubagentWatcher(opts: SubagentWatcherOptions): SubagentWat
       }
     } catch {
     }
+    if (!open) {
+      idleAfterClose = true;
+      return;
+    }
+    idleAfterClose = false;
     if (!stopped) arm();
   };
 
@@ -83,6 +91,10 @@ export function createSubagentWatcher(opts: SubagentWatcherOptions): SubagentWat
   return {
     update(next: SessionMessage[]): void {
       mainChain = next;
+      if (spawnIdsOpen(next)) {
+        idleAfterClose = false;
+        if (!stopped && !cancelPending) arm();
+      }
     },
     stop(): void {
       if (stopped) return;

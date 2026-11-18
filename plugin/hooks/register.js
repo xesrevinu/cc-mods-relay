@@ -145,6 +145,107 @@ function xmlText(value) {
   return String(value ?? "").replace(/[<>&]/g, (ch) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[ch]));
 }
 
+function shellQuote(value) {
+  return "'" + String(value ?? "").replace(/'/g, `'\\''`) + "'";
+}
+
+function waiterId(callId) {
+  const raw = String(callId || "");
+  if (!raw) return "";
+  return raw.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+}
+
+function waiterDonePath(id) {
+  return "/tmp/cc-mods-wait/" + id + ".done";
+}
+
+function waiterOutPath(id) {
+  return "/tmp/cc-mods-wait/" + id + ".out";
+}
+
+/** Mini builtin must own a pid so origin is task-notification, not a plugin prompt. */
+function waiterScript(callId) {
+  const id = waiterId(callId);
+  const done = shellQuote(waiterDonePath(id));
+  const out = shellQuote(waiterOutPath(id));
+  return "mkdir -p /tmp/cc-mods-wait; while [ ! -f " + done + " ]; do sleep 0.2; done; cat " + out + " 2>/dev/null; IFS= read -r cc_mods_ex < " + done + " || cc_mods_ex=0; exit \"$cc_mods_ex\"";
+}
+
+function waiterEvent(e, script) {
+  const patched = { ...e, command: script, run_in_background: true };
+  if (e.tool_input && typeof e.tool_input === "object") {
+    patched.tool_input = { ...e.tool_input, command: script, run_in_background: true };
+  }
+  return patched;
+}
+
+function isBackgroundResult(result) {
+  return !!(result && typeof result === "object" && result.backgroundTaskId != null && String(result.backgroundTaskId));
+}
+
+async function writeWaiterFiles($, frame) {
+  const id = waiterId(frame.callId);
+  if (!id) return;
+  const code = Number.isFinite(Number(frame.exitCode)) ? String(Number(frame.exitCode)) : "0";
+  const text = typeof frame.output === "string" ? frame.output : "";
+  await $.process.run(["/bin/bash", "-c", "mkdir -p /tmp/cc-mods-wait && cat > " + shellQuote(waiterOutPath(id))], {
+    stdin: text,
+    timeoutMs: 5_000,
+  });
+  await $.process.run(["/bin/bash", "-c", "printf %s " + shellQuote(code) + " > " + shellQuote(waiterDonePath(id))], {
+    timeoutMs: 5_000,
+  });
+}
+
+async function deliverBackground($, frame, busy) {
+  if (frame.agentId) await flushPending($, frame.agentId);
+  const text = taskNotification(frame);
+  if (frame.agentId) {
+    if (await deliverTaskText($, text, frame.agentId) === "retry") enqueue($, text, frame.agentId);
+  } else if (busy) {
+    enqueue($, text);
+  } else if (await deliverTaskText($, text) === "retry") {
+    enqueue($, text);
+  }
+}
+
+async function miniHasPath($, path) {
+  if (!path) return false;
+  try {
+    const ran = await $.process.run(["test", "-e", path], { timeoutMs: 2_000 });
+    return ran.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+function mergeBackgroundResult(client, waiter) {
+  if (!waiter || typeof waiter !== "object" || !waiter.result || typeof waiter.result !== "object") return waiter;
+  if (!client || typeof client !== "object") return waiter;
+  const merged = { ...waiter.result };
+  if (client.timedOutAfterMs !== undefined) {
+    merged.timedOutAfterMs = client.timedOutAfterMs;
+    if (typeof client.stdout === "string") merged.stdout = client.stdout;
+    if (typeof client.stderr === "string") merged.stderr = client.stderr;
+  } else if (typeof client.stderr === "string" && client.stderr && !merged.stderr) {
+    merged.stderr = client.stderr;
+  }
+  if (typeof client.backgroundCwdHint === "string" && client.backgroundCwdHint) {
+    merged.backgroundCwdHint = client.backgroundCwdHint;
+  }
+  return { ...waiter, result: merged };
+}
+
+function dropCallMappings(callId) {
+  if (!callId) return;
+  for (const [taskId, cid] of waiterTasks) {
+    if (cid === callId) waiterTasks.delete(taskId);
+  }
+  for (const [taskId, cid] of monitorTasks) {
+    if (cid === callId) monitorTasks.delete(taskId);
+  }
+}
+
 async function sessionIdOf($, e) {
   try {
     const value = await $.session.id();
@@ -255,7 +356,38 @@ function monitorNotification(frame) {
   ].join("\n");
 }
 
+let rpcSocket = "";
+let rpcSeq = 0;
+
 async function rpc($, frame, timeoutMs) {
+  if (rpcSocket && frame.type !== "hello") {
+    const deadline = Date.now() + (timeoutMs || 60_000);
+    try {
+      let res = await $.http.fetch("http://tools/rpc", {
+        socketPath: rpcSocket,
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: payload(frame),
+      });
+      if (res.status === 200 || res.status === 502) {
+        let parsed = JSON.parse(res.text);
+        while (parsed && parsed.pending === true) {
+          if (Date.now() >= deadline) throw new Error("RPC timed out");
+          res = await $.http.fetch("http://tools/wait", {
+            socketPath: rpcSocket,
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ callId: parsed.callId || frame.callId || frame.id }),
+          });
+          if (res.status !== 200 && res.status !== 502) throw new Error("wait HTTP " + res.status);
+          parsed = JSON.parse(res.text);
+        }
+        return parsed;
+      }
+    } catch (error) {
+      if (error && String(error.message) === "RPC timed out") throw error;
+    }
+  }
   const ran = await $.process.run(helperArgv(), { stdin: payload(frame), timeoutMs });
   const text = (ran.stdout || "").trim();
   if (!text) throw new Error(ran.stderr || `helper exit ${ran.exitCode}`);
@@ -284,28 +416,95 @@ async function modSocket($) {
   }
 }
 
+const emitQueue = [];
+let emitBusy = false;
+let emitScheduled = false;
+
+function coalesceEvents(items) {
+  const out = [];
+  for (const ev of items) {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      ev &&
+      prev.type === "chunk" &&
+      ev.type === "chunk" &&
+      prev.kind === ev.kind &&
+      prev.parentToolUseId === ev.parentToolUseId &&
+      typeof prev.text === "string" &&
+      typeof ev.text === "string"
+    ) {
+      prev.text += ev.text;
+    } else {
+      out.push(ev && typeof ev === "object" ? { ...ev } : ev);
+    }
+  }
+  return out;
+}
+
+async function pumpEvents($, socketPath) {
+  if (!socketPath || emitBusy) return;
+  emitBusy = true;
+  try {
+    while (emitQueue.length) {
+      const batch = coalesceEvents(emitQueue.splice(0));
+      try {
+        await $.http.fetch("http://adapter/events", {
+          socketPath,
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ events: batch }),
+        });
+      } catch {
+        /* adapter gone */
+      }
+    }
+  } finally {
+    emitBusy = false;
+  }
+}
+
 function emit($, socketPath, event) {
-  if (!socketPath) return;
-  void $.http.fetch("http://adapter/events", {
-    socketPath,
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ events: [event] }),
-  }).catch(() => {});
+  if (!socketPath || !event) return;
+  emitQueue.push(event);
+  if (event.type === "chunk") {
+    if (!emitBusy && !emitScheduled) {
+      emitScheduled = true;
+      void after($, 16).then(() => {
+        emitScheduled = false;
+        void pumpEvents($, socketPath);
+      });
+    }
+    return;
+  }
+  void pumpEvents($, socketPath);
 }
 
 const pending = [];
+const waiters = new Set();
+const skippedNotify = new Map();
+const waiterTasks = new Map();
+const monitorTasks = new Map();
 let flushing = false;
 const mainInflight = new Set();
+const replStack = [];
 let sawReplThisTurn = false;
+let replDispatchedThisTurn = false;
 let completeGen = 0;
 let pendingComplete = null;
 let currentTurnId = "";
+
+function isReplDispatch(result) {
+  if (result == null) return false;
+  const text = typeof result === "string" ? result : JSON.stringify(result);
+  return /\(dispatched\b|dispatched #\d+/i.test(text);
+}
 
 function resetPendingComplete() {
   completeGen++;
   pendingComplete = null;
   sawReplThisTurn = false;
+  replDispatchedThisTurn = false;
   mainInflight.clear();
 }
 
@@ -314,6 +513,7 @@ function flushTurnComplete($, sock) {
   pendingComplete = null;
   if (!payload) return;
   sawReplThisTurn = false;
+  replDispatchedThisTurn = false;
   emit($, sock, {
     type: "turn_completed",
     reason: payload.reason,
@@ -337,7 +537,7 @@ function settleTurnComplete($, sock) {
   const gen = ++completeGen;
   const payload = pendingComplete;
   if (!payload) return;
-  if (!sawReplThisTurn && mainInflight.size === 0) {
+  if (!replDispatchedThisTurn && mainInflight.size === 0 && replStack.length === 0) {
     flushTurnComplete($, sock);
     return;
   }
@@ -426,7 +626,6 @@ export function register(on) {
   let claudeSessionId = "";
   let tuiUid = "";
   const spawnToolUse = new Map();
-  const replStack = [];
 
   function pushRepl(id) {
     if (typeof id !== "string" || !id) return;
@@ -436,6 +635,12 @@ export function register(on) {
 
   on("session.start", async ($, e, next) => {
     resetPendingComplete();
+    emitQueue.length = 0;
+    emitScheduled = false;
+    waiters.clear();
+    skippedNotify.clear();
+    waiterTasks.clear();
+    monitorTasks.clear();
     replStack.length = 0;
     claudeSessionId = await sessionIdOf($, e);
     tuiUid = await tuiUidOf($);
@@ -454,9 +659,10 @@ export function register(on) {
       extraDirs = Array.isArray(ENDPOINT.extraDirs) ? ENDPOINT.extraDirs : [];
     }
     try {
+      rpcSocket = "/tmp/cc-mods-rpc-" + String(Date.now()).slice(-7) + "-" + String(++rpcSeq) + ".sock";
       await rpcRetry($, { type: "hello" }, 8_000, 8);
       void (async () => {
-        const listen = $.process.spawn({ argv: helperArgv(), input: payload({ type: "listen" }) });
+        const listen = $.process.spawn({ argv: helperArgv(), input: payload({ type: "listen", rpcSocket }) });
         let buf = "";
         for await (const chunk of listen) {
           if (chunk.stream !== "stdout") continue;
@@ -468,17 +674,18 @@ export function register(on) {
             if (!line) continue;
             const frame = JSON.parse(line);
             if (frame.type === "notify" && frame.kind === "background" && frame.status === "exited") {
-              if (frame.agentId) await flushPending($, frame.agentId);
-              const text = taskNotification(frame);
-              if (frame.agentId) {
-                if (await deliverTaskText($, text, frame.agentId) === "retry") enqueue($, text, frame.agentId);
-              } else if (mainBusy) {
-                enqueue($, text);
-              } else if (await deliverTaskText($, text) === "retry") {
-                enqueue($, text);
+              const callId = String(frame.callId || "");
+              dropCallMappings(callId);
+              try { await writeWaiterFiles($, frame); } catch { /* waiter may still be starting */ }
+              if (callId && waiters.has(callId)) {
+                waiters.delete(callId);
+                skippedNotify.set(callId, frame);
+                continue;
               }
+              await deliverBackground($, frame, mainBusy);
             }
             if (frame.type === "notify" && frame.kind === "monitor") {
+              if (frame.status === "exited" || frame.status === "expired") dropCallMappings(String(frame.callId || ""));
               if (frame.agentId) await flushPending($, frame.agentId);
               const text = monitorNotification(frame);
               if (frame.agentId) {
@@ -599,9 +806,14 @@ export function register(on) {
     try {
     if (isLocalTool(e.tool)) {
       let frame;
+      if (e.tool === "Bash" && input.run_in_background === true && typeof toolUseId === "string" && toolUseId) {
+        waiters.add(toolUseId);
+      }
       try {
-        const liveSession = await sessionIdOf($, e);
-        if (liveSession) claudeSessionId = liveSession;
+        if (!claudeSessionId) {
+          const liveSession = await sessionIdOf($, e);
+          if (liveSession) claudeSessionId = liveSession;
+        }
         frame = await rpc($, {
           type: "call",
           id: toolUseId,
@@ -613,37 +825,92 @@ export function register(on) {
           tuiUid,
         }, 600_000);
       } catch (error) {
+        if (typeof toolUseId === "string" && toolUseId) waiters.delete(toolUseId);
         try { await rpc($, { type: "cancel", callId: toolUseId }, 5_000); } catch { /* already gone */ }
         const message = error && error.message ? String(error.message) : String(error);
         finish(true, undefined, message);
         return failResult(message);
       }
       if (!frame || !frame.ok) {
+        if (typeof toolUseId === "string" && toolUseId) waiters.delete(toolUseId);
         const code = frame && frame.error && frame.error.code ? String(frame.error.code) : "ERROR";
         const message = frame && frame.error && frame.error.message ? String(frame.error.message) : "Tool failed";
         if (permissionDenied(code)) {
           finish(true, undefined, `${code}: ${message}`);
           return failResult(`${code}: ${message}`);
         }
-        // Mac already confirmed ENOENT. Let Mini's builtin Read set core isError
-        // (a hook cannot author that form; returning it unloads us).
+        // Mac already confirmed ENOENT. Let Mini's builtin Read set core isError,
+        // unless Mini still has a stale file at that path (synced CLAUDE.md, /tmp, ~/.claude).
         if (e.tool === "Read" && /File does not exist:/i.test(message)) {
-          const ran = await next(e);
-          finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result, message);
-          return ran;
+          const path = typeof input.file_path === "string" ? input.file_path : "";
+          if (!(await miniHasPath($, path))) {
+            const ran = await next(e);
+            finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result, message);
+            return ran;
+          }
         }
         const result = errorResult(e.tool, message, input);
         finish(true, result, message);
         return { result };
       }
       if (frame.result === undefined) {
+        if (typeof toolUseId === "string" && toolUseId) waiters.delete(toolUseId);
         const result = errorResult(e.tool, "empty tool result", input);
         finish(true, result, "empty tool result");
         return { result };
       }
+      if (e.tool === "Bash" && isBackgroundResult(frame.result) && typeof toolUseId === "string" && toolUseId) {
+        waiters.add(toolUseId);
+        try {
+          const ran = await next(waiterEvent(e, waiterScript(toolUseId)));
+          if (ran && ran.deny === undefined) {
+            skippedNotify.delete(toolUseId);
+            const merged = mergeBackgroundResult(frame.result, ran);
+            const miniId = merged.result && merged.result.backgroundTaskId != null ? String(merged.result.backgroundTaskId) : "";
+            if (miniId) waiterTasks.set(miniId, toolUseId);
+            finish(merged.isError === true, merged.result, merged.deny);
+            return merged;
+          }
+        } catch { /* fall back to plugin prompt */ }
+        waiters.delete(toolUseId);
+        const skipped = skippedNotify.get(toolUseId);
+        if (skipped) {
+          skippedNotify.delete(toolUseId);
+          try { await deliverBackground($, skipped, mainBusy); } catch { /* retry timer */ }
+        }
+      } else if (typeof toolUseId === "string" && toolUseId) {
+        waiters.delete(toolUseId);
+      }
+      if (e.tool === "Monitor" && frame.result && typeof frame.result === "object" && frame.result.taskId && typeof toolUseId === "string" && toolUseId) {
+        monitorTasks.set(String(frame.result.taskId), toolUseId);
+      }
       const result = objectResult(e.tool, frame.result, input);
       finish(false, result);
       return { result };
+    }
+
+    if (e.tool === "TaskStop") {
+      const taskId = typeof input.task_id === "string" && input.task_id
+        ? input.task_id
+        : typeof input.shell_id === "string"
+          ? input.shell_id
+          : "";
+      if (taskId && waiterTasks.has(taskId)) {
+        const callId = waiterTasks.get(taskId);
+        waiterTasks.delete(taskId);
+        try { await rpc($, { type: "cancel", callId }, 5_000); } catch { /* already exited */ }
+        const ran = await next(e);
+        finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result, ran.deny);
+        return ran;
+      }
+      if (taskId && monitorTasks.has(taskId)) {
+        const callId = monitorTasks.get(taskId);
+        monitorTasks.delete(taskId);
+        try { await rpc($, { type: "cancel", callId }, 5_000); } catch { /* already exited */ }
+        const result = { message: "Stopped monitor task " + taskId, task_id: taskId, task_type: "monitor", command: "" };
+        finish(false, result);
+        return { result };
+      }
     }
 
     if (HYDRATE_TOOLS.has(e.tool) && typeof input.file_path === "string" && input.file_path) {
@@ -660,6 +927,9 @@ export function register(on) {
     }
 
     const ran = await next(e);
+    if (e.tool === "REPL" && ran && ran.deny === undefined && ran.isError !== true && isReplDispatch(ran.result)) {
+      replDispatchedThisTurn = true;
+    }
     finish(
       ran.deny !== undefined || ran.isError === true,
       ran.deny !== undefined ? undefined : ran.result,
@@ -677,6 +947,7 @@ export function register(on) {
     if (e.tool === "REPL" && replStack.length && replStack[replStack.length - 1] === e.tool_use_id) {
       replStack.pop();
     }
+    if (typeof e.tool_use_id === "string" && e.tool_use_id) waiters.delete(e.tool_use_id);
     if (isLocalTool(e.tool) && !next.called) {
       try { await rpc($, { type: "cancel", callId: e.tool_use_id }, 5_000); } catch { /* already gone */ }
       return failResult("Tool call was cancelled");
@@ -686,6 +957,12 @@ export function register(on) {
 
   on("turn.complete", async ($, e, next) => {
     if (e.isAborted) {
+      if (!e.agentId) {
+        waiters.clear();
+        skippedNotify.clear();
+        waiterTasks.clear();
+        monitorTasks.clear();
+      }
       try {
         await rpc($, e.agentId ? { type: "cancel", agentId: e.agentId } : { type: "cancel" }, 5_000);
       } catch { /* already gone */ }

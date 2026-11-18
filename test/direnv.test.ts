@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyDirenvDump, withDirenv } from "../src/tools/direnv.js";
+import { applyDirenvDump, clearDirenvCacheForTests, withDirenv } from "../src/tools/direnv.js";
 import { execute } from "../src/exec.js";
 
 function run(dir: string, command: string, sessionId = "direnv-sess") {
@@ -77,4 +77,25 @@ test("Bash still runs when .envrc is blocked", async () => {
   expect(frame.ok).toBe(true);
   expect(frame.result.stdout).toContain("missing");
   expect(frame.result.stdout).toContain(realpathSync(dir));
+});
+
+test("withDirenv caches unchanged .envrc and invalidates when .envrc changes", async () => {
+  if (!direnv) return;
+  clearDirenvCacheForTests();
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-direnv-cache-"));
+  const envrc = join(dir, ".envrc");
+  writeFileSync(envrc, "export CC_MODS_DIRENV_CACHE=v1\n");
+  Bun.spawnSync([direnv, "allow", dir], { cwd: dir, stderr: "pipe" });
+  try {
+    const first = await withDirenv(dir, { ...process.env });
+    expect(first.CC_MODS_DIRENV_CACHE).toBe("v1");
+    // Ensure mtime advances before rewriting .envrc.
+    await Bun.sleep(20);
+    writeFileSync(envrc, "export CC_MODS_DIRENV_CACHE=v2\n");
+    Bun.spawnSync([direnv, "allow", dir], { cwd: dir, stderr: "pipe" });
+    const second = await withDirenv(dir, { ...process.env });
+    expect(second.CC_MODS_DIRENV_CACHE).toBe("v2");
+  } finally {
+    Bun.spawnSync([direnv, "deny", dir], { cwd: dir, stderr: "pipe" });
+  }
 });

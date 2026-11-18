@@ -145,7 +145,8 @@ export function tuiInputReady(snap: string): boolean {
     snap.includes("Do you want to use this API key") ||
     snap.includes("Yes, I accept") ||
     snap.includes("Let's get started") ||
-    snap.includes("Press Enter to continue")
+    snap.includes("Press Enter to continue") ||
+    snap.includes("Try the new fullscreen renderer?")
   ) {
     return false;
   }
@@ -279,6 +280,12 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
             herdr("pane", "send-keys", paneId, "enter");
           } catch { /* pane gone */ }
           acceptedBypass = true;
+        } else if (lastSnap.includes("Try the new fullscreen renderer?") && Date.now() - lastEnter > 1500) {
+          try {
+            herdr("pane", "send-keys", paneId, "down");
+            herdr("pane", "send-keys", paneId, "enter");
+          } catch { /* pane gone */ }
+          lastEnter = Date.now();
         } else if (lastSnap.includes("Press Enter to continue") && Date.now() - lastEnter > 1500) {
           try { herdr("pane", "send-keys", paneId, "enter"); } catch { /* pane gone */ }
           lastEnter = Date.now();
@@ -307,17 +314,20 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
     let killed = false;
     let lastRead = "";
     let tuiPid = 0;
-    let poll: ReturnType<typeof setInterval> | undefined;
-    let watch: ReturnType<typeof setInterval> | undefined;
+    let poll: ReturnType<typeof setTimeout> | undefined;
+    let watch: ReturnType<typeof setTimeout> | undefined;
     let unregister = (): void => {};
+    let lastActivityAt = Date.now();
+    const idlePollMs = Math.max(pollMs, Math.min(1_000, pollMs * 4));
+    const currentDelay = () => (Date.now() - lastActivityAt > 1_500 ? idlePollMs : pollMs);
 
     const stopTimers = (): void => {
       if (poll !== undefined) {
-        clearInterval(poll);
+        clearTimeout(poll);
         poll = undefined;
       }
       if (watch !== undefined) {
-        clearInterval(watch);
+        clearTimeout(watch);
         watch = undefined;
       }
     };
@@ -346,20 +356,25 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
 
     const startPanePoll = (): void => {
       if (poll !== undefined || exited) return;
-      poll = setInterval(() => {
-        if (exited || dataListeners.size === 0) return;
-        const snap = readPane();
-        if (snap && snap !== lastRead) {
-          let delta = snap;
-          if (snap.startsWith(lastRead)) delta = snap.slice(lastRead.length);
-          lastRead = snap;
-          if (delta) for (const l of dataListeners) l(delta);
+      const tick = () => {
+        if (exited) return;
+        if (dataListeners.size > 0) {
+          const snap = readPane();
+          if (snap && snap !== lastRead) {
+            lastActivityAt = Date.now();
+            let delta = snap;
+            if (snap.startsWith(lastRead)) delta = snap.slice(lastRead.length);
+            lastRead = snap;
+            if (delta) for (const l of dataListeners) l(delta);
+          }
         }
-      }, pollMs);
+        if (!exited) poll = setTimeout(tick, currentDelay());
+      };
+      poll = setTimeout(tick, pollMs);
     };
 
     let seenClaude = false;
-    watch = setInterval(() => {
+    const watchTick = () => {
       if (exited) return;
       try {
         const info = herdr("pane", "process-info", "--pane", paneId);
@@ -385,7 +400,9 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
           markExit({ exitCode: killed ? 1 : 0 });
         }
       }
-    }, pollMs);
+      if (!exited) watch = setTimeout(watchTick, currentDelay());
+    };
+    watch = setTimeout(watchTick, pollMs);
 
     function reapForeground(signal: NodeJS.Signals): void {
       for (const pid of seenPids) signalPidTree(pid, signal);
@@ -426,6 +443,7 @@ export function createHerdrSpawn(factoryOpts: HerdrSpawnFactoryOptions = {}): Te
       },
       write(data: string): void {
         if (exited) return;
+        lastActivityAt = Date.now();
         if (data.length === 1) {
           const keys = keyForControlByte(data);
           if (keys) {

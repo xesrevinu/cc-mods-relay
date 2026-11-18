@@ -37,6 +37,10 @@ type CtrlFrame = {
   home?: string;
   tuiRoot?: string;
   extraDirs?: unknown;
+  tuiEnv?: unknown;
+  reconnectGraceMs?: unknown;
+  instanceId?: unknown;
+  resumeToken?: unknown;
   env?: unknown;
   files?: unknown;
   homeFiles?: unknown;
@@ -56,6 +60,11 @@ type Instance = {
   cwd: string;
   tuiRoot: string;
   extraDirs: string[];
+  tuiEnv?: Record<string, string>;
+  reconnectGraceMs?: number;
+  resumeToken?: string;
+  graceTimer?: ReturnType<typeof setTimeout>;
+  outboundBuffer?: unknown[];
   client: ServerWebSocket<SocketData>;
   pluginSockets: Set<ServerWebSocket<SocketData>>;
   pendingCalls: Map<string, ServerWebSocket<SocketData>>;
@@ -88,7 +97,7 @@ function rmTree(dir: string) {
 }
 
 function sendJson(ws: ServerWebSocket<SocketData>, msg: unknown) {
-  if (ws.data?.alive === false) return;
+  if (ws.data?.alive === false || ws.readyState !== 1) return;
   try {
     ws.send(JSON.stringify(msg));
   } catch {
@@ -149,13 +158,30 @@ export function startServer(opts: ServeOpts) {
   const byPluginToken = new Map<string, string>();
   const lifetimes = new Set<Promise<void>>();
 
-  const sendClient = (inst: Instance, msg: unknown) => sendJson(inst.client, msg);
+  const sendClient = (inst: Instance, msg: unknown) => {
+    if (inst.client.data?.alive !== false && inst.client.readyState === 1) {
+      sendJson(inst.client, msg);
+      return;
+    }
+    if (inst.graceTimer && !inst.closing) {
+      const kind = (msg as { type?: string } | null)?.type;
+      if (kind === "transcript.append") return;
+      const buf = (inst.outboundBuffer ??= []);
+      if (buf.length >= 256) buf.shift();
+      buf.push(msg);
+    }
+  };
 
   const live = (inst: Instance) => instances.get(inst.id) === inst && !inst.closing;
 
   const teardown = (inst: Instance): Promise<void> => {
     if (inst.closing) return inst.closed ?? Promise.resolve();
     inst.closing = true;
+    if (inst.graceTimer) {
+      clearTimeout(inst.graceTimer);
+      inst.graceTimer = undefined;
+    }
+    inst.outboundBuffer = undefined;
     instances.delete(inst.id);
     byPluginToken.delete(inst.pluginToken);
     if (inst.client.data.instanceId === inst.id) inst.client.data.instanceId = undefined;
@@ -207,17 +233,22 @@ export function startServer(opts: ServeOpts) {
     if (tuiRoot !== cwd) {
       debug("TUI cwd is not the client cwd (mkdir of client path failed)", { cwd, tuiRoot });
     }
-    writeSessionFiles(tuiRoot, filesOf(frame.files));
-    writeHomeFiles(homedir(), filesOf(frame.homeFiles));
+    if (Array.isArray(frame.files)) writeSessionFiles(tuiRoot, filesOf(frame.files));
+    if (Array.isArray(frame.homeFiles)) writeHomeFiles(homedir(), filesOf(frame.homeFiles));
     const transcriptCursors = parseTranscriptCursors(frame.transcriptCursors);
     const id = randomUUID();
     const pluginToken = randomUUID();
+    const rawGrace = typeof frame.reconnectGraceMs === "number" && Number.isFinite(frame.reconnectGraceMs)
+      ? Math.max(0, Math.min(60_000, frame.reconnectGraceMs))
+      : 0;
+    const resumeToken = rawGrace > 0 ? randomUUID() : undefined;
     const inst: Instance = {
       id,
       pluginToken,
       cwd,
       tuiRoot,
       extraDirs,
+      ...(rawGrace > 0 ? { reconnectGraceMs: rawGrace, resumeToken } : {}),
       client: ws,
       pluginSockets: new Set(),
       pendingCalls: new Map(),
@@ -235,6 +266,7 @@ export function startServer(opts: ServeOpts) {
         claudeConfigDir: opts.claudeConfigDir ?? claudeConfigDir(),
         cursors: transcriptCursors,
         send: (msg) => sendClient(inst, msg),
+        canSend: () => inst.client.readyState === 1 && inst.client.getBufferedAmount() <= 1_024 * 1024,
         idleMs: opts.idleMs,
       });
     };
@@ -244,7 +276,14 @@ export function startServer(opts: ServeOpts) {
       if (!live(inst)) return;
 
       if (!boot) {
-        sendJson(ws, { v: 1, type: "instance.ready", instanceId: id, cwd, tuiRoot });
+        sendJson(ws, {
+          v: 1,
+          type: "instance.ready",
+          instanceId: id,
+          cwd,
+          tuiRoot,
+          ...(resumeToken ? { resumeToken } : {}),
+        });
         attachTranscript();
         return;
       }
@@ -282,7 +321,14 @@ export function startServer(opts: ServeOpts) {
         await teardown(inst);
         return;
       }
-      sendJson(ws, { v: 1, type: "instance.ready", instanceId: id, cwd, tuiRoot });
+      sendJson(ws, {
+        v: 1,
+        type: "instance.ready",
+        instanceId: id,
+        cwd,
+        tuiRoot,
+        ...(resumeToken ? { resumeToken } : {}),
+      });
       attachTranscript();
     } catch (error) {
       await teardown(inst);
@@ -329,6 +375,37 @@ export function startServer(opts: ServeOpts) {
       });
       return;
     }
+    if (frame.type === "instance.attach") {
+      const targetId = typeof frame.instanceId === "string" ? frame.instanceId : "";
+      const inst = targetId ? instances.get(targetId) : undefined;
+      if (!inst || inst.closing || !inst.resumeToken || frame.resumeToken !== inst.resumeToken) {
+        sendJson(ws, { v: 1, type: "instance.error", error: { code: "ATTACH_REJECTED", message: "unknown or expired instance" } });
+        return;
+      }
+      if (inst.graceTimer) {
+        clearTimeout(inst.graceTimer);
+        inst.graceTimer = undefined;
+      }
+      if (inst.client !== ws && inst.client.data.instanceId === inst.id) {
+        inst.client.data.instanceId = undefined;
+        try { inst.client.close(1000, "superseded"); } catch { /* ignore */ }
+      }
+      inst.client = ws;
+      ws.data.instanceId = inst.id;
+      sendJson(ws, {
+        v: 1,
+        type: "instance.ready",
+        instanceId: inst.id,
+        cwd: inst.cwd,
+        tuiRoot: inst.tuiRoot,
+        resumeToken: inst.resumeToken,
+        reattached: true,
+      });
+      const queued = inst.outboundBuffer?.splice(0) ?? [];
+      for (const item of queued) sendJson(ws, item);
+      inst.transcript?.flush();
+      return;
+    }
     const inst = ws.data.instanceId ? instances.get(ws.data.instanceId) : undefined;
     if (!inst) {
       sendJson(ws, { v: 1, type: "instance.error", error: { code: "NO_INSTANCE", message: "instance.start required" } });
@@ -345,7 +422,9 @@ export function startServer(opts: ServeOpts) {
       return;
     }
     if (frame.type === "notify") {
-      for (const plugin of inst.pluginSockets) sendJson(plugin, msg);
+      const listeners = [...inst.pluginSockets].filter((p) => p.data.listen);
+      const targets = listeners.length ? listeners : [...inst.pluginSockets];
+      for (const plugin of targets) sendJson(plugin, msg);
       return;
     }
     if (frame.type === "transcript.flush") {
@@ -367,6 +446,9 @@ export function startServer(opts: ServeOpts) {
       ws.data.authed = true;
       ws.data.instanceId = inst.id;
       inst.pluginSockets.add(ws);
+      if (frame.tuiEnv && typeof frame.tuiEnv === "object" && !Array.isArray(frame.tuiEnv)) {
+        inst.tuiEnv = envOf(frame.tuiEnv);
+      }
       sendJson(ws, { v: 1, type: "hello", ok: true });
       debug("plugin hello", { instanceId: inst.id });
       return;
@@ -396,6 +478,7 @@ export function startServer(opts: ServeOpts) {
         cwd: frame.cwd || inst.cwd,
         tuiRoot: frame.tuiRoot || inst.tuiRoot,
         extraDirs: extraDirsOf(frame.extraDirs).length ? extraDirsOf(frame.extraDirs) : inst.extraDirs,
+        ...(frame.tuiEnv === undefined && inst.tuiEnv ? { tuiEnv: inst.tuiEnv } : {}),
         sessionId: frame.sessionId || inst.id,
       });
       return;
@@ -445,7 +528,16 @@ export function startServer(opts: ServeOpts) {
       return new Response("not found", { status: 404 });
     },
     websocket: {
+      perMessageDeflate: true,
+      idleTimeout: 120,
+      sendPings: true,
       open() {},
+      drain(ws) {
+        if (ws.data.role === "client" && ws.data.instanceId) {
+          const inst = instances.get(ws.data.instanceId);
+          inst?.transcript?.flush();
+        }
+      },
       message(ws, data) {
         let msg: unknown;
         try {
@@ -457,11 +549,22 @@ export function startServer(opts: ServeOpts) {
         if (ws.data.role === "client") handleClient(ws, msg);
         else handlePlugin(ws, msg);
       },
-      close(ws) {
+      close(ws, code) {
         ws.data.alive = false;
         if (ws.data.role === "client" && ws.data.instanceId) {
           const inst = instances.get(ws.data.instanceId);
-          if (inst && inst.client === ws) void teardown(inst);
+          if (inst && inst.client === ws) {
+            if (code !== 1000 && inst.reconnectGraceMs && inst.reconnectGraceMs > 0 && !inst.closing) {
+              if (inst.graceTimer) clearTimeout(inst.graceTimer);
+              inst.graceTimer = setTimeout(() => {
+                inst.graceTimer = undefined;
+                void teardown(inst);
+              }, inst.reconnectGraceMs);
+              inst.graceTimer.unref?.();
+            } else {
+              void teardown(inst);
+            }
+          }
           return;
         }
         if (ws.data.role === "plugin" && ws.data.instanceId) {

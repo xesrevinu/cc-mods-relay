@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createBunPtySpawn } from "../src/bun-pty-backend.js";
-import { createHerdrSpawn, tuiResumeFailed } from "../src/herdr-backend.js";
+import { createHerdrSpawn, tuiInputReady, tuiResumeFailed } from "../src/herdr-backend.js";
 import { buildClaudeCmd } from "../src/engine-pty.js";
 import { pidAlive } from "../src/tui-lifetime.js";
 
@@ -129,4 +129,9 @@ test("herdr closes the workspace after every seen TUI pid is dead", async () => 
   const start = Date.now();
   while (!closed && Date.now() - start < 1_000) await Bun.sleep(20);
   expect(closed).toBe(true);
+});
+
+test("tuiInputReady blocks on the fullscreen renderer prompt", () => {
+  expect(tuiInputReady("auto mode on (shift+tab to cycle)")).toBe(true);
+  expect(tuiInputReady("Try the new fullscreen renderer? · auto mode on (shift+tab to cycle)")).toBe(false);
 });

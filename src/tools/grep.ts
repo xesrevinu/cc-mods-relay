@@ -27,6 +27,7 @@ function argv(input: Record<string, unknown>, mode: Mode, path: string): string[
   if (rg) {
     return [
       rg, "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-columns", "500",
+      ...(mode === "content" || mode === "count" ? ["--with-filename"] : []),
       ...flags,
       ...(asBool(input.multiline) ? ["-U", "--multiline-dotall"] : []),
       ...(asString(input.glob) ? ["--glob", asString(input.glob)] : []),
@@ -37,10 +38,21 @@ function argv(input: Record<string, unknown>, mode: Mode, path: string): string[
   if (!grep) throw new Error("Grep needs ripgrep (rg) or grep on PATH");
   return [
     grep, "-r", "-E", "-I", "--exclude-dir=.git", "--exclude-dir=node_modules",
+    ...(mode === "content" || mode === "count" ? ["-H"] : []),
     ...flags,
     ...(asString(input.glob) ? [`--include=${asString(input.glob)}`] : []),
     "-e", asString(input.pattern), "--", path,
   ];
+}
+
+function contentFilename(line: string, numbered: boolean): string | undefined {
+  if (line === "--") return undefined;
+  if (numbered) {
+    const match = line.match(/^(.+?)(?::\d+:|-\d+-)/);
+    if (match) return match[1];
+  }
+  const idx = line.indexOf(":");
+  return idx >= 0 ? line.slice(0, idx) : line;
 }
 
 export async function grepTool(
@@ -79,7 +91,20 @@ export async function grepTool(
   const unlimited = head === 0;
   const limit = unlimited ? undefined : (head ?? 250);
   const sliced = lines.slice(offset, limit === undefined ? undefined : offset + limit);
-  const filenames = [...new Set(sliced.map((line) => (mode === "content" ? line.split(":", 1)[0]! : mode === "count" ? line.replace(/:\d+$/, "") : line)))];
+  const numbered = asBool(input["-n"]) !== false;
+  const filenames = [
+    ...new Set(
+      sliced
+        .map((line) =>
+          mode === "content"
+            ? contentFilename(line, numbered)
+            : mode === "count"
+              ? line.replace(/:\d+$/, "")
+              : line,
+        )
+        .filter((f): f is string => Boolean(f)),
+    ),
+  ];
   return {
     mode,
     numFiles: filenames.length,

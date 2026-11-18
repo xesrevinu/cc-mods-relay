@@ -253,6 +253,22 @@ export function mapExplicitHomePath(
   }
 }
 
+/** Read-only SDK and toolchain locations (`Grep` Xcode headers, nix, homebrew). Never writable. */
+export function readToolchainDirs(): string[] {
+  if (process.platform === "win32") return [];
+  const dirs = ["/nix/store", "/opt/homebrew", "/usr/local", "/usr/include", "/usr/share", "/usr/lib"];
+  if (process.platform === "darwin") dirs.push("/Applications", "/Library/Developer", "/System/Library");
+  return dirs.map((d) => resolve(d));
+}
+
+function underToolchain(abs: string): string | undefined {
+  for (const dir of readToolchainDirs()) {
+    const hit = under(dir, abs);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
 /** Read/Grep/Glob/hydrate/SendFile. */
 export function mapReadPath(
   cwd: string,
@@ -261,7 +277,15 @@ export function mapReadPath(
   extraDirs: string[] = [],
   project?: string,
 ): string {
-  return mapExplicitHomePath(cwd, tuiRoot, path, extraDirs, project);
+  try {
+    return mapExplicitHomePath(cwd, tuiRoot, path, extraDirs, project);
+  } catch (error) {
+    if (!isAbsolute(path)) throw error;
+    const abs = resolve(rewriteRemotePath(path, project || cwd, tuiRoot));
+    const hit = underToolchain(abs);
+    if (hit) return hit;
+    throw error;
+  }
 }
 
 /** Workspace, extraDirs, and scratch — the roots Bash may persist as session cwd for later Write. */

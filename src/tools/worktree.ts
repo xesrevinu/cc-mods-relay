@@ -68,7 +68,7 @@ export async function enterWorktreeTool(
     const abs = real(mapCwd(workspace, frame.tuiRoot, pathIn, roots, workspace));
     const hit = trees.find((t) => real(t.path) === abs);
     if (!hit) throw new Error(`Path is not in git worktree list: ${abs}`);
-    persistCwd(workspace, sessionId, abs, roots, true);
+    persistCwd(workspace, sessionId, abs, roots, true, frame.agentId);
     states.set(sessionId, { originalCwd: workspace, worktreePath: abs, worktreeBranch: hit.branch, created: false });
     return {
       worktreePath: abs,
@@ -85,7 +85,7 @@ export async function enterWorktreeTool(
   if (ran.code !== 0) {
     throw new Error((ran.stderr || ran.stdout || "git worktree add failed").trim());
   }
-  persistCwd(workspace, sessionId, dest, roots, true);
+  persistCwd(workspace, sessionId, dest, roots, true, frame.agentId);
   states.set(sessionId, { originalCwd: workspace, worktreePath: dest, created: true });
   return { worktreePath: dest, message: `Created and entered worktree ${dest}` };
 }
@@ -111,7 +111,7 @@ export async function exitWorktreeTool(
     const removed = await git(workspace, ["worktree", "remove", ...(asBool(input.discard_changes) ? ["--force"] : []), worktreePath]);
     if (removed.code !== 0) throw new Error((removed.stderr || removed.stdout || "git worktree remove failed").trim());
   }
-  resetSessionCwd(sessionId);
+  resetSessionCwd(sessionId, frame.agentId);
   states.delete(sessionId);
   return {
     action,

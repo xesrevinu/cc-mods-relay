@@ -66,6 +66,19 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).toMatch(/^async function flushPending\(/m);
   expect(src).toContain("pending.length >= 100");
   expect(src).toContain("<task-notification>");
+  expect(src).toContain("/tmp/cc-mods-wait/");
+  expect(src).toContain("waiterScript");
+  expect(src).toContain("waiterEvent");
+  expect(src).toContain("writeWaiterFiles");
+  expect(src).toContain("isBackgroundResult");
+  expect(src).toContain("waiters.add");
+  expect(src).toContain("next(waiterEvent(e, waiterScript(toolUseId)))");
+  expect(src).toContain("TaskStop");
+  expect(src).toContain("miniHasPath");
+  expect(src).toContain("mergeBackgroundResult");
+  expect(src).toContain("replDispatchedThisTurn");
+  expect(src).toContain("coalesceEvents");
+  expect(src).toContain("pumpEvents");
   expect(src).toContain("kickFlush");
   expect(src).toContain("after($, 1_500)");
   expect(src).toContain("await sessionIdOf");
@@ -240,6 +253,14 @@ test("staged plugin is minified and does not ship sources or types", async () =>
   expect(registerFn).toBeGreaterThan(pendingCap);
   expect(register).toMatch(/export\{[A-Za-z$][\w$]* as register\}/);
   expect(register).not.toContain("Mods forbids");
+  expect(helper).toContain("tuiEnv");
+  expect(helper).toContain("/etc/localtime");
+  expect(helper).toContain("DateTimeFormat");
+  expect(helper).toContain("AppleLocale");
+  expect(helper).toContain("CC_MODS_TUI_ENV");
+  expect(helper).toContain("rpcSocket");
+  expect(register).toContain("http://tools/rpc");
+  expect(register).toContain("dispatched #");
   expect(register).not.toContain("ENDPOINT");
   expect(register).not.toMatch(/\bWebSocket\b/);
   expect(register).not.toMatch(/\bsetTimeout\b/);
@@ -470,8 +491,17 @@ test("cancel stops an in-flight Bash over the tool socket", async () => {
       ws.onerror = () => reject(new Error("socket failed"));
     });
     const hello = next();
-    ws.send(JSON.stringify({ v: 1, type: "hello", token: relay.token, cwd: dir }));
+    ws.send(JSON.stringify({ v: 1, type: "hello", token: relay.token, cwd: dir, tuiEnv: { TZ: "Asia/Tokyo", LANG: "en_US.UTF-8" } }));
     expect((await hello).ok).toBe(true);
+
+    const envRes = next();
+    ws.send(JSON.stringify({
+      v: 1, type: "call", id: "env-cache", callId: "env-cache", tool: "Bash",
+      input: { command: 'printf "%s %s" "$TZ" "$LANG"' },
+    }));
+    const envBody = await envRes;
+    expect(envBody.ok).toBe(true);
+    expect(envBody.result.stdout).toBe("Asia/Tokyo en_US.UTF-8");
 
     const started = Date.now();
     const result = next();
@@ -515,4 +545,42 @@ test("helper prints a result when the executor socket is gone", async () => {
   const frame = JSON.parse(stdout.trim().split("\n").at(-1)!);
   expect(frame.ok).toBe(false);
   expect(frame.error.code).toBe("EXECUTOR_DISCONNECTED");
+});
+
+test("same-file Edits serialize without clobbering while different files run in parallel", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-par-"));
+  const f1 = join(dir, "same.txt");
+  const f2 = join(dir, "other.txt");
+  writeFileSync(f1, "A\nB\n");
+  writeFileSync(f2, "X\n");
+  const relay = startRelay();
+  relay.bind("s-par", dir);
+  const ws = new WebSocket(relay.url);
+  const results = new Map<string, any>();
+  const done = new Promise<void>((resolve) => {
+    ws.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data));
+      if (frame.type === "result" && frame.callId) {
+        results.set(frame.callId, frame);
+        if (results.size === 3) resolve();
+      }
+    };
+  });
+  await new Promise<void>((resolve, reject) => {
+    ws.onopen = () => resolve();
+    ws.onerror = () => reject(new Error("socket failed"));
+  });
+  ws.send(JSON.stringify({ v: 1, type: "hello", token: relay.token, cwd: dir }));
+  await Bun.sleep(20);
+  ws.send(JSON.stringify({ v: 1, type: "call", id: "1", callId: "e1", tool: "Edit", input: { file_path: f1, old_string: "A", new_string: "A1" } }));
+  ws.send(JSON.stringify({ v: 1, type: "call", id: "2", callId: "e2", tool: "Edit", input: { file_path: f1, old_string: "B", new_string: "B1" } }));
+  ws.send(JSON.stringify({ v: 1, type: "call", id: "3", callId: "e3", tool: "Edit", input: { file_path: f2, old_string: "X", new_string: "X1" } }));
+  await done;
+  expect(results.get("e1")?.ok).toBe(true);
+  expect(results.get("e2")?.ok).toBe(true);
+  expect(results.get("e3")?.ok).toBe(true);
+  expect(readFileSync(f1, "utf8")).toBe("A1\nB1\n");
+  expect(readFileSync(f2, "utf8")).toBe("X1\n");
+  ws.close();
+  relay.stop();
 });

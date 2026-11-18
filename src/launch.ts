@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { configDir } from "./config.js";
@@ -7,6 +7,7 @@ import pluginManifest from "../plugin/.claude-plugin/plugin.json";
 import pluginHooks from "../plugin/hooks/hooks.json";
 // @ts-expect-error Bun `type: "text"` is source text, not a module
 import pluginRegister from "../plugin/hooks/register.js" with { type: "text" };
+// @ts-expect-error Bun `type: "text"` is source text, not a module
 import pluginWsClient from "../plugin/hooks/ws-client.js" with { type: "text" };
 import pluginWriteFile from "../plugin/hooks/write-file.js" with { type: "text" };
 
@@ -79,8 +80,9 @@ export async function stagePlugin(endpoint: Endpoint): Promise<string> {
   return stage;
 }
 
-const CLAUDE_DIR_EXCLUDES = new Set(["projects", "debug", "file-history", "todos", "sessions"]);
+const CLAUDE_DIR_EXCLUDES = new Set(["projects", "debug", "file-history", "todos", "sessions", "worktrees", "cache", "node_modules"]);
 const CLAUDE_FILE_EXCLUDES = new Set(["history.jsonl"]);
+const SYNC_FILE_MAX_BYTES = 512 * 1024;
 
 /** Project files Claude Code loads at session start. */
 export const SESSION_MEMORY_FILES = ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"] as const;
@@ -130,7 +132,7 @@ export function homeSyncPaths(home: string): string[] {
   return paths;
 }
 
-function walkFiles(root: string, rel: string, out: SyncFile[]): void {
+function walkFiles(root: string, rel: string, out: SyncFile[], seenDirs = new Set<string>()): void {
   const abs = join(root, rel);
   let st;
   try {
@@ -141,17 +143,28 @@ function walkFiles(root: string, rel: string, out: SyncFile[]): void {
   if (st.isDirectory()) {
     const base = rel.split(/[\\/]/).pop() ?? "";
     if (rel.startsWith(".claude") && CLAUDE_DIR_EXCLUDES.has(base) && rel !== ".claude") return;
+    if (base === "node_modules" || base === ".git") return;
+    try {
+      const real = realpathSync(abs);
+      if (seenDirs.has(real)) return;
+      seenDirs.add(real);
+    } catch {
+      return;
+    }
     for (const name of readdirSync(abs)) {
-      walkFiles(root, join(rel, name), out);
+      walkFiles(root, join(rel, name), out, seenDirs);
     }
     return;
   }
   const base = rel.split(/[\\/]/).pop() ?? "";
   if (CLAUDE_FILE_EXCLUDES.has(base)) return;
+  if (st.size > SYNC_FILE_MAX_BYTES) return;
   try {
-    out.push({ path: rel.split(sep).join("/"), content: readFileSync(abs, "utf8") });
+    const buf = readFileSync(abs);
+    if (buf.includes(0)) return;
+    out.push({ path: rel.split(sep).join("/"), content: buf.toString("utf8") });
   } catch {
-    /* skip unreadable / binary */
+    /* skip unreadable */
   }
 }
 
@@ -254,8 +267,11 @@ function allowedHomeRel(rel: string): boolean {
   return HOME_SYNC_PREFIXES.some((prefix) => rel.startsWith(prefix));
 }
 
+const managedSync = new Map<string, Set<string>>();
+
 function writeRelFiles(root: string, files: SyncFile[], allow?: (rel: string) => boolean): void {
   mkdirSync(root, { recursive: true });
+  const next = new Set<string>();
   for (const file of files) {
     const rel = normalizeRel(file.path);
     if (!rel || (allow && !allow(rel))) continue;
@@ -263,7 +279,19 @@ function writeRelFiles(root: string, files: SyncFile[], allow?: (rel: string) =>
     if (!isInsideRoot(root, dest)) continue;
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, file.content);
+    next.add(rel);
   }
+  const prev = managedSync.get(root);
+  if (prev) {
+    for (const rel of prev) {
+      if (next.has(rel)) continue;
+      const stale = join(root, rel);
+      if (isInsideRoot(root, stale)) {
+        try { unlinkSync(stale); } catch { /* already gone */ }
+      }
+    }
+  }
+  managedSync.set(root, next);
 }
 
 export function writeSessionFiles(tuiRoot: string, files: SyncFile[]): void {
