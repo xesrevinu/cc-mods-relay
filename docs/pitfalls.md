@@ -7,7 +7,21 @@ Two machines, same names as the README:
 - **This machine** — ACP client, workspace tools, real files.
 - **TUI host** — persistent WebSocket server, Claude Code TUI, Mods plugin.
 
-Do not put hostnames, usernames, tokens, Tailscale addresses, session ids, or live home paths in this file or in tests.
+Do not put hostnames, usernames, tokens, private-network addresses, session ids, or live home paths in this file, in comments, or in tests.
+
+## Where this came from
+
+Mined from this repo’s Cursor chats (Nov 11–18 2026), including the user questions that first surfaced each class of failure. Two chats had no engineering content (stopped before work, and a model-usage-limit switch).
+
+| When | Chat | What it burned |
+| --- | --- | --- |
+| Nov 11–12 | Architecture review | TUI + Mods + ACP shape; env allowlist; plugin embed after `bun` compile; PTY vs Mods for prompts; slash vs ACP; cwd flatten; mock API splash |
+| Nov 12 | Orphan processes | herdr/SIGHUP leftovers; test fixtures leaking live paths |
+| Nov 12 | Session id and history | fork/load/resume; `/usage` `/context`; 120s turn watchdog; queue vs steer; `_meta` at `session/new`; herdr session names |
+| Nov 14 | Bash / direnv | `bash -c` skips direnv; rewriting results onto the TUI-host home; ToolSearch fail-closed |
+| Nov 14–17 | Persistent WebSocket | Nix bun `SIGKILL`; Environment reminder is process cwd; do not set a custom API base URL to fake cwd; git stub; compact; JSONL rsync; Cursor worktree cleanup; string `{ result }` |
+| Nov 17 | Path replace | `~` expansion; read vs write jail; subagent background hang; `$.session` used as a value |
+| Nov 18 | Code Mode | `turn.complete` early; `{ deny }` vs business failure; hook-authored `isError` unloads the plugin |
 
 ---
 
@@ -42,9 +56,14 @@ The one exception: after this machine has confirmed a Read ENOENT (`File does no
 
 ### `$` may only go to a top-level helper
 
-Mods error: `$` was passed to a minified nested name. Allowed: a top-level `function` declaration, a top-level const bound to one, or an import from the same file. Call sites are always `$.noun.event(...)`. `on` is always `on("<event>", hook)`. `next.to` is always `next.to(e, "<tier>")`.
+Two live load errors:
 
-**Rule:** Helpers that take `$` are top-level `function` declarations. Nested helpers may exist only if they do not take `$`. Tests should reject `function name($` inside `register()`. Symptom of a bad hook shape is the same class of failure: plugin hello after every tool.
+- `$` was passed to a minified nested name (`"V"`).
+- `$.session` was used as a value (`a noun of $ bound, passed or read`).
+
+Allowed: a top-level `function` declaration, a top-level const bound to one, or an import from the same file. Call sites are always `$.noun.event(...)`. `on` is always `on("<event>", hook)`. `next.to` is always `next.to(e, "<tier>")`.
+
+**Rule:** Helpers that take `$` are top-level `function` declarations. Nested helpers may exist only if they do not take `$`. Never read `$.session` as an object; call `await $.session.id()`. Tests should reject `function name($` inside `register()`. Symptom of a bad hook shape is the same class of failure: plugin hello after every tool.
 
 ### The hooks module is not Node
 
@@ -157,17 +176,19 @@ No `import` / `require`. `$` and `file()` become workspace tool calls only when 
 
 `safeGetCWD()` is `process.cwd()`. The Environment block is a `<system-reminder>` on the first user message (Primary working directory, git boolean, Additional working directories, platform, shell, OS). It is not part of the default `system` blocks.
 
-`--system-prompt` replaces system text and does not touch it. `--append-system-prompt-file` cannot override it. `--system-prompt-snapshot` freezes system text, not the reminder. The reminder is re-injected on compact and on subagents.
+`--system-prompt` replaces system text and does not touch it. `--append-system-prompt-file` cannot override it. `--system-prompt-snapshot` freezes system text, not the reminder. The reminder is re-injected on compact and on subagents. Appending git / platform / shell / memory-file text was redundant: Claude already loads `CLAUDE.md` and `AGENTS.md`. Do not add more append to “fix” tool behavior; fix the tool shapes.
 
 **Rule:** The TUI cwd string must be the client path. mkdir that absolute path on the TUI host when the filesystem allows it. Do not try to out-prompt the reminder. Do not set `ANTHROPIC_BASE_URL` to rewrite it: a non-first-party host flips gateway behavior, Remote Control, fine-grained tool streaming, first-byte deadlines, and OAuth. `DYLD_INSERT_LIBRARIES` does not work against the signed binary.
 
-`session/new.cwd` is the client pwd. `initialize` typically has no cwd. Prefer the client path when it exists. `--add-dir` is Additional working directories only; it does not change Primary. `CLAUDE.md` from an add-dir needs `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`.
+A hash cwd (`…/tui/<hash>`) looks empty and trips folder-trust. Flatten under the same path the client uses. Placeholder directories must not use words like `relay` or `proxy`. Copy project `AGENTS.md` / `CLAUDE.md` / `.claude/` / `.agents/` into that folder at start, plus user-level skills; hash both scopes so startup does not recopy every time.
+
+`session/new.cwd` is the client pwd. `initialize` typically has no cwd. `_meta` is not a cwd channel. Prefer the client path when it exists. `--add-dir` is Additional working directories only; it does not change Primary. `CLAUDE.md` from an add-dir needs `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`.
 
 ### Rewrite inbound tool inputs only
 
 Mapping results back to the TUI-host home made the model believe two homes. A blind username replace invented paths that do not exist here.
 
-**Rule:** Longest prefix on the way in (TUI root, then TUI home). Bash / Read / Write results show real workspace paths. The model should have no way to observe the TUI-host home. Do not special-case `.cursor`. Do not hardcode a `Workspace/` prefix.
+**Rule:** Longest prefix on the way in (TUI root, then TUI home). Bash / Read / Write results show real workspace paths. Do not rewrite results back onto the TUI-host home — that is how the model learned two homes and started every turn with `cd`. The model should have no way to observe the TUI-host home. Do not special-case `.cursor`. Do not hardcode a `Workspace/` prefix. When the two account names differ, the inbound prefix map is the whole fix; do not also map the way out.
 
 ### `~` expansion needs a left boundary, and `$` in the replacement is special
 
@@ -281,6 +302,12 @@ Emit ACP v1 `usage_update` with `used` / `size` / `cost`. Stamp `PromptRequest._
 
 Extension methods are `_{method}` with transparent params. `session/info` is an `{ result, error }` envelope. `session/usage` is a bare `{ usage }`. Do not use one envelope for both.
 
+### Slash commands that have no ACP equivalent hang
+
+`/usage` and `/context` were forwarded as ordinary prompts and never came back. Plan/debug/diff/sandbox/skill/plugin slashes that have no ACP request should not be advertised. `/compact` injected into the TUI with no `compaction_update` left the ACP client with no notification.
+
+**Rule:** Only advertise slashes the client can actually call. Answer `/usage` and `/context` in `prompt()` with `end_turn`, or via `session/info`. Hide those records from replay so they do not enter the next API turn.
+
 ### Print mode is not the production path
 
 `claude -p` can “prove” tools while production TUI + herdr still fails. `--tools` and `--allowedTools` are variadic and will eat the argv prompt (“Input must be provided through stdin”). `CLAUDE_CODE_SIMPLE=1` / `--bare` skip the probe and also skip plugin hooks. Production is TUI + herdr. Put the prompt on stdin.
@@ -293,7 +320,9 @@ A catch-all `tool.call` with no matcher and no `next` forwards every tool. Agent
 
 **Rule:** Workspace (Read / Write / Edit / Glob / Grep / NotebookEdit / Bash / PowerShell, including subagent Read / Write) → RPC here, never `next` on success. Deny (LSP, and deferred tools the executor does not want as native): `UNSUPPORTED_TOOL`, not a fabricated success. Native-on-host: Agent, Skill, WebSearch, TodoWrite, AskUserQuestion, PlanMode, MCP, Cron. Hydrate-then-native for Artifact / DesignSync `file_path`: if the copy fails, the builtin still runs and the TUI copy can be missing — do not treat hydrate failure as success of the read.
 
-Client fs/terminal caps off means ACP `fs/*` is not the tool path; Mods WebSocket is. Permission UI for host-native dialogs is `classic.PermissionRequest`.
+ToolSearch must work. Tools that Claude Code exposes by default must not fail closed; only extra tools need enabling. Monitor is a background line stream, not a foreground Bash. Compress images before base64 (around 85% is enough). Do not open ACP `fs/*` or terminal caps: the client would then try to serve files itself instead of the Mods WebSocket.
+
+Client fs/terminal caps off means ACP `fs/*` is not the tool path; Mods WebSocket is. Permission UI for host-native dialogs is `classic.PermissionRequest`. Submit prompts through the PTY. Reading structured events from Mods is fine; `$.prompt.submit` is not a real user turn.
 
 ---
 
@@ -323,13 +352,17 @@ Token comes from the config file, never argv, so it does not show up in `ps`.
 - A `\bclaude\b` rewrite corrupted paths like `/tmp/claude-abc`. Rewrite is `(^|[\s;|&])claude(?=[\s]|$)`.
 - Claude may scaffold `.claude-plugin/types` on load; that is not part of the shipped tar.
 - `{type:"http"}` MCP entries need headers at create. Set `mcpServers` on the session after create.
-- A leftover gitdir index restores staged files via `checkout-index -a -f`. Unstaged files exist only in the working tree. Do not `git worktree prune` while recovering a vanished checkout.
+- A leftover gitdir index restores staged files via `checkout-index -a -f`. Unstaged files exist only in the working tree. Do not `git worktree prune` while recovering a vanished checkout. Cursor’s worktree cleanup can delete a live checkout; `cursor.worktreeCleanupIntervalHours` above 596 overflows and the loop keeps running. That is not this relay deleting files.
+- Herdr UI session names must stay neutral (`claude` / workspace label `claude-tui`). Words like `remote` / `relay` in the session name show up in the local machine sidebar.
+- If the ACP client creates a session and the user quits with no work, close/delete that empty session.
+- Plugin helper exit 137 after copy is usually unsigned / Nix bun, not “the model ran out of memory”. If the WebSocket drops, the TUI keeps running; the next client connect must not leave a half-started instance (`inst.client === ws`).
 
 ---
 
 ## Tests and this file
 
-- Fixtures use nonexistent homes. `existsSync` against a real home path collapses the assertion. Do not scan the entire home. Public tests stay on fake paths (`/tmp/…`) or a `/.cc-mods-relay/` match. Do not copy live `ps` lines into the repo.
+- Fixtures use nonexistent homes. `existsSync` against a real home path collapses the assertion. Do not scan the entire home. Public tests stay on fake paths (`/tmp/…`) or a `/.cc-mods-relay/` match. Do not copy live `ps` lines into the repo. Do not match exact usage, token counts, or timezones. Do not put a real `/Users/<name>/` marker in e2e scripts. Comments that skip `git init` of a home directory must not contain a real account name.
+- Public docs name ACP, Claude Code, and this binary. They do not name internal hosts, other products used as the ACP client, or how to bypass Claude Code.
 - `bun check src/index.ts` is the type gate that matters. Whole-repo `bun check` still reports pre-existing test errors. The plugin file is not cleanly typechecked under the plugin tsconfig.
 - `bun build` from a temp dir cannot resolve the SDK. Build from the repo.
 - `??` mixed with `||` is a Bun parse error and TS5076. Split the expressions.
