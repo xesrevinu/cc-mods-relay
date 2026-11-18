@@ -15,6 +15,28 @@ const LINE_CHAR_CAP = 2000;
 const DEFAULT_LIMIT = 2000;
 const LARGE_LIMIT = 100_000;
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
+/** Mods cannot join hook `{ result }` parts past ~4 MiB. Stay under that with JSON wrapping. */
+export const READ_CONTENT_BYTE_CAP = 2 * 1024 * 1024;
+
+function takeUtf8Budget(lines: string[], maxBytes: number): { lines: string[]; truncated: boolean } {
+  const out: string[] = [];
+  let bytes = 0;
+  for (const line of lines) {
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    const extra = out.length === 0 ? lineBytes : 1 + lineBytes;
+    if (out.length === 0 && extra > maxBytes) {
+      let keep = line;
+      while (keep.length > 1 && Buffer.byteLength(`${keep.slice(0, -1)}…`, "utf8") > maxBytes) {
+        keep = keep.slice(0, Math.max(1, keep.length - 64));
+      }
+      return { lines: [`${keep.slice(0, -1)}…`], truncated: true };
+    }
+    if (bytes + extra > maxBytes) return { lines: out, truncated: true };
+    bytes += extra;
+    out.push(line);
+  }
+  return { lines: out, truncated: false };
+}
 
 function sniffImage(buf: Uint8Array): ImageMime | undefined {
   if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
@@ -99,14 +121,16 @@ export async function readTool(cwd: string, tuiRoot: string | undefined, input: 
   const slice = lines.slice(startLine - 1, startLine - 1 + Math.max(0, limit)).map((line) =>
     line.length > LINE_CHAR_CAP ? `${line.slice(0, LINE_CHAR_CAP)}…` : line,
   );
+  const capped = takeUtf8Budget(slice, READ_CONTENT_BYTE_CAP);
   const wholeFile = asNumber(input.offset) === undefined && asNumber(input.limit) === undefined && !allowLarge;
-  const truncatedByTokenCap = wholeFile && startLine === 1 && slice.length < lines.length;
+  const truncatedByTokenCap =
+    capped.truncated || (wholeFile && startLine === 1 && slice.length < lines.length);
   return {
     type: "text" as const,
     file: {
       filePath: path,
-      content: slice.join("\n"),
-      numLines: slice.length,
+      content: capped.lines.join("\n"),
+      numLines: capped.lines.length,
       startLine,
       totalLines: lines.length,
       ...(truncatedByTokenCap ? { truncatedByTokenCap: true as const } : {}),

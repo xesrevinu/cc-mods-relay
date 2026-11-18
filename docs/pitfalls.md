@@ -21,7 +21,7 @@ Mined from this repo’s Cursor chats (Nov 11–18 2026), including the user que
 | Nov 14 | Bash / direnv | `bash -c` skips direnv; rewriting results onto the TUI-host home; ToolSearch fail-closed |
 | Nov 14–17 | Persistent WebSocket | Nix bun `SIGKILL`; Environment reminder is process cwd; do not set a custom API base URL to fake cwd; git stub; compact; JSONL rsync; Cursor worktree cleanup; string `{ result }` |
 | Nov 17 | Path replace | `~` expansion; read vs write jail; subagent background hang; `$.session` used as a value |
-| Nov 18 | Code Mode | `turn.complete` early; `{ deny }` vs business failure; hook-authored `isError` unloads the plugin |
+| Nov 18 | Code Mode | `turn.complete` early; `{ deny }` vs business failure; hook-authored `isError` unloads the plugin; huge Read `{ result }` cannot be joined |
 
 ---
 
@@ -119,9 +119,9 @@ There is no error union on Read. Stuffing `File does not exist: …` into `conte
 
 ### Truncation is a success flag
 
-SDK `truncatedByTokenCap` means a whole-file read was auto-paginated past the token cap; `content` is only the first page. This relay’s default whole-file cap is 2000 lines. Glob `truncated` is the SDK limit of 100 files. Grep’s default mode is `files_with_matches`; set `mode` / `content` / `numMatches` when the caller asked for content or count.
+SDK `truncatedByTokenCap` means a whole-file read was auto-paginated past the token cap; `content` is only the first page. This relay’s default whole-file cap is 2000 lines **and** 2 MiB of UTF-8. 2000 fat lines (each already clipped to 2000 characters) is ~4 MiB, which Mods splits across hook parts. Hook-authored `{ result }` objects for those parts cannot be joined: “The tool's result was not delivered… ask for less at a time (for a file, use offset and limit).” A ~1 MiB Read still fits in one `{ result }`. Do not `next()` a large workspace Read to dodge this — the builtin would read the TUI host. Glob `truncated` is the SDK limit of 100 files. Grep’s default mode is `files_with_matches`; set `mode` / `content` / `numMatches` when the caller asked for content or count.
 
-Do not invent a Read error arm for truncation.
+Do not invent a Read error arm for truncation. Code Mode `file().text()` of a multi-megabyte jsonl should be Bash/`jq` or a paged Read.
 
 ---
 
@@ -196,13 +196,13 @@ Mapping results back to the TUI-host home made the model believe two homes. A bl
 
 **Rule:** Expand `~` only at the start of a path token (`~/x`, `cd ~`, `VAR=~/x`). Use a function replacer so `$` inside the destination is literal.
 
-### Read and Write do not share a jail
+### Explicit `$HOME` paths are writable; relative `../` is not
 
-One `mapPath` for every tool either blocked reference trees / auto-memory or opened Write to all of `$HOME`.
+Jailing Write to the session cwd blocked a sibling checkout (`…/github/<other>/scripts/prebuild.py` → `PATH_DENIED: Path is outside …/github/<project>`). Native Claude Code does not invent that jail. Read already allowed explicit home paths; Write did not.
 
-**Rule:** Read / Grep / Glob / hydrate / SendFile: workspace, scratch, extra dirs, or an explicit absolute / `~` / `$HOME` path under the home directory. A relative `../` still throws. Write / Edit stay on the write mapper (project plus artifacts). The only outside write exception is Claude auto-memory: `~/.claude/projects/*/memory/<file>`. Do not silently rewrite a Bash command into a Read. A prefer-file refusal is `TOOL_FAILED` that names the Read or Grep to use.
+**Rule:** Read / Write / Edit / NotebookEdit share `mapExplicitHomePath`: workspace, extra dirs, common scratch, or an explicit absolute / `~` / `$HOME` path under the home directory. Scratch is `/tmp`, `/var/tmp`, `$TMPDIR`, `~/.cursor`, `~/.claude`, `~/.local/share`, Linux `/dev/shm`, macOS `/var/folders`, and `$XDG_RUNTIME_DIR` when set. Live JSONL habits that belong here: sibling checkouts, `~/.cursor/worktrees`, `~/.cursor/artifacts`, `~/.claude/projects/*/memory`, `~/.claude/plans`, `~/.local/share/references-repos`, and `/tmp` experiments. Each `/tmp` and `/var` root also includes its macOS `/private/…` spelling — Bash persists cwd from `pwd -P`, so `/tmp` without `/private/tmp` drops `cd /tmp`. A relative `../` still throws (`../.ssh`). `/etc` still throws. Do not persist `cd` into an arbitrary home folder such as `~/.ssh`. Do not silently rewrite a Bash command into a Read. A prefer-file refusal is `TOOL_FAILED` that names the Read or Grep to use.
 
-A Bash `cd` outside write roots must not become the next Write’s root. Official background-command hint: directory changes made by the backgrounded command do not apply to subsequent commands. `EnterWorktree` may still change cwd.
+A Bash `cd` outside project/scratch/extraDirs is still not persisted for later relative Write. Official background-command hint: directory changes made by the backgrounded command do not apply to subsequent commands. `EnterWorktree` may still change cwd.
 
 ### Git stub must match the client branch
 
@@ -212,9 +212,9 @@ A Bash `cd` outside write roots must not become the next Write’s root. Officia
 
 ### macOS `/var` is `/private/var`
 
-`git worktree list` prints `/private/var` while `join` produced `/var`. direnv tests compared `pwd` to a `/var/folders` path and failed.
+`git worktree list` prints `/private/var` while `join` produced `/var`. direnv tests compared `pwd` to a `/var/folders` path and failed. The same split applies to `/tmp` vs `/private/tmp` for Write jail and persisted `cd`.
 
-**Rule:** Compare `pwd -P` / `realpath` on both sides. EnterWorktree requires the path to be in `git worktree list` after realpath. Name XOR path. Exit requires `action: "keep" | "remove"`. Trust keys also differ for `/var` vs `/private/var` until `realpath`.
+**Rule:** Compare `pwd -P` / `realpath` on both sides. Scratch roots must list both spellings. EnterWorktree requires the path to be in `git worktree list` after realpath. Name XOR path. Exit requires `action: "keep" | "remove"`. Trust keys also differ for `/var` vs `/private/var` until `realpath`.
 
 ---
 

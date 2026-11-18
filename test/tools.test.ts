@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { cancelAgent, cancelCall, execute } from "../src/exec.js";
 import {
   applyModEvent,
@@ -14,6 +14,7 @@ import {
 import { toolInfoFromToolUse } from "../src/tools.js";
 import { encodeClaudeTaskDir, persistCwd, sessionCwd } from "../src/tools/bash.js";
 import { mapPath, mapReadPath, mapWritePath, rewriteRemoteText } from "../src/tools/paths.js";
+import { READ_CONTENT_BYTE_CAP } from "../src/tools/read.js";
 import { nativeToolError, nativeToolResult } from "../src/tools/runtime.js";
 
 function run(
@@ -227,6 +228,14 @@ test("Read honors offset/limit, rejects directories, and returns native text sch
   expect(capped.result.file.truncatedByTokenCap).toBe(true);
   const paged = await run(dir, "Read", { file_path: join(dir, "big.txt"), offset: 1, limit: 10 });
   expect(paged.result.file.truncatedByTokenCap).toBeUndefined();
+  const fat = Array.from({ length: 1200 }, () => "x".repeat(2000)).join("\n") + "\n";
+  writeFileSync(join(dir, "fat.jsonl"), fat);
+  const bulky = await run(dir, "Read", { file_path: join(dir, "fat.jsonl") });
+  expect(bulky.ok).toBe(true);
+  expect(Buffer.byteLength(bulky.result.file.content, "utf8")).toBeLessThanOrEqual(READ_CONTENT_BYTE_CAP);
+  expect(bulky.result.file.numLines).toBeLessThan(1200);
+  expect(bulky.result.file.totalLines).toBe(1200);
+  expect(bulky.result.file.truncatedByTokenCap).toBe(true);
 });
 
 test("Edit replace_all, unique-match failure, and empty old_string create", async () => {
@@ -295,8 +304,18 @@ test("relative TUI paths map onto the client workspace", () => {
   expect(mapWritePath(cwd, tui, join(home, ".claude/projects/-Users-me-app/memory/note.md"))).toBe(
     join(home, ".claude/projects/-Users-me-app/memory/note.md"),
   );
-  expect(() => mapWritePath(cwd, tui, join(home, ".claude/projects/-Users-me-app/sess.jsonl"))).toThrow(/outside/);
-  expect(() => mapWritePath(cwd, tui, join(home, ".local/share/references-repos/nsh/x.rs"))).toThrow(/outside/);
+  expect(mapWritePath(cwd, tui, join(home, ".claude/projects/-Users-me-app/sess.jsonl"))).toBe(
+    join(home, ".claude/projects/-Users-me-app/sess.jsonl"),
+  );
+  expect(mapWritePath(cwd, tui, join(home, "Workspace/github/sibling/prebuild.py"))).toBe(
+    join(home, "Workspace/github/sibling/prebuild.py"),
+  );
+  expect(mapWritePath(cwd, tui, "/Users/bob/Workspace/other/x.ts")).toBe(join(home, "Workspace/other/x.ts"));
+  expect(mapWritePath(cwd, tui, "/tmp/cc-mods-relay.txt")).toBe("/tmp/cc-mods-relay.txt");
+  expect(mapWritePath(cwd, tui, "/private/tmp/cc-mods-relay.txt")).toBe("/private/tmp/cc-mods-relay.txt");
+  expect(mapWritePath(cwd, tui, "/var/tmp/cc-mods-relay.txt")).toBe("/var/tmp/cc-mods-relay.txt");
+  expect(() => mapWritePath(cwd, tui, "../.ssh/id_rsa")).toThrow(/outside/);
+  expect(() => mapWritePath(cwd, tui, "/etc/passwd")).toThrow(/outside/);
   expect(rewriteRemoteText("cd /Users/bob/Workspace/abc && ls", cwd, tui)).toBe("cd /Users/me/proj && ls");
   expect(rewriteRemoteText("cd /Users/bob/Workspace/abc-extra", cwd, tui)).toBe(`cd ${home}/Workspace/abc-extra`);
   expect(rewriteRemoteText("cd ~/Workspace/abc && pwd", cwd, tui)).toBe("cd /Users/me/proj && pwd");
@@ -415,23 +434,30 @@ test("aborting a subagent cancels only that agent's Bash", async () => {
   expect(Date.now() - started).toBeLessThan(5_000);
 });
 
-test("Read of an explicit $HOME path outside the project is allowed; Write is not", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
+test("Read and Write of an explicit $HOME path outside the project are allowed", async () => {
+  const dir = mkdtempSync(join(homedir(), ".cc-mods-relay-proj-"));
   const outside = join(homedir(), `.cc-mods-relay-read-${process.pid}.txt`);
   writeFileSync(outside, "reference\n");
   try {
     const got = await run(dir, "Read", { file_path: outside });
     expect(got.ok).toBe(true);
     expect(got.result.file.content).toContain("reference");
-    const wrote = await run(dir, "Write", { file_path: outside, content: "nope\n" });
-    expect(wrote.ok).toBe(false);
-    expect(wrote.error.message).toMatch(/outside/);
+    const wrote = await run(dir, "Write", { file_path: outside, content: "updated\n" });
+    expect(wrote.ok).toBe(true);
+    expect(await Bun.file(outside).text()).toBe("updated\n");
+    const relative = await run(dir, "Write", { file_path: "../pwn.txt", content: "nope\n" });
+    expect(relative.ok).toBe(false);
+    expect(relative.error.code).toBe("PATH_DENIED");
+    const etc = await run(dir, "Write", { file_path: "/etc/passwd", content: "nope\n" });
+    expect(etc.ok).toBe(false);
+    expect(etc.error.code).toBe("PATH_DENIED");
   } finally {
     rmSync(outside, { force: true });
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("Write to Claude Code project memory is allowed; other home files are not", async () => {
+test("Write to Claude Code project memory and other explicit home files is allowed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-tools-"));
   const dest = join(homedir(), ".claude", "projects", "cc-mods-relay-test", "memory", "note.md");
   const jsonl = join(homedir(), ".claude", "projects", "cc-mods-relay-test", "sess.jsonl");
@@ -439,9 +465,9 @@ test("Write to Claude Code project memory is allowed; other home files are not",
     const wrote = await run(dir, "Write", { file_path: dest, content: "remember\n" }, { callId: "mem" });
     expect(wrote.ok).toBe(true);
     expect(await Bun.file(dest).text()).toBe("remember\n");
-    const blocked = await run(dir, "Write", { file_path: jsonl, content: "{}\n" }, { callId: "jsonl" });
-    expect(blocked.ok).toBe(false);
-    expect(blocked.error.message).toMatch(/outside/);
+    const sibling = await run(dir, "Write", { file_path: jsonl, content: "{}\n" }, { callId: "jsonl" });
+    expect(sibling.ok).toBe(true);
+    expect(await Bun.file(jsonl).text()).toBe("{}\n");
   } finally {
     rmSync(join(homedir(), ".claude", "projects", "cc-mods-relay-test"), { recursive: true, force: true });
   }
@@ -456,6 +482,54 @@ test("Write to ~/.cursor/artifacts is allowed", async () => {
     expect(await Bun.file(dest).text()).toBe("scratch\n");
   } finally {
     rmSync(join(homedir(), ".cursor", "artifacts", "cc-mods-relay-test"), { recursive: true, force: true });
+  }
+});
+
+test("cd into ~/.local/share is persisted for later Write", async () => {
+  const dir = mkdtempSync(join(homedir(), ".cc-mods-relay-proj-"));
+  mkdirSync(join(homedir(), ".local", "share"), { recursive: true });
+  const share = mkdtempSync(join(homedir(), ".local", "share", "cc-mods-relay-"));
+  try {
+    const cd = await run(dir, "Bash", { command: `cd "${share}"` }, { callId: "share-cd", sessionId: "share-sess" });
+    expect(cd.ok).toBe(true);
+    const wrote = await run(dir, "Write", { file_path: "out.txt", content: "share\n" }, { callId: "share-w", sessionId: "share-sess" });
+    expect(wrote.ok).toBe(true);
+    expect(existsSync(join(dir, "out.txt"))).toBe(false);
+    expect(readFileSync(join(share, "out.txt"), "utf8")).toBe("share\n");
+  } finally {
+    rmSync(share, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Write to /tmp and other common temp dirs is allowed", async () => {
+  const dir = mkdtempSync(join(homedir(), ".cc-mods-relay-proj-"));
+  const stamp = `${process.pid}-${Date.now()}`;
+  const tmpFile = `/tmp/cc-mods-relay-${stamp}.txt`;
+  const varFile = `/var/tmp/cc-mods-relay-${stamp}.txt`;
+  const relName = `cc-mods-relay-rel-${stamp}.txt`;
+  try {
+    expect(mapWritePath(dir, undefined, tmpFile)).toBe(resolve(tmpFile));
+    expect(mapWritePath(dir, undefined, `/private${tmpFile}`)).toBe(resolve(`/private${tmpFile}`));
+    const wrote = await run(dir, "Write", { file_path: tmpFile, content: "tmp\n" }, { callId: "tmp-w" });
+    expect(wrote.ok).toBe(true);
+    expect(await Bun.file(tmpFile).text()).toBe("tmp\n");
+    const varWrote = await run(dir, "Write", { file_path: varFile, content: "vartmp\n" }, { callId: "var-w" });
+    expect(varWrote.ok).toBe(true);
+    expect(await Bun.file(varFile).text()).toBe("vartmp\n");
+    const cd = await run(dir, "Bash", { command: "cd /tmp" }, { callId: "tmp-cd", sessionId: "tmp-sess" });
+    expect(cd.ok).toBe(true);
+    const rel = await run(dir, "Write", { file_path: relName, content: "rel\n" }, { callId: "tmp-rel", sessionId: "tmp-sess" });
+    expect(rel.ok).toBe(true);
+    expect(existsSync(join(dir, relName))).toBe(false);
+    expect(readFileSync(join("/tmp", relName), "utf8")).toBe("rel\n");
+  } finally {
+    rmSync(tmpFile, { force: true });
+    rmSync(`/private${tmpFile}`, { force: true });
+    rmSync(varFile, { force: true });
+    rmSync(join("/tmp", relName), { force: true });
+    rmSync(join("/private/tmp", relName), { force: true });
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

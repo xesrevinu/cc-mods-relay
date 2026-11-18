@@ -44,23 +44,48 @@ export function remoteHome(tuiRoot?: string): string | undefined {
   return userHomePrefix(posixPath(resolve(tuiRoot)));
 }
 
-/** Claude Code scratch plus the process temp dir. Always writable alongside cwd. */
+/**
+ * Logical `/tmp` and `/var` vs macOS `/private/tmp` and `/private/var`.
+ * Bash persists cwd from `pwd -P`, so Write jail must accept both spellings.
+ */
+function withPrivateAlias(abs: string): string[] {
+  const n = posixPath(abs);
+  if (n.startsWith("/private/")) return [n];
+  if (n === "/tmp" || n.startsWith("/tmp/") || n === "/var" || n.startsWith("/var/")) {
+    return [n, `/private${n}`];
+  }
+  return [n];
+}
+
+/** Claude Code scratch, OS temp, and common agent scratch roots. Always writable alongside cwd. */
 export function scratchDirs(): string[] {
-  const dirs = [join(homedir(), ".cursor", "artifacts"), tmpdir()];
-  if (process.platform !== "win32") dirs.push("/tmp");
-  return [...new Set(dirs.map((d) => resolve(d)))];
+  const home = homedir();
+  const dirs = [
+    join(home, ".cursor"),
+    join(home, ".claude"),
+    join(home, ".local", "share"),
+    tmpdir(),
+  ];
+  if (process.platform !== "win32") dirs.push("/tmp", "/var/tmp", "/dev/shm");
+  if (process.platform === "darwin") dirs.push("/var/folders");
+  const xdg = process.env.XDG_RUNTIME_DIR;
+  if (xdg) dirs.push(xdg);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const variant of withPrivateAlias(resolve(dir))) {
+      if (seen.has(variant)) continue;
+      seen.add(variant);
+      out.push(variant);
+    }
+  }
+  return out;
 }
 
 /** Claude Code folder names: every non-alphanumeric becomes `-` (`.cursor` → `-cursor`). */
 export function encodeClaudeDir(cwd: string): string {
   return cwd.replace(/\/+$/, "").replace(/[^a-zA-Z0-9]/g, "-");
-}
-
-/** Claude Code auto-memory: `~/.claude/projects/<encoded>/memory/*.md`. */
-export function isClaudeMemoryPath(abs: string): boolean {
-  const prefix = `${posixPath(homedir())}/.claude/projects/`;
-  const n = posixPath(abs);
-  return n.startsWith(prefix) && /\/memory\/[^/]+$/.test(n);
 }
 
 export function mergeRoots(extraDirs: string[] = []): string[] {
@@ -185,6 +210,14 @@ export function mapPath(
   return inside(rootProject, abs);
 }
 
+function underScratch(abs: string): string | undefined {
+  for (const dir of scratchDirs()) {
+    const hit = under(dir, abs);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
 function homeQualified(path: string): boolean {
   return (
     isAbsolute(path) ||
@@ -197,10 +230,12 @@ function homeQualified(path: string): boolean {
 }
 
 /**
- * Read/Grep/Glob: workspace, extraDirs, scratch, or an explicit path under $HOME.
- * Relative `../` still cannot walk out. Write/Edit keep using `mapPath`.
+ * Workspace, extraDirs, common scratch (`/tmp`, `/var/tmp`, `$TMPDIR`, …),
+ * or an explicit absolute / `~` / `$HOME` path under the home directory.
+ * Relative `../` still cannot walk out. Shared by Read and Write so a sibling checkout
+ * (`…/github/other`) is not `PATH_DENIED` while `/etc` and `../.ssh` still are.
  */
-export function mapReadPath(
+export function mapExplicitHomePath(
   cwd: string,
   tuiRoot: string | undefined,
   path: string,
@@ -212,9 +247,21 @@ export function mapReadPath(
   } catch (error) {
     if (!homeQualified(path)) throw error;
     const abs = resolve(rewriteRemotePath(path, project || cwd, tuiRoot));
-    if (under(homedir(), abs)) return abs;
+    const hit = under(homedir(), abs) ?? underScratch(abs);
+    if (hit) return hit;
     throw error;
   }
+}
+
+/** Read/Grep/Glob/hydrate/SendFile. */
+export function mapReadPath(
+  cwd: string,
+  tuiRoot: string | undefined,
+  path: string,
+  extraDirs: string[] = [],
+  project?: string,
+): string {
+  return mapExplicitHomePath(cwd, tuiRoot, path, extraDirs, project);
 }
 
 /** Workspace, extraDirs, and scratch — the roots Bash may persist as session cwd for later Write. */
@@ -239,14 +286,15 @@ export function mapCwd(
     return mapPath(cwd, tuiRoot, path, extraDirs, project);
   } catch (error) {
     const abs = resolve(rewriteRemotePath(path, project || cwd, tuiRoot));
-    if (under(homedir(), abs)) return abs;
+    const hit = under(homedir(), abs) ?? underScratch(abs);
+    if (hit) return hit;
     throw error;
   }
 }
 
 /**
- * Write/Edit: workspace, extraDirs, scratch — plus Claude Code `memory/*.md`.
- * Other `$HOME` paths stay jailed.
+ * Write/Edit/NotebookEdit: same as Read for explicit home paths.
+ * `cd` still must not persist a session cwd outside project/scratch/extraDirs.
  */
 export function mapWritePath(
   cwd: string,
@@ -255,14 +303,7 @@ export function mapWritePath(
   extraDirs: string[] = [],
   project?: string,
 ): string {
-  try {
-    return mapPath(cwd, tuiRoot, path, extraDirs, project);
-  } catch (error) {
-    if (!homeQualified(path)) throw error;
-    const abs = resolve(rewriteRemotePath(path, project || cwd, tuiRoot));
-    if (isClaudeMemoryPath(abs)) return abs;
-    throw error;
-  }
+  return mapExplicitHomePath(cwd, tuiRoot, path, extraDirs, project);
 }
 
 export function asString(value: unknown, fallback = ""): string {
