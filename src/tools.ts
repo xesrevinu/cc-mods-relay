@@ -246,6 +246,23 @@ export function toolInfoFromToolUse(
       };
     }
 
+    case "REPL": {
+      const input = toolUse.input as { code?: unknown } | undefined;
+      const code = typeof input?.code === "string" ? input.code : "";
+      return {
+        title: "Code",
+        kind: "execute",
+        content: code
+          ? [
+              {
+                type: "content",
+                content: { type: "text", text: "```javascript\n" + code + "\n```" },
+              },
+            ]
+          : [],
+      };
+    }
+
     case "Bash":
     case "PowerShell": {
       const input = toolUse.input as BashInput | undefined;
@@ -663,6 +680,7 @@ export function toolUpdateFromToolResult(
 
   switch (toolUse?.name) {
     case "Read": {
+      if ("is_error" in toolResult && toolResult.is_error) return rawContentUpdate();
       const structuredRead = structuredResult<FileReadOutput>(toolUseResult);
       if (
         structuredRead?.type === "image" &&

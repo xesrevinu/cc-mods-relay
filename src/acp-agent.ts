@@ -156,7 +156,15 @@ import { isSafeAbsPath, resolveTuiCwd, sessionClientCwd, trustTuiCwd, workspaceO
 import { materializeClientDir } from "./config.js";
 import { debug } from "./debug.js";
 import { answerPermission, answerQuestion, modChannelConnected, onModEvent, type ModEvent, type PermissionDecision } from "./mod-channel.js";
-import { applyModEvent, stopReasonFromMod } from "./mod-live.js";
+import {
+  applyModEvent,
+  isReplDispatchResult,
+  jsonlHasReplToolUse,
+  openReplId,
+  replModEventsFromMessage,
+  stopReasonFromMod,
+  withReplParent,
+} from "./mod-live.js";
 import {
   MODEL_CONTEXT_WINDOWS,
   MODEL_ID_CONTEXT_WINDOWS,
@@ -374,6 +382,8 @@ type Session = {
   lastContextSnapshot?: ContextUsageSnapshot;
   turnTempImagePaths?: string[];
   liveFromMod?: boolean;
+  /** Mods `turn.start` id; stale `turn_completed` from a previous turn must not match. */
+  modTurnId?: string;
   modTools?: Map<string, { tool: string; input: Record<string, unknown> }>;
   /** ACP client `PromptRequest._meta.promptId`, echoed on `session/update`. */
   currentPromptId?: string;
@@ -543,6 +553,11 @@ export interface AgentDeps {
   tuiRoot?: string;
   /** Plugin stage directory. Falls back to `$CC_MODS_PLUGIN_DIR`. */
   pluginDir?: string;
+  /**
+   * After Mods `turn.complete`, wait this long for Code Mode REPL inner tools.
+   * Tests leave this unset so `finish()` is immediate.
+   */
+  turnSettleMs?: number;
   /** Per-instance Mods unix channel. Falls back to the process-wide bind. */
   modChannel?: {
     onEvent: (listener: (event: ModEvent) => void) => () => void;
@@ -1348,6 +1363,7 @@ export class ClaudeAcpAgent {
   private readonly launchCwd: string | undefined;
   private readonly tuiRoot: string | undefined;
   private readonly pluginDir: string | undefined;
+  private readonly turnSettleMs: number;
   private readonly modChannel?: AgentDeps["modChannel"];
   private readonly engines: Map<string, SessionEngine> = new Map();
   private readonly unsubMod: () => void;
@@ -1370,6 +1386,7 @@ export class ClaudeAcpAgent {
     this.launchCwd = deps.clientCwd && isSafeAbsPath(deps.clientCwd) ? deps.clientCwd : undefined;
     this.tuiRoot = deps.tuiRoot && isSafeAbsPath(deps.tuiRoot) ? deps.tuiRoot : undefined;
     this.pluginDir = deps.pluginDir;
+    this.turnSettleMs = deps.turnSettleMs ?? 0;
     this.modChannel = deps.modChannel;
     this.getMessages =
       (deps.liveDiff ?? false)
@@ -1788,6 +1805,7 @@ export class ClaudeAcpAgent {
 
   private async executePrompt(params: PromptRequest, session: Session): Promise<PromptResponse> {
     session.cancelled = false;
+    session.modTurnId = undefined;
     session.currentPromptId = promptIdFromMeta(params._meta);
     try {
       return await this.runPrompt(params, session);
@@ -1848,7 +1866,11 @@ export class ClaudeAcpAgent {
       schedule: this.schedule,
       sessionId: params.sessionId,
       logger: this.logger,
-      onTurnResolved: () => void this.emitSessionTitleUpdate(params.sessionId),
+      settleMs: this.turnSettleMs,
+      onTurnResolved: () => {
+        void this.closeOpenRepl(params.sessionId);
+        void this.emitSessionTitleUpdate(params.sessionId);
+      },
     });
     sessionRecord.turnDetector = detector;
     sessionRecord.turnCancel = cancel;
@@ -2027,7 +2049,11 @@ export class ClaudeAcpAgent {
       schedule: this.schedule,
       sessionId,
       logger: this.logger,
-      onTurnResolved: () => void this.emitSessionTitleUpdate(sessionId),
+      settleMs: this.turnSettleMs,
+      onTurnResolved: () => {
+        void this.closeOpenRepl(sessionId);
+        void this.emitSessionTitleUpdate(sessionId);
+      },
     });
     session.turnDetector = detector;
     session.turnCancel = cancel;
@@ -3154,6 +3180,47 @@ export class ClaudeAcpAgent {
     }
   }
 
+  private async mirrorLiveRepl(sessionId: string, session: Session, message: unknown): Promise<void> {
+    session.modTools ??= new Map();
+    const ctx = {
+      client: this.client,
+      tools: session.modTools,
+      cwd: session.cwd,
+      supportsTerminal:
+        (this.clientCapabilities?._meta as { terminal_output?: boolean } | undefined)?.terminal_output === true,
+      contextWindowSize: session.contextWindowSize,
+    };
+    for (const event of replModEventsFromMessage(message)) {
+      if (event.type === "tool_started") {
+        if (typeof event.toolUseId !== "string" || session.modTools.has(event.toolUseId)) continue;
+        await applyModEvent(sessionId, event, ctx);
+        continue;
+      }
+      if (event.type !== "tool_finished" || typeof event.toolUseId !== "string") continue;
+      const started = session.modTools.get(event.toolUseId);
+      if (!started || started.tool !== "REPL") continue;
+      if (isReplDispatchResult(event.result)) continue;
+      await applyModEvent(sessionId, event, ctx);
+    }
+  }
+
+  private async closeOpenRepl(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session?.modTools) return;
+    const ctx = {
+      client: this.client,
+      tools: session.modTools,
+      cwd: session.cwd,
+      supportsTerminal:
+        (this.clientCapabilities?._meta as { terminal_output?: boolean } | undefined)?.terminal_output === true,
+      contextWindowSize: session.contextWindowSize,
+    };
+    for (const [id, started] of [...session.modTools]) {
+      if (started.tool !== "REPL") continue;
+      await applyModEvent(sessionId, { type: "tool_finished", toolUseId: id, isError: false }, ctx);
+    }
+  }
+
   async handleModEvent(event: ModEvent): Promise<void> {
     const sessionId =
       Object.entries(this.sessions).find(([, session]) => session.turnDetector)?.[0] ??
@@ -3188,9 +3255,13 @@ export class ClaudeAcpAgent {
     // Mods is the live path: JSONL is not observed for EOT while the plugin is
     // connected, so every live event must keep the stall watchdog from firing.
     const toolUseId = typeof event.toolUseId === "string" ? event.toolUseId : undefined;
-    if (event.type === "tool_started" && toolUseId) session.turnDetector?.hold(toolUseId);
-    else if (event.type === "tool_finished" && toolUseId) session.turnDetector?.release(toolUseId);
-    else session.turnDetector?.noteActivity();
+    // Code Mode's REPL stays "running" after a dispatch stub; inner Bash/Read
+    // holds keep the turn open. Holding REPL itself would deadlock EOT.
+    if (event.type === "tool_started" && toolUseId && event.tool !== "REPL") {
+      session.turnDetector?.hold(toolUseId);
+    } else if (event.type === "tool_finished" && toolUseId && event.tool !== "REPL") {
+      session.turnDetector?.release(toolUseId);
+    } else session.turnDetector?.noteActivity();
     if (event.type === "tool_started" || event.type === "tool_finished") {
       debug(`mod ${event.type}`, {
         toolUseId: event.toolUseId,
@@ -3201,7 +3272,19 @@ export class ClaudeAcpAgent {
       });
     }
     session.modTools ??= new Map();
-    const kind = await applyModEvent(sessionId, event, {
+    if (event.type === "tool_started" && toolUseId && session.modTools.has(toolUseId)) {
+      return;
+    }
+    const started = toolUseId ? session.modTools.get(toolUseId) : undefined;
+    if (
+      event.type === "tool_finished" &&
+      started?.tool === "REPL" &&
+      isReplDispatchResult(event.result)
+    ) {
+      return;
+    }
+    const live = withReplParent(event, openReplId(session.modTools));
+    const kind = await applyModEvent(sessionId, live, {
       client: this.client,
       tools: session.modTools,
       cwd: session.cwd,
@@ -3222,11 +3305,20 @@ export class ClaudeAcpAgent {
     }
     if (kind === "turn_started") {
       session.liveFromMod = true;
+      if (typeof event.turnId === "string" && event.turnId) session.modTurnId = event.turnId;
       session.turnDetector?.noteActivity();
     }
     if (kind === "turn_completed") {
-      if (event.reason === "aborted" || event.isAborted === true) session.turnCancel?.();
-      else session.turnDetector?.finish(stopReasonFromMod(event.reason));
+      const turnId = typeof event.turnId === "string" ? event.turnId : undefined;
+      const aborted = event.reason === "aborted" || event.isAborted === true;
+      if (aborted) {
+        if (!turnId || turnId !== session.modTurnId) return;
+        session.turnCancel?.();
+      } else if (turnId && session.modTurnId && turnId !== session.modTurnId) {
+        return;
+      } else {
+        session.turnDetector?.finish(stopReasonFromMod(event.reason));
+      }
     }
   }
 
@@ -3318,7 +3410,12 @@ export class ClaudeAcpAgent {
       session.detectorCursor = messages.length;
       if (session.turnDetector) {
         for (const m of fed) {
-          session.turnDetector.observe(m as never);
+          // Code Mode: JSONL assistant rows look terminal while the REPL sandbox
+          // is still running. Mods turn.complete + settleMs owns EOT. Non-Code
+          // Mode still uses JSONL as the backup, except REPL tool_use rows.
+          if (this.turnSettleMs <= 0 && !jsonlHasReplToolUse(m)) {
+            session.turnDetector.observe(m as never);
+          }
           const content = (m as { message?: { content?: unknown } }).message?.content;
           if (statusCommandOutput(content)) session.turnDetector.finish("end_turn");
           if (compactEventFromMessage(m)) {
@@ -3327,6 +3424,7 @@ export class ClaudeAcpAgent {
           }
         }
       }
+      for (const m of fed) await this.mirrorLiveRepl(sessionId, session, m);
       if (session.gate) {
         for (const m of fed) registerGateToolUses(m, session.gate);
       }

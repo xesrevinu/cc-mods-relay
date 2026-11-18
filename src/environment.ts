@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -69,4 +69,52 @@ export function trustTuiCwd(cwd: string, env: NodeJS.ProcessEnv = process.env, h
 /** Extra dirs go in a sidecar (Mods cats it). Prompt listing uses Claude Code `--add-dir`. */
 export async function writeSessionMount(pluginDir: string, extraDirs: string[]): Promise<void> {
   writeFileSync(join(pluginDir, EXTRA_DIRS_FILE), JSON.stringify(extraDirs));
+}
+
+/** Keys Claude Code stores after the first Code Mode confirmation dialog. */
+export const CODE_MODE_CAVEAT_KEYS = [
+  "codeModeCaveatsAcceptedV1",
+  "codeModeAutoModeCaveatAcceptedV1",
+] as const;
+
+function writeClaudeJson(path: string, body: string): void {
+  const write = (): void => {
+    writeFileSync(path, body);
+    chmodSync(path, 0o600);
+  };
+  try {
+    write();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EACCES" && code !== "EPERM") throw error;
+    chmodSync(path, 0o600);
+    write();
+  }
+}
+
+/**
+ * Skip the first-run Code Mode confirmation (and the TUI restart it triggers)
+ * by writing the caveat flags Claude Code keeps in `.claude.json`.
+ */
+export function acceptCodeModeCaveats(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): void {
+  const files = env.CLAUDE_CONFIG_DIR
+    ? [join(env.CLAUDE_CONFIG_DIR, ".claude.json")]
+    : [join(home, ".claude.json")];
+  for (const file of files) {
+    try {
+      const raw = (
+        existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {}
+      ) as Record<string, unknown>;
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const already = CODE_MODE_CAVEAT_KEYS.every((key) => raw[key] === true);
+      if (already) continue;
+      for (const key of CODE_MODE_CAVEAT_KEYS) raw[key] = true;
+      writeClaudeJson(file, `${JSON.stringify(raw, null, 2)}\n`);
+    } catch {
+      /* leave the file alone if it is not JSON */
+    }
+  }
 }

@@ -85,7 +85,12 @@ export async function applyModEvent(
     const parent = meta(event.parentToolUseId);
     const mapped = started
       ? toolUpdateFromToolResult(
-          { type: "tool_result", tool_use_id: event.toolUseId, content: "", is_error: isError },
+          {
+            type: "tool_result",
+            tool_use_id: event.toolUseId,
+            content: isError && typeof event.error === "string" ? event.error : "",
+            is_error: isError,
+          },
           { name: started.tool, id: event.toolUseId, input: started.input },
           ctx.supportsTerminal,
           event.result,
@@ -184,4 +189,76 @@ export function stopReasonFromMod(reason: unknown): string {
   if (reason === "max_tokens") return "max_tokens";
   if (reason === "refusal") return "refusal";
   return "end_turn";
+}
+
+export function openReplId(tools: Map<string, Started>): string | undefined {
+  for (const [id, started] of tools) {
+    if (started.tool === "REPL") return id;
+  }
+  return undefined;
+}
+
+/** Nest Code Mode inner tools under the open REPL when the plugin omitted a parent. */
+export function withReplParent(event: ModEvent, replId: string | undefined): ModEvent {
+  if (!replId) return event;
+  if (event.tool === "REPL" || event.toolUseId === replId) return event;
+  if (typeof event.parentToolUseId === "string") return event;
+  if (event.type !== "tool_started" && event.type !== "tool_finished" && event.type !== "chunk") {
+    return event;
+  }
+  return { ...event, parentToolUseId: replId };
+}
+
+/** JSONL assistant rows that start a REPL must not be treated as terminal EOT. */
+export function jsonlHasReplToolUse(message: unknown): boolean {
+  return contentBlocks(message).some((block) => block.type === "tool_use" && block.name === "REPL");
+}
+
+function contentBlocks(value: unknown): Record<string, unknown>[] {
+  if (!value || typeof value !== "object") return [];
+  const message = (value as { message?: unknown }).message;
+  const src = message && typeof message === "object" ? message : value;
+  const content = (src as { content?: unknown }).content;
+  return Array.isArray(content)
+    ? content.filter((block): block is Record<string, unknown> => !!block && typeof block === "object")
+    : [];
+}
+
+function resultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => {
+        if (!block || typeof block !== "object") return "";
+        const text = (block as { text?: unknown }).text;
+        return typeof text === "string" ? text : "";
+      })
+      .join("");
+  }
+  return content == null ? "" : JSON.stringify(content);
+}
+
+/** REPL jsonl often records a stub result while the sandbox is still running. */
+export function isReplDispatchResult(content: unknown): boolean {
+  return /\(dispatched\b|dispatched #\d+/i.test(resultText(content));
+}
+
+/** Code Mode's REPL does not always hit Mods `tool.call`. Mirror it from JSONL. */
+export function replModEventsFromMessage(message: unknown): ModEvent[] {
+  const out: ModEvent[] = [];
+  for (const block of contentBlocks(message)) {
+    if (block.type === "tool_use" && block.name === "REPL" && typeof block.id === "string") {
+      const input = block.input && typeof block.input === "object" ? (block.input as Record<string, unknown>) : {};
+      out.push({ type: "tool_started", toolUseId: block.id, tool: "REPL", input });
+    }
+    if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+      out.push({
+        type: "tool_finished",
+        toolUseId: block.tool_use_id,
+        isError: block.is_error === true,
+        result: block.content,
+      });
+    }
+  }
+  return out;
 }

@@ -3,7 +3,7 @@ import { accessSync, constants } from "node:fs";
 import { delimiter, join } from "node:path";
 import { reportImageVisionSmoke } from "./image-vision-smoke.js";
 
-export const PROVENANCE_CLAUDE_VERSION = "2.1.312";
+export const PROVENANCE_CLAUDE_VERSION = "2.1.327";
 
 const INSTALL_HINT = 'Install the Claude Code subscription CLI or ensure "claude" is on PATH.';
 

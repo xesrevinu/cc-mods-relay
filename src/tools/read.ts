@@ -99,6 +99,8 @@ export async function readTool(cwd: string, tuiRoot: string | undefined, input: 
   const slice = lines.slice(startLine - 1, startLine - 1 + Math.max(0, limit)).map((line) =>
     line.length > LINE_CHAR_CAP ? `${line.slice(0, LINE_CHAR_CAP)}…` : line,
   );
+  const wholeFile = asNumber(input.offset) === undefined && asNumber(input.limit) === undefined && !allowLarge;
+  const truncatedByTokenCap = wholeFile && startLine === 1 && slice.length < lines.length;
   return {
     type: "text" as const,
     file: {
@@ -107,6 +109,7 @@ export async function readTool(cwd: string, tuiRoot: string | undefined, input: 
       numLines: slice.length,
       startLine,
       totalLines: lines.length,
+      ...(truncatedByTokenCap ? { truncatedByTokenCap: true as const } : {}),
     },
   };
 }

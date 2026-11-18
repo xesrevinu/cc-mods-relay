@@ -9,7 +9,7 @@ import { startModChannel } from "../src/mod-channel.js";
 import { startRelay } from "../src/relay.js";
 import { stagePlugin } from "../src/launch.js";
 import { resolveTerminalBackendName } from "../src/terminal-backend.js";
-import { DEFERRED_TOOLS, WORKSPACE_TOOLS } from "../src/tools/forward.js";
+import { DEFERRED_TOOLS, isLocalTool, WORKSPACE_TOOLS } from "../src/tools/forward.js";
 
 test("withPlugin injects --plugin-dir on the claude command, not path fragments", () => {
   const tui = "claude --session-id sess --mcp-config /tmp/claude-abc/x.json";
@@ -33,11 +33,22 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).toContain("failResult");
   expect(src).toContain("deny:");
   expect(src).toContain("objectResult");
+  expect(src).toMatch(/^function errorResult\(/m);
+  expect(src).toMatch(/^function permissionDenied\(/m);
+  expect(src).not.toContain("return objectResult(tool, text, input)");
+  expect(src).toContain("finish(true, result, message)");
+  expect(src).toContain('return failResult("Tool call was cancelled")');
+  expect(src).toContain("CALL_ID_CONFLICT");
+  expect(src).toContain("PATH_DENIED");
+  expect(src).toContain("error: text");
+  expect(src).toContain("filenames: [], content: text");
+  expect(src).toContain("File does not exist:");
+  expect(src).toContain("return ran");
   expect(src).not.toContain('if (tool === "Grep" || tool === "Glob")');
   expect(src).toContain('if (tool === "Grep") return { numFiles: 0, filenames: [] }');
   expect(src).toContain('if (tool === "Glob") return { durationMs: 0, numFiles: 0, filenames: [], truncated: false }');
   expect(src).not.toContain("{ value: text }");
-  expect(src).not.toContain("isError: true");
+  expect(src).not.toContain("{ isError: true, result:");
   expect(src).not.toContain("if (e.agentId && !parent) return next(e)");
   expect(src).toContain("$.session.send");
   expect(src).toContain("$.session.id()");
@@ -75,6 +86,20 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).not.toContain("result: message");
   for (const tool of WORKSPACE_TOOLS) expect(src).toContain(`"${tool}"`);
   for (const tool of DEFERRED_TOOLS) expect(src).toContain(`"${tool}"`);
+  expect(isLocalTool("REPL")).toBe(false);
+  expect(src).toContain('e.tool !== "REPL"');
+  expect(src).toContain("replStack");
+  expect(src).toContain("sawReplThisTurn");
+  expect(src).toContain("mainInflight");
+  expect(src).toContain("resetPendingComplete");
+  expect(src).toContain("if (e.isAborted) flushTurnComplete($, socket)");
+  expect(src).toContain("sawReplThisTurn ? 8_000 : 400");
+  expect(src).toMatch(/^function flushTurnComplete\(/m);
+  expect(src).toMatch(/^function settleTurnComplete\(/m);
+  expect(src).toMatch(/^function resetPendingComplete\(/m);
+  const registerBody = src.slice(src.indexOf("export function register"));
+  expect(registerBody).not.toMatch(/function \w+\(\$/);
+  expect(registerBody).not.toMatch(/\(\$\s*\)\s*=>/);
 });
 
 test("terminal backend defaults to herdr and accepts bun PTY aliases", () => {

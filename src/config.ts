@@ -11,7 +11,25 @@ export type CcModsConfig = {
   /** Namespace for opaque/path layouts. Unused by the default home layout. */
   dir: string;
   ws: WsStyle;
+  /**
+   * Opt-in Claude Code Code Mode for TUI sessions. Off by default.
+   * Sets `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` on the spawned `claude` process.
+   */
+  codeMode: boolean;
 };
+
+/** Claude Code's own Code Mode switch. A `0` anywhere keeps Code Mode off. */
+export const CODE_MODE_ENV = "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE";
+
+/** Relay override: `1` forces Code Mode on, `0` forces it off, even if `config.json` disagrees. */
+export const CODE_MODE_CONFIG_ENV = "CC_MODS_CODE_MODE";
+
+function envFlag(value: string | undefined): boolean | undefined {
+  if (value == null || value === "") return undefined;
+  if (value === "0" || value === "false" || value === "off") return false;
+  if (value === "1" || value === "true" || value === "on") return true;
+  return undefined;
+}
 
 export type WsIndexEntry = { cwd: string; host: string; hostDir: string };
 
@@ -79,10 +97,14 @@ export function loadConfig(): CcModsConfig {
   );
   const wsEnv = Bun.env.CC_MODS_WS;
   const ws: WsStyle = isStyle(wsEnv) ? wsEnv : isStyle(file.ws) ? file.ws : "home";
-  cached = { dir, ws };
-  if (!hadFile || file.dir !== dir || file.ws !== ws) {
+  const codeModeEnv = envFlag(Bun.env[CODE_MODE_CONFIG_ENV]);
+  const fileCodeMode = file.codeMode === true;
+  const codeMode = codeModeEnv ?? fileCodeMode;
+  cached = { dir, ws, codeMode };
+  // Env overrides are session-scoped. Do not persist `CC_MODS_CODE_MODE` into config.json.
+  if (!hadFile || file.dir !== dir || file.ws !== ws || Boolean(file.codeMode) !== fileCodeMode) {
     try {
-      writeFileSecure(configPath(), `${JSON.stringify(cached, null, 2)}\n`);
+      writeFileSecure(configPath(), `${JSON.stringify({ dir, ws, codeMode: fileCodeMode }, null, 2)}\n`);
     } catch {
       /* read-only home */
     }
@@ -90,8 +112,27 @@ export function loadConfig(): CcModsConfig {
   return cached;
 }
 
-export function resetConfigForTests(cfg?: CcModsConfig, index?: Record<string, WsIndexEntry>): void {
-  cached = cfg;
+/**
+ * Whether this process should start Claude Code in Code Mode.
+ * `CC_MODS_CODE_MODE=0` or `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0` wins.
+ */
+export function codeModeEnabled(
+  env: Record<string, string | undefined> = process.env,
+  cfg?: Pick<CcModsConfig, "codeMode">,
+): boolean {
+  const forced = envFlag(env[CODE_MODE_CONFIG_ENV]);
+  if (forced === false) return false;
+  const claude = envFlag(env[CODE_MODE_ENV]);
+  if (claude === false) return false;
+  if (forced === true || claude === true) return true;
+  return (cfg ?? loadConfig()).codeMode === true;
+}
+
+export function resetConfigForTests(
+  cfg?: { dir: string; ws: WsStyle; codeMode?: boolean },
+  index?: Record<string, WsIndexEntry>,
+): void {
+  cached = cfg ? { codeMode: false, ...cfg } : undefined;
   indexCache = index;
 }
 

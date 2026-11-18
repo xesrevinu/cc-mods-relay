@@ -8,6 +8,9 @@
  *
  * Default-exposed tools always intercept. Deferred tools stay off the default
  * list so ToolSearch can load them; once selected they run here, never deny.
+ *
+ * Code Mode's `REPL` tool runs the JavaScript sandbox on the TUI host. Do not
+ * intercept it. Inner Bash/Read/Edit calls from that sandbox still match below.
  */
 
 export const WORKSPACE_TOOLS = [

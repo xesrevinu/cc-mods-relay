@@ -11,6 +11,24 @@ test("resume keeps the same session id and does not spawn a fresh claude", () =>
   expect(cmd).not.toContain("||");
 });
 
+test("resume with Code Mode keeps REPL on the allowed list", () => {
+  const [, cmd] = buildResumeArgv(
+    SOURCE,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    ["AskUserQuestion", "REPL"],
+    undefined,
+    { codeMode: true },
+  );
+  expect(cmd).toContain(`--resume "${SOURCE}"`);
+  expect(cmd).toContain(" --allowedTools Grep,Glob,REPL");
+  expect(cmd).toContain('--disallowed-tools "AskUserQuestion"');
+  expect(cmd).not.toContain("REPL,");
+});
+
 test("resume passes --model from extraFlags so the TUI keeps the session model", () => {
   const [, cmd] = buildResumeArgv(
     SOURCE,

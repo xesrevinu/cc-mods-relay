@@ -1,9 +1,18 @@
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
+/** Workspace jail — not a tool business failure. Plugin maps this to `{ deny }`. */
+export class PathDeniedError extends Error {
+  readonly code = "PATH_DENIED" as const;
+  constructor(root: string) {
+    super(`Path is outside ${root}`);
+    this.name = "PathDeniedError";
+  }
+}
+
 export function inside(root: string, abs: string): string {
   const rel = relative(root, abs);
-  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error(`Path is outside ${root}`);
+  if (rel.startsWith("..") || isAbsolute(rel)) throw new PathDeniedError(root);
   return abs;
 }
 

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { withPlugin } from "../src/compose.js";
@@ -14,10 +14,14 @@ import {
   writeHomeFiles,
 } from "../src/launch.js";
 import { debugOn, summarize } from "../src/debug.js";
+import { collectForwardedEnv } from "../src/forwarded-env.js";
 import { buildSanitizedEnv, buildSpawnArgv, extraClaudeFlags, parseCcModsRelayMeta } from "../src/engine-pty.js";
+import { CODE_MODE_CONFIG_ENV, CODE_MODE_ENV, resetConfigForTests } from "../src/config.js";
 import { remoteEnvPrefix } from "../src/ssh.js";
 import { TEST_API_KEY, isolatedWorkspace, pinMockSettings, testApiKeySuffix } from "./harness.js";
 import {
+  acceptCodeModeCaveats,
+  CODE_MODE_CAVEAT_KEYS,
   EXTRA_DIRS_FILE,
   resolveTuiCwd,
   sessionClientCwd,
@@ -159,6 +163,31 @@ test("remote TUI cwd stays on Mini when the client path is missing here", () => 
   expect(resolveTuiCwd(dir, true, "/tmp/tui")).toBe(dir);
 });
 
+test("acceptCodeModeCaveats writes the first-run flags without dropping other keys", () => {
+  const home = mkdtempSync(join(tmpdir(), "cc-mods-code-mode-"));
+  const config = join(home, ".claude.json");
+  writeFileSync(config, JSON.stringify({ projects: { "/old": { hasTrustDialogAccepted: true } } }));
+  chmodSync(config, 0o600);
+  acceptCodeModeCaveats({}, home);
+  const json = JSON.parse(readFileSync(config, "utf8")) as Record<string, unknown>;
+  expect(json.projects).toEqual({ "/old": { hasTrustDialogAccepted: true } });
+  for (const key of CODE_MODE_CAVEAT_KEYS) expect(json[key]).toBe(true);
+  expect(statSync(config).mode & 0o777).toBe(0o600);
+});
+
+test("acceptCodeModeCaveats does not rewrite ~/ .claude.json when CLAUDE_CONFIG_DIR is set", () => {
+  const home = mkdtempSync(join(tmpdir(), "cc-mods-code-mode-home-"));
+  const isolated = mkdtempSync(join(tmpdir(), "cc-mods-code-mode-iso-"));
+  const homeConfig = join(home, ".claude.json");
+  writeFileSync(homeConfig, JSON.stringify({ oauth: "secret" }));
+  acceptCodeModeCaveats({ CLAUDE_CONFIG_DIR: isolated }, home);
+  expect(JSON.parse(readFileSync(homeConfig, "utf8"))).toEqual({ oauth: "secret" });
+  const isolatedConfig = join(isolated, ".claude.json");
+  const json = JSON.parse(readFileSync(isolatedConfig, "utf8")) as Record<string, unknown>;
+  for (const key of CODE_MODE_CAVEAT_KEYS) expect(json[key]).toBe(true);
+  expect(statSync(isolatedConfig).mode & 0o777).toBe(0o600);
+});
+
 test("trustTuiCwd marks the host session cwd trusted without rewriting other projects", () => {
   const home = mkdtempSync(join(tmpdir(), "cc-mods-trust-"));
   const config = join(home, ".claude.json");
@@ -223,6 +252,8 @@ test("extra Claude flags come from initialize._meta.ccModsRelay", () => {
     " --no-chrome --dangerously-skip-permissions --tools Read,Write",
   );
   expect(extraClaudeFlags({ model: "haiku" })).toBe(" --allowedTools Grep,Glob --model haiku");
+  expect(extraClaudeFlags({ codeMode: true })).toBe(" --allowedTools Grep,Glob,REPL");
+  expect(extraClaudeFlags({ codeMode: true, tools: ["Read", "Write"] })).toBe(" --tools Read,Write,REPL");
 });
 
 test("launch --cwd is the client pwd; session/new.cwd is only a fallback", () => {
@@ -253,6 +284,7 @@ test("TUI spawn env looks like a user session and drops billing plus relay inter
     CC_MODS_PLUGIN_DIR: "/tmp/plugin",
     FORK_GATE: "on",
     CLAUDE_TUI_BACKEND: "herdr",
+    [CODE_MODE_CONFIG_ENV]: "0",
   });
   expect(env.PATH).toBe("/bin");
   expect(env.USER).toBe("alice");
@@ -266,7 +298,20 @@ test("TUI spawn env looks like a user session and drops billing plus relay inter
   expect(env.CC_MODS_PLUGIN_DIR).toBeUndefined();
   expect(env.FORK_GATE).toBeUndefined();
   expect(env.CLAUDE_TUI_BACKEND).toBeUndefined();
+  expect(env[CODE_MODE_ENV]).toBeUndefined();
   expect(buildSpawnArgv("sess")[0]).toBe("-c");
+});
+
+test("Code Mode env is injected when the config override is on", () => {
+  resetConfigForTests({ dir: "Workspace", ws: "home", codeMode: false });
+  const env = buildSanitizedEnv({
+    PATH: "/bin",
+    HOME: "/tmp/iso",
+    [CODE_MODE_CONFIG_ENV]: "1",
+  });
+  expect(env[CODE_MODE_ENV]).toBe("1");
+  expect(env[CODE_MODE_CONFIG_ENV]).toBeUndefined();
+  expect(collectForwardedEnv({ [CODE_MODE_CONFIG_ENV]: "1" })[CODE_MODE_ENV]).toBe("1");
 });
 
 test("local-tool-forward stays off so it cannot race Mods intercept", () => {

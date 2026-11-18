@@ -134,6 +134,91 @@ export function nativeToolResult(
   return asObject({ stdout: text, stderr: "", interrupted: false } satisfies BashOutput);
 }
 
+/**
+ * Mods `{ result }` still has to be a ToolOutputSchema object. Native failures
+ * that are not in that object live on `tool_result.is_error` (plugin `finish(true)`).
+ *
+ * In-schema channels: Bash.stderr, NotebookEdit.error, worktree.message, Grep.content.
+ * FileRead/FileEdit/FileWrite have no error arm — the is_error string occupies the
+ * primary text field so the model still sees it.
+ */
+export function nativeToolError(
+  tool: string | undefined,
+  message: unknown,
+  input: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const text = asText(message) || "Tool failed";
+  const filePath = inputPath(input);
+  if (tool === "Bash" || tool === "PowerShell") {
+    return asObject({ stdout: "", stderr: text, interrupted: false } satisfies BashOutput);
+  }
+  if (tool === "NotebookEdit") {
+    const editMode = typeof input.edit_mode === "string" && input.edit_mode ? input.edit_mode : "replace";
+    return asObject({
+      new_source: "",
+      cell_type: "code",
+      language: "python",
+      edit_mode: editMode,
+      error: text,
+      notebook_path: filePath,
+      original_file: "",
+      updated_file: "",
+    } satisfies NotebookEditOutput);
+  }
+  if (tool === "Grep") {
+    return asObject({ numFiles: 0, filenames: [], content: text } satisfies GrepOutput);
+  }
+  if (tool === "Glob") {
+    return asObject({ durationMs: 0, numFiles: 0, filenames: [], truncated: false } satisfies GlobOutput);
+  }
+  if (tool === "Read") {
+    const lines = text.split("\n");
+    return asObject({
+      type: "text",
+      file: { filePath, content: text, numLines: lines.length, startLine: 1, totalLines: lines.length },
+    } satisfies FileReadOutput);
+  }
+  if (tool === "Write") {
+    return asObject({
+      type: "update",
+      filePath,
+      content: text,
+      structuredPatch: [],
+      originalFile: null,
+    } satisfies FileWriteOutput);
+  }
+  if (tool === "Edit") {
+    return asObject({
+      filePath,
+      oldString: "",
+      newString: text,
+      originalFile: null,
+      structuredPatch: [],
+      userModified: false,
+      replaceAll: input.replace_all === true,
+    } satisfies FileEditOutput);
+  }
+  if (tool === "EnterWorktree") {
+    return asObject({ worktreePath: "", message: text } satisfies EnterWorktreeOutput);
+  }
+  if (tool === "ExitWorktree") {
+    const action = input.action === "remove" ? "remove" as const : "keep" as const;
+    return asObject({
+      action,
+      originalCwd: "",
+      worktreePath: "",
+      message: text,
+    } satisfies ExitWorktreeOutput);
+  }
+  if (tool === "Monitor") {
+    return asObject({ taskId: "", timeoutMs: 0 } satisfies MonitorOutput);
+  }
+  if (tool === "SendFile" || tool === "SendUserFile") {
+    return { filePath, bytes: 0 };
+  }
+  return asObject({ stdout: "", stderr: text, interrupted: false } satisfies BashOutput);
+}
+
 export function abortedShellResult(stdout = "", stderr = ""): BashOutput {
   const extra = "Command was aborted before completion";
   const merged = stderr ? `${stderr.trimEnd()}\n${extra}` : extra;

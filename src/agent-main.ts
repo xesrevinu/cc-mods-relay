@@ -6,6 +6,8 @@ import { usageUpdateEnabled } from "./usage-env.js";
 import { liveDiffEnabled } from "./live-diff-env.js";
 import { liveSubagentWatchEnabled } from "./live-subagent-env.js";
 import { bindModChannel, startModChannel } from "./mod-channel.js";
+import { codeModeEnabled } from "./config.js";
+import { CODE_MODE_SETTLE_MS } from "./end-of-turn.js";
 import { resolveTerminalBackendName } from "./terminal-backend.js";
 import { installTuiExitHooks, reapAllTuis } from "./tui-lifetime.js";
 import { reapOrphanHerdrWorkspaces, reapOrphanPluginProcesses } from "./tui-reap.js";
@@ -91,6 +93,7 @@ export async function bootAgent(
       tuiRoot: opts.tuiRoot,
       pluginDir,
       modChannel: channel,
+      turnSettleMs: codeModeEnabled(env) ? CODE_MODE_SETTLE_MS : 0,
     },
   };
 }

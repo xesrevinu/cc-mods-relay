@@ -3,10 +3,18 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { cancelAgent, cancelCall, execute } from "../src/exec.js";
-import { applyModEvent } from "../src/mod-live.js";
+import {
+  applyModEvent,
+  isReplDispatchResult,
+  jsonlHasReplToolUse,
+  openReplId,
+  replModEventsFromMessage,
+  withReplParent,
+} from "../src/mod-live.js";
+import { toolInfoFromToolUse } from "../src/tools.js";
 import { encodeClaudeTaskDir, persistCwd, sessionCwd } from "../src/tools/bash.js";
 import { mapPath, mapReadPath, mapWritePath, rewriteRemoteText } from "../src/tools/paths.js";
-import { nativeToolResult } from "../src/tools/runtime.js";
+import { nativeToolError, nativeToolResult } from "../src/tools/runtime.js";
 
 function run(
   dir: string,
@@ -63,6 +71,43 @@ test("nativeToolResult fallbacks match Claude Agent SDK per-tool objects", () =>
   expect(exit).toMatchObject({ action: "keep", originalCwd: "", worktreePath: "", message: "oops" });
   expect(nativeToolResult("Bash", "hi")).toEqual({ stdout: "hi", stderr: "", interrupted: false });
   expect("value" in nativeToolResult("Unknown", "x")).toBe(false);
+});
+
+test("nativeToolError uses in-schema failure fields instead of a successful fallback", () => {
+  expect(nativeToolError("Bash", "Use the Read tool")).toEqual({
+    stdout: "",
+    stderr: "Use the Read tool",
+    interrupted: false,
+  });
+  expect(nativeToolError("NotebookEdit", "Cell not found", { notebook_path: "/tmp/n.ipynb", edit_mode: "delete" })).toMatchObject({
+    error: "Cell not found",
+    new_source: "",
+    notebook_path: "/tmp/n.ipynb",
+    edit_mode: "delete",
+  });
+  expect(nativeToolError("Grep", "search failed")).toEqual({
+    numFiles: 0,
+    filenames: [],
+    content: "search failed",
+  });
+  expect(nativeToolError("Glob", "oops")).toEqual({
+    durationMs: 0,
+    numFiles: 0,
+    filenames: [],
+    truncated: false,
+  });
+  const read = nativeToolError("Read", "File does not exist: /tmp/gone.md", { file_path: "/tmp/gone.md" });
+  expect(read.type).toBe("text");
+  expect((read.file as { content: string }).content).toBe("File does not exist: /tmp/gone.md");
+  expect(nativeToolError("Write", "Permission denied: /tmp/a", { file_path: "/tmp/a" }).type).toBe("update");
+  expect(nativeToolError("ExitWorktree", "uncommitted files", { action: "remove" })).toMatchObject({
+    action: "remove",
+    message: "uncommitted files",
+  });
+  expect(nativeToolError("EnterWorktree", "not a worktree")).toMatchObject({
+    worktreePath: "",
+    message: "not a worktree",
+  });
 });
 
 test("workspace tools return Claude Agent SDK required fields", async () => {
@@ -170,6 +215,18 @@ test("Read honors offset/limit, rejects directories, and returns native text sch
   expect(missing.error.code).toBe("TOOL_FAILED");
   const dirRead = await run(dir, "Read", { file_path: join(dir, "sub") });
   expect(dirRead.ok).toBe(false);
+  const jail = await run(dir, "Read", { file_path: "/etc/passwd" });
+  expect(jail.ok).toBe(false);
+  expect(jail.error.code).toBe("PATH_DENIED");
+  const many = Array.from({ length: 2001 }, (_, i) => `L${i + 1}`).join("\n") + "\n";
+  writeFileSync(join(dir, "big.txt"), many);
+  const capped = await run(dir, "Read", { file_path: join(dir, "big.txt") });
+  expect(capped.ok).toBe(true);
+  expect(capped.result.file.numLines).toBe(2000);
+  expect(capped.result.file.totalLines).toBe(2001);
+  expect(capped.result.file.truncatedByTokenCap).toBe(true);
+  const paged = await run(dir, "Read", { file_path: join(dir, "big.txt"), offset: 1, limit: 10 });
+  expect(paged.result.file.truncatedByTokenCap).toBeUndefined();
 });
 
 test("Edit replace_all, unique-match failure, and empty old_string create", async () => {
@@ -688,6 +745,44 @@ test("EnterWorktree path switches session cwd; ExitWorktree keep restores", asyn
   expect(root.result.file.content).toBe("root");
 });
 
+test("REPL tool calls show as Code with the JavaScript", () => {
+  const info = toolInfoFromToolUse({
+    id: "repl1",
+    name: "REPL",
+    input: { code: "await edit(target, \"a\", \"b\");" },
+  });
+  expect(info.title).toBe("Code");
+  expect(info.kind).toBe("execute");
+  expect(JSON.stringify(info.content)).toContain("await edit");
+});
+
+test("JSONL REPL rows become live mod events and nest inner tools", () => {
+  const started = replModEventsFromMessage({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", id: "r1", name: "REPL", input: { code: "await file(p).text()" } }] },
+  });
+  expect(started).toEqual([{ type: "tool_started", toolUseId: "r1", tool: "REPL", input: { code: "await file(p).text()" } }]);
+  expect(isReplDispatchResult("(dispatched #1)")).toBe(true);
+  expect(isReplDispatchResult("ok")).toBe(false);
+  const tools = new Map<string, { tool: string; input: Record<string, unknown> }>([
+    ["r1", { tool: "REPL", input: {} }],
+  ]);
+  expect(openReplId(tools)).toBe("r1");
+  expect(withReplParent({ type: "tool_started", toolUseId: "b1", tool: "Bash", input: {} }, "r1")).toMatchObject({
+    parentToolUseId: "r1",
+  });
+  expect(withReplParent({ type: "tool_started", toolUseId: "r1", tool: "REPL", input: {} }, "r1").parentToolUseId).toBeUndefined();
+  expect(withReplParent({ type: "tool_finished", toolUseId: "r1" }, "r1").parentToolUseId).toBeUndefined();
+  expect(jsonlHasReplToolUse({
+    type: "assistant",
+    message: { stop_reason: "end_turn", content: [{ type: "tool_use", id: "r1", name: "REPL", input: {} }] },
+  })).toBe(true);
+  expect(jsonlHasReplToolUse({
+    type: "assistant",
+    message: { stop_reason: "end_turn", content: [{ type: "text", text: "done" }] },
+  })).toBe(false);
+});
+
 test("mod events become ACP session updates", async () => {
   const updates: any[] = [];
   const client = { sessionUpdate: async (note: any) => { updates.push(note.update); } };
@@ -703,4 +798,27 @@ test("mod events become ACP session updates", async () => {
   expect(await applyModEvent("s", { type: "turn_completed", reason: "answer" }, {
     client, tools, cwd: "/tmp", supportsTerminal: false,
   })).toBe("turn_completed");
+});
+
+test("ACP shows a failed Read as error text, not numbered file contents", async () => {
+  const updates: any[] = [];
+  const client = { sessionUpdate: async (note: any) => { updates.push(note.update); } };
+  const tools = new Map<string, { tool: string; input: Record<string, unknown> }>();
+  const ctx = { client, tools, cwd: "/tmp", supportsTerminal: false };
+  await applyModEvent("s", { type: "tool_started", toolUseId: "r", tool: "Read", input: { file_path: "/tmp/gone.md" } }, ctx);
+  await applyModEvent("s", {
+    type: "tool_finished",
+    toolUseId: "r",
+    isError: true,
+    error: "File does not exist: /tmp/gone.md",
+    result: {
+      type: "text",
+      file: { filePath: "/tmp/gone.md", content: "File does not exist: /tmp/gone.md", numLines: 1, startLine: 1, totalLines: 1 },
+    },
+  }, ctx);
+  const done = updates.find((u) => u.sessionUpdate === "tool_call_update" && u.status === "failed");
+  expect(done?.status).toBe("failed");
+  const text = done?.content?.[0]?.content?.text as string;
+  expect(text).toContain("File does not exist: /tmp/gone.md");
+  expect(text).not.toMatch(/^1\t/);
 });

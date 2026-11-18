@@ -1240,3 +1240,39 @@ test("Mods tool events hold the stall watchdog instead of letting a live turn ex
   expect(notes).toBeGreaterThan(0);
 });
 
+test("stale aborted turn_completed does not cancel a newer prompt", async () => {
+  const { agent, cwd } = harness();
+  live.push(agent);
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  const created = await agent.newSession({ cwd, mcpServers: [] });
+  const session = agent.sessions[created.sessionId];
+  const emptyDetector = {
+    beginTurn() {},
+    observe() {},
+    noteActivity() {},
+    hold() {},
+    release() {},
+    markCancelled() {},
+    stop() {},
+    finish() {},
+  };
+  session.turnDetector = emptyDetector;
+  let cancelled = 0;
+  session.turnCancel = () => {
+    cancelled += 1;
+  };
+  await agent.handleModEvent({ type: "turn_started", turnId: "turn-1" });
+  expect(session.modTurnId).toBe("turn-1");
+  await agent.handleModEvent({ type: "turn_completed", reason: "aborted", isAborted: true, turnId: "turn-1" });
+  expect(cancelled).toBe(1);
+
+  cancelled = 0;
+  session.modTurnId = undefined;
+  session.turnDetector = emptyDetector;
+  session.turnCancel = () => {
+    cancelled += 1;
+  };
+  await agent.handleModEvent({ type: "turn_completed", reason: "aborted", isAborted: true, turnId: "turn-1" });
+  expect(cancelled).toBe(0);
+});
+

@@ -6,10 +6,14 @@ import {
   extraClaudeFlags,
   resolveShell,
   spawnClaudePty,
+  withCodeModeFlags,
   type CcModsRelayFlags,
+  type PtyEngineHandle,
 } from "./engine-pty.js";
+import { CODE_MODE_ENV } from "./config.js";
+import { acceptCodeModeCaveats } from "./environment.js";
+import { homedir } from "node:os";
 import { appendSystemPromptFileFlag, disallowedToolsFlag } from "./local-tool-forward.js";
-import type { PtyEngineHandle } from "./engine-pty.js";
 import { isSafeAgentRef } from "./agent-catalog.js";
 import { isSessionId } from "./session-delete.js";
 
@@ -156,7 +160,9 @@ export function buildResumeArgv(
   const ag = agent && agent !== "default" && isSafeAgentRef(agent) ? ` --agent "${agent}"` : "";
   const dirs = buildAddDirFlags(additionalDirectories);
   const mcp = mcpConfigFile ? ` --mcp-config "${mcpConfigFile}"` : "";
-  const denied = disallowedToolsFlag(disallowedTools);
+  const denied = disallowedToolsFlag(
+    extraFlags?.codeMode ? disallowedTools?.filter((name) => name !== "REPL") : disallowedTools,
+  );
   const append = appendSystemPromptFileFlag(appendSystemPromptFile);
   const flags = `${pm}${ef}${ag}${dirs}${mcp}${denied}${append}${extraClaudeFlags(extraFlags)}`;
   if (!isSessionId(sessionId)) {
@@ -193,6 +199,7 @@ export function spawnResumePty(opts: SpawnResumeOptions): PtyEngineHandle {
   const { sessionId, cwd, baseEnv = process.env, spawn = createHerdrSpawn({ herdrSession: process.env.CLAUDE_TUI_HERDR_SESSION || "default" }) } = opts;
 
   const shell = resolveShell(baseEnv);
+  const extraFlags = withCodeModeFlags(opts.extraFlags, baseEnv);
   const argv = buildResumeArgv(
     sessionId,
     opts.permissionMode,
@@ -202,10 +209,13 @@ export function spawnResumePty(opts: SpawnResumeOptions): PtyEngineHandle {
     opts.mcpConfigFile,
     opts.disallowedTools,
     opts.appendSystemPromptFile,
-    opts.extraFlags,
+    extraFlags,
     opts.forkedSessionId ? { forkSessionId: opts.forkedSessionId } : undefined,
   );
   const env = buildSanitizedEnv(baseEnv);
+  if (env[CODE_MODE_ENV] === "1") {
+    acceptCodeModeCaveats(env, typeof env.HOME === "string" ? env.HOME : homedir());
+  }
 
   assertSpawnEnvUntainted(env);
 

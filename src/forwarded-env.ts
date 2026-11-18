@@ -1,3 +1,5 @@
+import { CODE_MODE_ENV, codeModeEnabled } from "./config.js";
+
 export const FORWARDED_ENV = [
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_API_KEY",
@@ -16,6 +18,7 @@ export const FORWARDED_ENV = [
   "DISABLE_AUTOUPDATER",
   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
   "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+  CODE_MODE_ENV,
   "CI",
 ] as const;
 
@@ -28,5 +31,6 @@ export function collectForwardedEnv(env: NodeJS.ProcessEnv = process.env): Recor
     if (!value) continue;
     out[key] = value;
   }
+  if (codeModeEnabled(env)) out[CODE_MODE_ENV] = "1";
   return out;
 }

@@ -7,6 +7,13 @@ export { TURN_WATCHDOG_MS, FILE_DISCOVERY_WATCHDOG_MS };
 
 export const TURN_STALL_WATCHDOG_MS = 120_000;
 
+/** Code Mode: wait this long after `turn.complete` for REPL inner tools to start. */
+export const CODE_MODE_SETTLE_MS = 15_000;
+/** After the last inner tool, wait this long for another REPL round or the answer. */
+export const CODE_MODE_ANSWER_MS = 15_000;
+/** Idle window after answer chunks (or extra inner tools) before ACP `end_turn`. */
+export const CODE_MODE_QUIET_MS = 400;
+
 export const TURN_WATCHDOG_ENV = "FORK_TURN_WATCHDOG_MS";
 
 function resolveDefaultWatchdogMs(): number {
@@ -140,6 +147,11 @@ export interface EndOfTurnDetectorOptions {
   schedule?: DetectorSchedule;
   deltaTMs?: number;
   watchdogMs?: number;
+  /**
+   * After Mods `turn.complete` with no in-flight tools, wait this long for a
+   * late tool to start (Code Mode REPL). `0` confirms immediately.
+   */
+  settleMs?: number;
   sessionId?: string;
   logger?: { error: (...args: unknown[]) => void };
 }
@@ -153,7 +165,11 @@ export interface EndOfTurnDetector {
   release(id: string): void;
   markCancelled(): void;
   stop(): void;
-  /** Mods `turn.complete` — settle now, without waiting for a JSONL stop_reason. */
+  /**
+   * Mods `turn.complete`. Waits for in-flight holds (and `settleMs` when no
+   * tool has started yet) so Code Mode can run REPL inner tools before ACP
+   * `session/prompt` returns.
+   */
   finish(stopReason?: string): void;
 }
 
@@ -182,13 +198,18 @@ export function createEndOfTurnDetector(opts: EndOfTurnDetectorOptions): EndOfTu
   const schedule = opts.schedule ?? defaultSchedule;
   const deltaTMs = opts.deltaTMs ?? DELTA_T_MS;
   const watchdogMs = opts.watchdogMs ?? resolveDefaultWatchdogMs();
+  const settleMs = opts.settleMs ?? 0;
+  const answerMs = settleMs > 0 ? Math.min(settleMs, CODE_MODE_ANSWER_MS) : 0;
+  const quietMs = settleMs > 0 ? Math.min(settleMs, CODE_MODE_QUIET_MS) : 0;
 
   let pendingCandidate: StopReasonEvent | undefined;
   let cancelDelta: (() => void) | undefined;
   let cancelWatchdog: (() => void) | undefined;
+  let cancelSettle: (() => void) | undefined;
   let lastEvent: StopReasonEvent | undefined;
   const firedUuids = new Set<string>();
   const openTaskIds = new Set<string>();
+  let seenWork = false;
   let stopped = false;
   let cancelled = false;
 
@@ -202,17 +223,56 @@ export function createEndOfTurnDetector(opts: EndOfTurnDetectorOptions): EndOfTu
     cancelWatchdog = undefined;
   }
 
+  function clearSettle(): void {
+    cancelSettle?.();
+    cancelSettle = undefined;
+  }
+
   function confirmBoundary(): void {
     if (cancelled) return;
+    if (openTaskIds.size > 0) return;
+    // Code Mode: Mods turn.complete arms settleMs so REPL inner tools can
+    // start. A JSONL user/assistant write must not cut that wait short.
+    if (cancelSettle) return;
     const boundary = pendingCandidate;
     if (!boundary) return;
     pendingCandidate = undefined;
+    seenWork = false;
     clearDelta();
     clearWatchdog();
+    clearSettle();
     openTaskIds.clear();
     const uuid = eventUuid(boundary);
     if (uuid) firedUuids.add(uuid);
     opts.onEndOfTurn(boundary);
+  }
+
+  function armSettle(ms: number): void {
+    clearSettle();
+    if (ms <= 0) {
+      confirmBoundary();
+      return;
+    }
+    cancelSettle = schedule(() => {
+      cancelSettle = undefined;
+      confirmBoundary();
+    }, ms);
+  }
+
+  /** Confirm now, or wait `settleMs` for a late Code Mode tool to appear. */
+  function tryFinish(_fromRelease: boolean): void {
+    if (cancelled || stopped) return;
+    if (openTaskIds.size > 0) return;
+    if (!pendingCandidate) return;
+    if (settleMs > 0 && !seenWork) {
+      armSettle(settleMs);
+      return;
+    }
+    if (settleMs > 0 && seenWork && answerMs > 0) {
+      armSettle(answerMs);
+      return;
+    }
+    confirmBoundary();
   }
 
   function armDelta(): void {
@@ -244,6 +304,8 @@ export function createEndOfTurnDetector(opts: EndOfTurnDetectorOptions): EndOfTu
   return {
     beginTurn(): void {
       if (stopped || cancelled) return;
+      seenWork = false;
+      clearSettle();
       armWatchdog();
     },
     observe(event: StopReasonEvent): void {
@@ -265,35 +327,43 @@ export function createEndOfTurnDetector(opts: EndOfTurnDetectorOptions): EndOfTu
     noteActivity(): void {
       if (stopped || cancelled) return;
       if (cancelWatchdog !== undefined) armWatchdog();
+      if (cancelSettle !== undefined) armSettle(seenWork ? quietMs : settleMs);
     },
     hold(id: string): void {
       if (stopped || cancelled || !id) return;
+      seenWork = true;
       openTaskIds.add(id);
+      clearSettle();
       if (cancelWatchdog !== undefined) armWatchdog();
     },
     release(id: string): void {
       if (stopped || cancelled || !id) return;
       openTaskIds.delete(id);
       if (cancelWatchdog !== undefined) armWatchdog();
+      tryFinish(true);
     },
     markCancelled(): void {
       cancelled = true;
       clearDelta();
       clearWatchdog();
+      clearSettle();
       pendingCandidate = undefined;
+      seenWork = false;
       openTaskIds.clear();
     },
     stop(): void {
       stopped = true;
       clearDelta();
       clearWatchdog();
+      clearSettle();
       pendingCandidate = undefined;
+      seenWork = false;
       openTaskIds.clear();
     },
     finish(stopReason = "end_turn"): void {
       if (stopped || cancelled) return;
       pendingCandidate = { type: "assistant", message: { stop_reason: stopReason } };
-      confirmBoundary();
+      tryFinish(false);
     },
   };
 }
@@ -309,6 +379,7 @@ export interface TurnResolverOptions {
   logger?: StopReasonLogger;
   deltaTMs?: number;
   watchdogMs?: number;
+  settleMs?: number;
   onTurnResolved?: () => void;
 }
 
@@ -345,6 +416,7 @@ export function createTurnResolver(opts: TurnResolverOptions = {}): TurnResolver
     logger: opts.logger,
     deltaTMs: opts.deltaTMs,
     watchdogMs: opts.watchdogMs,
+    settleMs: opts.settleMs,
   });
 
   return {

@@ -13,9 +13,60 @@ function isLocalTool(tool) {
   return WORKSPACE_TOOLS.has(tool) || DEFERRED_TOOLS.has(tool);
 }
 
-/** Mods `tool.call` only accepts `{ result }` or `{ deny }`. Anything else is skipped and the builtin runs on Mini. */
+/** Mods `tool.call` only accepts `{ result }` or `{ deny }`. Hook-authored `{ isError: true }` skips/unloads the hook. */
 function failResult(message) {
   return { deny: String(message) };
+}
+
+/** User/transport/jail refusal — not a completed tool. Missing files must not go through here. */
+function permissionDenied(code) {
+  return code === "CANCELLED" || code === "UNAUTHORIZED" || code === "CALL_ID_CONFLICT" || code === "PATH_DENIED";
+}
+
+function resultPath(input) {
+  if (typeof input.file_path === "string") return input.file_path;
+  if (typeof input.path === "string") return input.path;
+  if (typeof input.notebook_path === "string") return input.notebook_path;
+  return "";
+}
+
+/**
+ * Tool ran and failed. `{ deny }` would show as permission denied in the TUI.
+ * Must not reuse objectResult (that wrapper is a successful fallback).
+ */
+function errorResult(tool, message, input) {
+  const text = String(message || "Tool failed");
+  const filePath = resultPath(input);
+  if (tool === "Bash" || tool === "PowerShell") return { stdout: "", stderr: text, interrupted: false };
+  if (tool === "NotebookEdit") {
+    return {
+      new_source: "",
+      cell_type: "code",
+      language: "python",
+      edit_mode: typeof input.edit_mode === "string" && input.edit_mode ? input.edit_mode : "replace",
+      error: text,
+      notebook_path: filePath,
+      original_file: "",
+      updated_file: "",
+    };
+  }
+  if (tool === "Grep") return { numFiles: 0, filenames: [], content: text };
+  if (tool === "Glob") return { durationMs: 0, numFiles: 0, filenames: [], truncated: false };
+  if (tool === "Read") {
+    const lines = text.split("\n");
+    return { type: "text", file: { filePath, content: text, numLines: lines.length, startLine: 1, totalLines: lines.length } };
+  }
+  if (tool === "Write") return { type: "update", filePath, content: text, structuredPatch: [], originalFile: null };
+  if (tool === "Edit") {
+    return { filePath, oldString: "", newString: text, originalFile: null, structuredPatch: [], userModified: false, replaceAll: input.replace_all === true };
+  }
+  if (tool === "EnterWorktree") return { worktreePath: "", message: text };
+  if (tool === "ExitWorktree") {
+    return { action: input.action === "remove" ? "remove" : "keep", originalCwd: "", worktreePath: "", message: text };
+  }
+  if (tool === "Monitor") return { taskId: "", timeoutMs: 0 };
+  if (tool === "SendFile" || tool === "SendUserFile") return { filePath, bytes: 0 };
+  return { stdout: "", stderr: text, interrupted: false };
 }
 
 /** Mods `{ result }` must match Claude Agent SDK ToolOutputSchemas. A string skips the hook and runs the builtin on the TUI host. */
@@ -245,6 +296,78 @@ function emit($, socketPath, event) {
 
 const pending = [];
 let flushing = false;
+const mainInflight = new Set();
+let sawReplThisTurn = false;
+let completeGen = 0;
+let pendingComplete = null;
+let currentTurnId = "";
+
+function resetPendingComplete() {
+  completeGen++;
+  pendingComplete = null;
+  sawReplThisTurn = false;
+  mainInflight.clear();
+}
+
+function flushTurnComplete($, sock) {
+  const payload = pendingComplete;
+  pendingComplete = null;
+  if (!payload) return;
+  sawReplThisTurn = false;
+  emit($, sock, {
+    type: "turn_completed",
+    reason: payload.reason,
+    isAborted: payload.isAborted,
+    ...(payload.turnId ? { turnId: payload.turnId } : {}),
+  });
+  const u = payload.usage;
+  if (u && typeof u.input_tokens === "number" && typeof u.output_tokens === "number") {
+    emit($, sock, {
+      type: "usage",
+      inputTokens: u.input_tokens,
+      outputTokens: u.output_tokens,
+      cachedReadTokens: u.cache_read_input_tokens,
+      cachedWriteTokens: u.cache_creation_input_tokens,
+    });
+  }
+  void rpc($, { type: "turn.complete", answer: payload.answer || "", isAborted: payload.isAborted }, 5_000).catch(() => {});
+}
+
+function settleTurnComplete($, sock) {
+  const gen = ++completeGen;
+  const payload = pendingComplete;
+  if (!payload) return;
+  if (!sawReplThisTurn && mainInflight.size === 0) {
+    flushTurnComplete($, sock);
+    return;
+  }
+  void after($, 0).then(async () => {
+    let idle = 0;
+    let started = false;
+    let waited = 0;
+    while (gen === completeGen && pendingComplete === payload) {
+      if (mainInflight.size > 0) {
+        started = true;
+        idle = 0;
+        await after($, 100);
+        waited += 100;
+        if (waited >= 15_000) {
+          if (gen === completeGen && pendingComplete === payload) flushTurnComplete($, sock);
+          return;
+        }
+        continue;
+      }
+      idle += 100;
+      waited += 100;
+      const need = started ? (sawReplThisTurn ? 8_000 : 400) : 8_000;
+      if (idle >= need || waited >= 15_000) {
+        if (gen === completeGen && pendingComplete === payload) flushTurnComplete($, sock);
+        return;
+      }
+      await after($, 100);
+    }
+  });
+}
 
 function enqueue($, text, agentId) {
   if (!text) return;
@@ -303,8 +426,17 @@ export function register(on) {
   let claudeSessionId = "";
   let tuiUid = "";
   const spawnToolUse = new Map();
+  const replStack = [];
+
+  function pushRepl(id) {
+    if (typeof id !== "string" || !id) return;
+    sawReplThisTurn = true;
+    if (replStack[replStack.length - 1] !== id) replStack.push(id);
+  }
 
   on("session.start", async ($, e, next) => {
+    resetPendingComplete();
+    replStack.length = 0;
     claudeSessionId = await sessionIdOf($, e);
     tuiUid = await tuiUidOf($);
     socket = await modSocket($);
@@ -372,6 +504,9 @@ export function register(on) {
     if (!e.agentId) {
       mainBusy = true;
       hitMaxTokens = false;
+      resetPendingComplete();
+      replStack.length = 0;
+      currentTurnId = typeof e.turnId === "string" ? e.turnId : "";
       emit($, socket, { type: "turn_started", turnId: e.turnId });
     }
     return next(e);
@@ -441,16 +576,27 @@ export function register(on) {
   });
 
   on("tool.call", async ($, e, next) => {
-    const parent = e.agentId ? spawnToolUse.get(e.agentId) : undefined;
+    const nested = e.tool !== "REPL" && replStack.length ? replStack[replStack.length - 1] : undefined;
+    const parent = e.agentId ? spawnToolUse.get(e.agentId) : nested;
     const tag = parent ? { parentToolUseId: parent } : {};
     const toolUseId = e.tool_use_id;
+    if (!e.agentId && typeof toolUseId === "string" && toolUseId) mainInflight.add(toolUseId);
     const input = toolInput(e);
     emit($, socket, { type: "tool_started", toolUseId, tool: e.tool, input, ...tag });
 
-    const finish = (isError, result) => {
-      emit($, socket, { type: "tool_finished", toolUseId, isError, ...(result !== undefined ? { result } : {}), ...tag });
+    const finish = (isError, result, error) => {
+      emit($, socket, {
+        type: "tool_finished",
+        toolUseId,
+        isError,
+        ...(result !== undefined ? { result } : {}),
+        ...(isError && error ? { error: String(error) } : {}),
+        ...tag,
+      });
     };
 
+    if (e.tool === "REPL") pushRepl(toolUseId);
+    try {
     if (isLocalTool(e.tool)) {
       let frame;
       try {
@@ -469,17 +615,31 @@ export function register(on) {
       } catch (error) {
         try { await rpc($, { type: "cancel", callId: toolUseId }, 5_000); } catch { /* already gone */ }
         const message = error && error.message ? String(error.message) : String(error);
-        finish(true);
+        finish(true, undefined, message);
         return failResult(message);
       }
       if (!frame || !frame.ok) {
-        const message = `${frame?.error?.code || "ERROR"}: ${frame?.error?.message || "Tool failed"}`;
-        finish(true);
-        return failResult(message);
+        const code = frame && frame.error && frame.error.code ? String(frame.error.code) : "ERROR";
+        const message = frame && frame.error && frame.error.message ? String(frame.error.message) : "Tool failed";
+        if (permissionDenied(code)) {
+          finish(true, undefined, `${code}: ${message}`);
+          return failResult(`${code}: ${message}`);
+        }
+        // Mac already confirmed ENOENT. Let Mini's builtin Read set core isError
+        // (a hook cannot author that form; returning it unloads us).
+        if (e.tool === "Read" && /File does not exist:/i.test(message)) {
+          const ran = await next(e);
+          finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result, message);
+          return ran;
+        }
+        const result = errorResult(e.tool, message, input);
+        finish(true, result, message);
+        return { result };
       }
       if (frame.result === undefined) {
-        finish(true);
-        return failResult("empty tool result");
+        const result = errorResult(e.tool, "empty tool result", input);
+        finish(true, result, "empty tool result");
+        return { result };
       }
       const result = objectResult(e.tool, frame.result, input);
       finish(false, result);
@@ -500,9 +660,23 @@ export function register(on) {
     }
 
     const ran = await next(e);
-    finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result);
+    finish(
+      ran.deny !== undefined || ran.isError === true,
+      ran.deny !== undefined ? undefined : ran.result,
+      ran.deny,
+    );
     return ran;
+    } finally {
+      if (!e.agentId && typeof toolUseId === "string" && toolUseId) mainInflight.delete(toolUseId);
+      if (e.tool === "REPL" && replStack.length && replStack[replStack.length - 1] === toolUseId) {
+        replStack.pop();
+      }
+    }
   }).catch(async ($, e, next) => {
+    if (!e.agentId && typeof e.tool_use_id === "string" && e.tool_use_id) mainInflight.delete(e.tool_use_id);
+    if (e.tool === "REPL" && replStack.length && replStack[replStack.length - 1] === e.tool_use_id) {
+      replStack.pop();
+    }
     if (isLocalTool(e.tool) && !next.called) {
       try { await rpc($, { type: "cancel", callId: e.tool_use_id }, 5_000); } catch { /* already gone */ }
       return failResult("Tool call was cancelled");
@@ -522,18 +696,15 @@ export function register(on) {
     if (!e.agentId) {
       mainBusy = false;
       const reason = e.reason === "answer" && hitMaxTokens ? "max_tokens" : e.reason;
-      emit($, socket, { type: "turn_completed", reason, isAborted: !!e.isAborted });
-      const u = e.usage;
-      if (u && typeof u.input_tokens === "number" && typeof u.output_tokens === "number") {
-        emit($, socket, {
-          type: "usage",
-          inputTokens: u.input_tokens,
-          outputTokens: u.output_tokens,
-          cachedReadTokens: u.cache_read_input_tokens,
-          cachedWriteTokens: u.cache_creation_input_tokens,
-        });
-      }
-      try { await rpc($, { type: "turn.complete", answer: e.answer || "", isAborted: !!e.isAborted }, 5_000); } catch { /* ignore */ }
+      pendingComplete = {
+        reason,
+        isAborted: !!e.isAborted,
+        answer: e.answer || "",
+        usage: e.usage,
+        turnId: typeof e.turnId === "string" && e.turnId ? e.turnId : currentTurnId,
+      };
+      if (e.isAborted) flushTurnComplete($, socket);
+      else settleTurnComplete($, socket);
     }
     return next(e);
   });

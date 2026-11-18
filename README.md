@@ -101,6 +101,16 @@ Without `--url`, this binary starts an in-process server on loopback. The TUI an
 cc-mods-relay doctor
 ```
 
+Code Mode is off by default. Opt in from `~/.config/cc-mods-relay/config.json` (or `CC_MODS_CODE_MODE=1`). That sets `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` on the TUI and skips the first-run confirmation. Needs Claude Code v2.1.327 or later. Workspace tools still run on this machine; the `REPL` sandbox stays on the TUI host.
+
+```json
+{
+  "dir": "Workspace",
+  "ws": "home",
+  "codeMode": true
+}
+```
+
 ## Session folder
 
 The TUI cds into the client's working directory. The server creates that path when it is missing, so Claude Code's Environment is `/Users/you/...` rather than the server user's home. If mkdir fails, it uses the same path under the server `$HOME`:

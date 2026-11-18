@@ -7,7 +7,7 @@ import { hydrateTool } from "./tools/hydrate.js";
 import { cancelAgent, cancelSession, wasCancelled } from "./tools/jobs.js";
 import { monitorTool } from "./tools/monitor.js";
 import { notebookEditTool } from "./tools/notebook.js";
-import { mapPath, mergeRoots } from "./tools/paths.js";
+import { mapPath, mergeRoots, PathDeniedError } from "./tools/paths.js";
 import { readTool } from "./tools/read.js";
 import { abortedShellResult, nativeToolResult, SHELL_TOOLS, type Send, type ToolFrame } from "./tools/runtime.js";
 import { enterWorktreeTool, exitWorktreeTool } from "./tools/worktree.js";
@@ -72,6 +72,7 @@ export async function execute(frame: ToolFrame, send: Send, notify: Send = send)
       if (shell) return ok(reply, frame, abortedShellResult());
       return fail(reply, frame, "CANCELLED", message);
     }
+    if (error instanceof PathDeniedError) return fail(reply, frame, "PATH_DENIED", message);
     return fail(reply, frame, "TOOL_FAILED", message);
   }
 }

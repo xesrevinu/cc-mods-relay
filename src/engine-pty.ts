@@ -3,9 +3,12 @@ import { createHerdrSpawn } from "./herdr-backend.js";
 import type { EngineTerminal, TerminalSpawn } from "./terminal-backend.js";
 import { appendSystemPromptFileFlag, disallowedToolsFlag } from "./local-tool-forward.js";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { isSafeAgentRef } from "./agent-catalog.js";
+import { CODE_MODE_ENV, codeModeEnabled } from "./config.js";
 import { debug } from "./debug.js";
+import { acceptCodeModeCaveats } from "./environment.js";
 
 const PTY_NAME = "xterm-256color";
 const PTY_COLS = 120;
@@ -33,7 +36,11 @@ export type CcModsRelayFlags = {
   skipPermissions?: boolean;
   tools?: string[];
   model?: string;
+  /** Keep `REPL` on the launch tool list when Code Mode is on. */
+  codeMode?: boolean;
 };
+
+const CODE_MODE_TOOL = "REPL";
 
 const MODEL_NAME = /^[A-Za-z0-9._-]+$/;
 
@@ -76,6 +83,7 @@ export function buildSanitizedEnv(
   env.COLORTERM = "truecolor";
   env.FORCE_COLOR = "3";
   env[TODO_TOOLS_ENV] ??= "1";
+  if (codeModeEnabled(baseEnv)) env[CODE_MODE_ENV] = "1";
   return env;
 }
 
@@ -113,7 +121,9 @@ export function buildClaudeCmd(
   if (settingsFile) cmd += ` --settings "${settingsFile}"`;
   cmd += buildAddDirFlags(additionalDirectories);
   if (mcpConfigFile) cmd += ` --mcp-config "${mcpConfigFile}"`;
-  cmd += disallowedToolsFlag(disallowedTools);
+  cmd += disallowedToolsFlag(
+    extraFlags?.codeMode ? withoutRepl(disallowedTools) : disallowedTools,
+  );
   cmd += appendSystemPromptFileFlag(appendSystemPromptFile);
   cmd += extraClaudeFlags(extraFlags);
   debug("tui command", { cmd });
@@ -130,12 +140,27 @@ export function extraClaudeFlags(flags: CcModsRelayFlags = {}): string {
   const tools = (flags.tools ?? [])
     .map((name) => name.trim())
     .filter((name) => TOOL_NAME.test(name));
+  if (flags.codeMode && tools.length && !tools.includes(CODE_MODE_TOOL)) tools.push(CODE_MODE_TOOL);
   if (tools.length) out += ` --tools ${tools.join(",")}`;
   // Native macOS/Linux CC drops Grep/Glob in favor of bash find/grep. Naming
   // either in --allowedTools restores both without replacing the default set.
-  else out += " --allowedTools Grep,Glob";
+  // Code Mode also needs REPL on the allowed list (`this launch's tool options`).
+  else out += flags.codeMode ? " --allowedTools Grep,Glob,REPL" : " --allowedTools Grep,Glob";
   if (flags.model && MODEL_NAME.test(flags.model)) out += ` --model ${flags.model}`;
   return out;
+}
+
+function withoutRepl(names: string[] | undefined): string[] | undefined {
+  if (!names?.length) return names;
+  const next = names.filter((name) => name !== CODE_MODE_TOOL);
+  return next.length === names.length ? names : next;
+}
+
+export function withCodeModeFlags(
+  extraFlags: CcModsRelayFlags | undefined,
+  env: Record<string, string | undefined>,
+): CcModsRelayFlags {
+  return { ...extraFlags, codeMode: extraFlags?.codeMode ?? codeModeEnabled(env) };
 }
 
 export function isSafeDir(p: string): boolean {
@@ -228,6 +253,7 @@ export function spawnClaudePty(opts: SpawnPtyOptions): PtyEngineHandle {
 
   const sessionId = opts.sessionId ?? randomUUID();
   const shell = resolveShell(baseEnv);
+  const flags = withCodeModeFlags(extraFlags, baseEnv);
   const argv = buildSpawnArgv(
     sessionId,
     permissionMode,
@@ -238,10 +264,13 @@ export function spawnClaudePty(opts: SpawnPtyOptions): PtyEngineHandle {
     mcpConfigFile,
     disallowedTools,
     appendSystemPromptFile,
-    extraFlags,
+    flags,
   );
 
   const env = buildSanitizedEnv(baseEnv);
+  if (env[CODE_MODE_ENV] === "1") {
+    acceptCodeModeCaveats(env, typeof env.HOME === "string" ? env.HOME : homedir());
+  }
 
   assertSpawnEnvUntainted(env);
 
