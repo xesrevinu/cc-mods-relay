@@ -7,6 +7,7 @@ import { pinTuiLocale, workspaceSpawnEnv } from "./workspace-env.js";
 import { cancelCall, finishJob, getJobOutputFile, promoteJobToBackground, registerJob, wasCancelled } from "./jobs.js";
 import { classifyBashIntent, droppedRedundantCd, REDUNDANT_CD_HINT } from "./bash-intent.js";
 import { asBool, asNumber, asString, encodeClaudeDir, insideWriteRoot, mapCwd, mergeRoots, rewriteRemoteText } from "./paths.js";
+import { detectModifiedReadFiles } from "./read-state.js";
 import { abortedShellResult, clampTimeout, killTree, type Send, type ToolFrame } from "./runtime.js";
 
 const MAX_OUTPUT = 30_000;
@@ -37,6 +38,109 @@ function attachExitMeta(result: BashOutput, exitCode: number, rawStderr: string)
     exitMetaByResult.set(result, { exitCode, rawStderr });
   }
   return result;
+}
+
+const NO_MATCH_BINS = new Set(["grep", "rg", "egrep", "fgrep", "findstr"]);
+const DIFF_BINS = new Set(["diff", "fc", "cmp"]);
+const SILENT_BINS = new Set(["mkdir", "cp", "mv", "rm", "rmdir", "touch", "chmod", "chown", "ln", "cd", "export", "unset", "true", ":"]);
+
+function finalCommandInfo(command: string): { bin: string; sub: string; andOrGated: boolean } {
+  let quote: string | undefined;
+  let lastStart = 0;
+  let andOrGated = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < command.length) {
+        i += 1;
+        continue;
+      }
+      if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < command.length) {
+      i += 1;
+      continue;
+    }
+    if (ch === "&" && command[i + 1] === "&") {
+      andOrGated = true;
+      i += 1;
+      lastStart = i + 1;
+      continue;
+    }
+    if (ch === "|" && command[i + 1] === "|") {
+      andOrGated = true;
+      i += 1;
+      lastStart = i + 1;
+      continue;
+    }
+    if (ch === "|" || ch === ";" || ch === "\n") {
+      if (ch === ";" || ch === "\n") andOrGated = false;
+      lastStart = i + 1;
+    }
+  }
+  const tail = command.slice(lastStart).trim();
+  const parts = tail.split(/\s+/).filter(Boolean);
+  let idx = 0;
+  while (idx < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[idx]!)) idx += 1;
+  const rawBin = (parts[idx] ?? "").replace(/^["']|["']$/g, "");
+  const bin = (rawBin.split(/[\\/]/).pop() ?? rawBin).toLowerCase();
+  const sub = (parts[idx + 1] ?? "").replace(/^["']|["']$/g, "").toLowerCase();
+  return { bin, sub, andOrGated };
+}
+
+/** Native Claude Code Bash semantics: exit 1 from grep/rg/diff is informational, not an error. */
+export function interpretExitCode(command: string, code: number): string | undefined {
+  if (code !== 1) return undefined;
+  const info = finalCommandInfo(command);
+  if (info.andOrGated) return undefined;
+  if (NO_MATCH_BINS.has(info.bin)) return "No matches found";
+  if (DIFF_BINS.has(info.bin)) return "Files differ";
+  return undefined;
+}
+
+export function expectsNoOutput(command: string): boolean {
+  const info = finalCommandInfo(command);
+  if (SILENT_BINS.has(info.bin)) return true;
+  if (info.bin === "git" && (info.sub === "add" || info.sub === "rm" || info.sub === "mv")) return true;
+  return false;
+}
+
+function finalizeForeground(
+  command: string,
+  code: number,
+  aborted: boolean,
+  stdoutText: string,
+  stderrText: string,
+  noteRedundantCd: boolean,
+  sandbox: Record<string, unknown>,
+  sessionId: string,
+  cwd: string,
+): BashOutput {
+  const rawStderr = clip(stderrText);
+  const interpretation = !aborted ? interpretExitCode(command, code) : undefined;
+  let stderr = rawStderr;
+  if (aborted) stderr = append(stderr, "Command was aborted before completion");
+  else if (code !== 0 && !interpretation) stderr = append(stderr, `Exit code ${code}`);
+  const outClipped = clip(stdoutText.trimEnd());
+  const errClipped = stderr.trimEnd();
+  const staleHint = !aborted ? detectModifiedReadFiles(sessionId, cwd) : undefined;
+  const noOut = !aborted && code === 0 && !outClipped && !errClipped && expectsNoOutput(command);
+  const res = withRedundantCdHint({
+    stdout: outClipped,
+    stderr: errClipped,
+    interrupted: aborted,
+    ...(interpretation ? { returnCodeInterpretation: interpretation } : {}),
+    ...(noOut ? { noOutputExpected: true } : {}),
+    ...(staleHint ? { staleReadFileStateHint: staleHint } : {}),
+    ...sandbox,
+  }, noteRedundantCd);
+  if (aborted || interpretation) return res;
+  return attachExitMeta(res, code, noteRedundantCd ? append(rawStderr, REDUNDANT_CD_HINT).trimEnd() : rawStderr.trimEnd());
 }
 
 type StreamBuffer = {
@@ -451,18 +555,7 @@ export async function bashTool(
       const nextCwd = (await Bun.file(pwdFile).text().catch(() => "")).trim();
       if (nextCwd) persistCwd(workspace, sessionId, nextCwd, extraDirs, false, frame.agentId);
       await Bun.file(pwdFile).delete().catch(() => {});
-      const code = drained.value;
-      const rawStderr = clip(stderrBuf.text);
-      let stderr = rawStderr;
-      if (aborted) stderr = append(stderr, "Command was aborted before completion");
-      else if (code !== 0) stderr = append(stderr, `Exit code ${code}`);
-      const res = withRedundantCdHint({
-        stdout: clip(stdout.text.trimEnd()),
-        stderr: stderr.trimEnd(),
-        interrupted: aborted,
-        ...sandbox,
-      }, noteRedundantCd);
-      return aborted ? res : attachExitMeta(res, code, noteRedundantCd ? append(rawStderr, REDUNDANT_CD_HINT).trimEnd() : rawStderr.trimEnd());
+      return finalizeForeground(command, drained.value, aborted, stdout.text, stderrBuf.text, noteRedundantCd, sandbox, sessionId, cwd);
     }
     const finished = Promise.all([pumpsDone, proc.exited]);
     watchBackground(proc, finished, frame, { stdout, stderr: stderrBuf }, notify, BG_TIMEOUT_DEFAULT, workspace, pwdFile);
@@ -481,18 +574,7 @@ export async function bashTool(
   const nextCwd = (await Bun.file(pwdFile).text().catch(() => "")).trim();
   if (nextCwd) persistCwd(workspace, sessionId, nextCwd, extraDirs, false, frame.agentId);
   await Bun.file(pwdFile).delete().catch(() => {});
-  const code = raced.value;
-  const rawStderr = clip(stderrBuf.text);
-  let stderr = rawStderr;
-  if (aborted) stderr = append(stderr, "Command was aborted before completion");
-  else if (code !== 0) stderr = append(stderr, `Exit code ${code}`);
-  const res = withRedundantCdHint({
-    stdout: clip(stdout.text.trimEnd()),
-    stderr: stderr.trimEnd(),
-    interrupted: aborted,
-    ...sandbox,
-  }, noteRedundantCd);
-  return aborted ? res : attachExitMeta(res, code, noteRedundantCd ? append(rawStderr, REDUNDANT_CD_HINT).trimEnd() : rawStderr.trimEnd());
+  return finalizeForeground(command, raced.value, aborted, stdout.text, stderrBuf.text, noteRedundantCd, sandbox, sessionId, cwd);
 }
 
 function withRedundantCdHint(result: BashOutput, dropped: boolean): BashOutput {

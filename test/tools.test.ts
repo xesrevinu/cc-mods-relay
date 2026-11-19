@@ -1527,3 +1527,63 @@ test("Grep includes totalFiles and totalLines for native pagination copy", async
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("Bash sets returnCodeInterpretation for grep/diff exit 1 without firing exit stub", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-bash-rci-"));
+  writeFileSync(join(dir, "a.txt"), "one\n");
+  writeFileSync(join(dir, "b.txt"), "two\n");
+  try {
+    const noMatch = await run(dir, "Bash", { command: "printf 'abc\\n' | grep zzz" });
+    expect(noMatch.ok).toBe(true);
+    expect(noMatch.result.returnCodeInterpretation).toBe("No matches found");
+    expect(noMatch.result.stderr).toBe("");
+    expect(noMatch.exitCode).toBeUndefined();
+
+    const differ = await run(dir, "Bash", { command: "diff a.txt b.txt" });
+    expect(differ.ok).toBe(true);
+    expect(differ.result.returnCodeInterpretation).toBe("Files differ");
+    expect(differ.exitCode).toBeUndefined();
+
+    // And-gated failure before grep must remain a real error (exitCode: 1).
+    const gated = await run(dir, "Bash", { command: "false && grep zzz a.txt" });
+    expect(gated.ok).toBe(true);
+    expect(gated.result.returnCodeInterpretation).toBeUndefined();
+    expect(gated.exitCode).toBe(1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bash emits staleReadFileStateHint when a command modifies a previously Read file and marks noOutputExpected", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-bash-stale-"));
+  const file = join(dir, "app.ts");
+  const sid = `stale-${Date.now()}`;
+  writeFileSync(file, "export const v = 1;\n");
+  try {
+    const r = await run(dir, "Read", { file_path: file }, { sessionId: sid, callId: "r1" });
+    expect(r.ok).toBe(true);
+
+    const mk = await run(dir, "Bash", { command: "mkdir -p nested" }, { sessionId: sid, callId: "b0" });
+    expect(mk.ok).toBe(true);
+    expect(mk.result.noOutputExpected).toBe(true);
+    expect(mk.result.staleReadFileStateHint).toBeUndefined();
+
+    const mutate = await run(
+      dir,
+      "Bash",
+      { command: `printf 'export const v = 2;\\n' > '${file}'` },
+      { sessionId: sid, callId: "b1" },
+    );
+    expect(mutate.ok).toBe(true);
+    expect(mutate.result.staleReadFileStateHint).toContain("app.ts");
+    expect(mutate.result.staleReadFileStateHint).toContain("Call Read before editing");
+
+    // Second Bash without modifying app.ts must not re-emit the hint.
+    const clean = await run(dir, "Bash", { command: "echo still-ok" }, { sessionId: sid, callId: "b2" });
+    expect(clean.ok).toBe(true);
+    expect(clean.result.staleReadFileStateHint).toBeUndefined();
+    expect(clean.result.noOutputExpected).toBeUndefined();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

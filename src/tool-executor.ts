@@ -4,6 +4,7 @@ import { debug } from "./debug.js";
 import { cancelAgent, cancelCall, cancelSession, execute, type ToolFrame } from "./exec.js";
 import { aliasTaskOutput, resetSessionCwd, sessionCwd } from "./tools/bash.js";
 import { rewriteRemotePath } from "./tools/paths.js";
+import { clearReadState } from "./tools/read-state.js";
 
 export type TurnFrame = {
   type?: string;
@@ -252,6 +253,7 @@ export function createToolExecutor() {
       for (const sid of seenSessions) {
         cancelSession(sid, { includeBackground: true });
         resetSessionCwd(sid, undefined, { allAgents: true });
+        clearReadState(sid);
       }
       seenSessions.clear();
     },

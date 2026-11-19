@@ -8,6 +8,7 @@ import { cancelAgent, cancelSession, wasCancelled } from "./tools/jobs.js";
 import { monitorTool } from "./tools/monitor.js";
 import { notebookEditTool } from "./tools/notebook.js";
 import { mapPath, mergeRoots, PathDeniedError } from "./tools/paths.js";
+import { recordReadFile } from "./tools/read-state.js";
 import { readTool } from "./tools/read.js";
 import { abortedShellResult, nativeToolResult, SHELL_TOOLS, type Send, type ToolFrame } from "./tools/runtime.js";
 import { enterWorktreeTool, exitWorktreeTool } from "./tools/worktree.js";
@@ -54,9 +55,21 @@ export async function execute(frame: ToolFrame, send: Send, notify: Send = send)
       if (shell) return ok(reply, frame, abortedShellResult());
       return fail(reply, frame, "CANCELLED", "Tool call was cancelled");
     }
-    if (frame.tool === "Read") return ok(reply, frame, await readTool(cwd, tuiRoot, input, extraDirs, workspace, frame.callId));
-    if (frame.tool === "Write") return ok(reply, frame, await writeTool(cwd, tuiRoot, input, extraDirs, workspace));
-    if (frame.tool === "Edit") return ok(reply, frame, await editTool(cwd, tuiRoot, input, extraDirs, workspace));
+    if (frame.tool === "Read") {
+      const res = await readTool(cwd, tuiRoot, input, extraDirs, workspace, frame.callId);
+      if (res.type === "text" && res.file?.filePath) recordReadFile(frame.sessionId, res.file.filePath);
+      return ok(reply, frame, res);
+    }
+    if (frame.tool === "Write") {
+      const res = await writeTool(cwd, tuiRoot, input, extraDirs, workspace);
+      recordReadFile(frame.sessionId, res.filePath);
+      return ok(reply, frame, res);
+    }
+    if (frame.tool === "Edit") {
+      const res = await editTool(cwd, tuiRoot, input, extraDirs, workspace);
+      recordReadFile(frame.sessionId, res.filePath);
+      return ok(reply, frame, res);
+    }
     if (frame.tool === "Glob") return ok(reply, frame, await globTool(cwd, tuiRoot, input, extraDirs, workspace, frame.callId, frame.sessionId, frame.agentId));
     if (frame.tool === "Grep") return ok(reply, frame, await grepTool(cwd, tuiRoot, input, extraDirs, frame.callId, frame.sessionId, workspace, frame.agentId));
     if (frame.tool === "NotebookEdit") return ok(reply, frame, await notebookEditTool(cwd, tuiRoot, input, extraDirs, workspace));
