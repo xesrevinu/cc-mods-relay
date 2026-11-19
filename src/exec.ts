@@ -1,4 +1,4 @@
-import { bashTool, cancelCall as cancelBash, sessionCwd } from "./tools/bash.js";
+import { bashTool, cancelCall as cancelBash, getBashExitMeta, sessionCwd } from "./tools/bash.js";
 import { sendFileTool } from "./tools/deferred.js";
 import { editTool } from "./tools/edit.js";
 import { globTool } from "./tools/glob.js";
@@ -18,8 +18,9 @@ export type { ToolFrame };
 const fail = (send: Send, frame: ToolFrame, code: string, message: string) =>
   send({ v: 1, type: "result", id: frame.id, callId: frame.callId, sessionId: frame.sessionId, ok: false, error: { code, message } });
 
-const ok = (send: Send, frame: ToolFrame, value: unknown) =>
-  send({
+const ok = (send: Send, frame: ToolFrame, value: unknown) => {
+  const exitMeta = getBashExitMeta(value);
+  return send({
     v: 1,
     type: "result",
     id: frame.id,
@@ -27,7 +28,9 @@ const ok = (send: Send, frame: ToolFrame, value: unknown) =>
     sessionId: frame.sessionId,
     ok: true,
     result: nativeToolResult(frame.tool, value, frame.input ?? {}),
+    ...(exitMeta ? { exitCode: exitMeta.exitCode, rawStderr: exitMeta.rawStderr } : {}),
   });
+};
 
 export { mapPath, cancelBash as cancelCall, cancelAgent, cancelSession };
 
@@ -54,7 +57,7 @@ export async function execute(frame: ToolFrame, send: Send, notify: Send = send)
     if (frame.tool === "Read") return ok(reply, frame, await readTool(cwd, tuiRoot, input, extraDirs, workspace));
     if (frame.tool === "Write") return ok(reply, frame, await writeTool(cwd, tuiRoot, input, extraDirs, workspace));
     if (frame.tool === "Edit") return ok(reply, frame, await editTool(cwd, tuiRoot, input, extraDirs, workspace));
-    if (frame.tool === "Glob") return ok(reply, frame, await globTool(cwd, tuiRoot, input, extraDirs, workspace));
+    if (frame.tool === "Glob") return ok(reply, frame, await globTool(cwd, tuiRoot, input, extraDirs, workspace, frame.callId, frame.sessionId, frame.agentId));
     if (frame.tool === "Grep") return ok(reply, frame, await grepTool(cwd, tuiRoot, input, extraDirs, frame.callId, frame.sessionId, workspace, frame.agentId));
     if (frame.tool === "NotebookEdit") return ok(reply, frame, await notebookEditTool(cwd, tuiRoot, input, extraDirs, workspace));
     if (frame.tool === "hydrate") return ok(reply, frame, await hydrateTool(cwd, tuiRoot, input, extraDirs, workspace));

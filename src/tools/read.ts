@@ -15,9 +15,13 @@ const LINE_CHAR_CAP = 2000;
 const DEFAULT_LIMIT = 2000;
 const LARGE_LIMIT = 100_000;
 const STREAM_PAGE_THRESHOLD_BYTES = 256 * 1024;
+const EXACT_LINE_COUNT_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_PDF_BYTES = Math.floor(2.5 * 1024 * 1024);
-/** Mods cannot join hook `{ result }` parts past ~4 MiB. Stay under that with JSON wrapping. */
-export const READ_CONTENT_BYTE_CAP = 2 * 1024 * 1024;
+/**
+ * Mods cannot join hook `{ result }` parts past ~4 MiB (and JSON escaping of
+ * quotes/backslashes/newlines expands UTF-8 text). 1.5 MiB stays safely below.
+ */
+export const READ_CONTENT_BYTE_CAP = 1_500_000;
 
 function clipLine(line: string): string {
   return line.length > LINE_CHAR_CAP ? `${line.slice(0, LINE_CHAR_CAP)}…` : line;
@@ -27,6 +31,7 @@ async function readPagedStream(
   file: ReturnType<typeof Bun.file>,
   startLine: number,
   limit: number,
+  countExactTotal: boolean,
 ): Promise<{ lines: string[]; totalLines: number; exactTotal: boolean }> {
   const reader = file.stream().getReader();
   const decoder = new TextDecoder();
@@ -34,24 +39,32 @@ async function readPagedStream(
   const collected: string[] = [];
   let lineNo = 0;
   let pending = "";
-  let sawMoreAfterEnd = false;
+  let pastWindow = false;
+  let stoppedEarly = false;
+  let lastByte = -1;
 
   const pushLine = (line: string): boolean => {
     lineNo += 1;
     if (lineNo >= startLine && lineNo <= endLine) {
       collected.push(clipLine(line));
     } else if (lineNo > endLine) {
-      sawMoreAfterEnd = true;
       return true;
     }
     return false;
   };
 
-  let stoppedEarly = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (!value || value.length === 0) continue;
+      lastByte = value[value.length - 1]!;
+      if (pastWindow) {
+        for (let i = 0; i < value.length; i++) {
+          if (value[i] === 0x0a) lineNo += 1;
+        }
+        continue;
+      }
       pending += decoder.decode(value, { stream: true });
       let start = 0;
       for (;;) {
@@ -60,26 +73,38 @@ async function readPagedStream(
         const line = pending.slice(start, nl);
         start = nl + 1;
         if (pushLine(line)) {
-          stoppedEarly = true;
+          if (countExactTotal) {
+            pastWindow = true;
+            // Count any remaining newlines already decoded into `pending`.
+            for (let k = start; k < pending.length; k++) {
+              if (pending.charCodeAt(k) === 10) lineNo += 1;
+            }
+            pending = "";
+            start = 0;
+          } else {
+            stoppedEarly = true;
+          }
           break;
         }
       }
-      pending = pending.slice(start);
+      if (!pastWindow) pending = pending.slice(start);
       if (stoppedEarly) {
         await reader.cancel().catch(() => {});
         break;
       }
     }
     if (!stoppedEarly) {
-      pending += decoder.decode();
-      if (pending.length > 0) pushLine(pending);
+      if (pastWindow) {
+        if (lastByte !== -1 && lastByte !== 0x0a) lineNo += 1;
+      } else {
+        pending += decoder.decode();
+        if (pending.length > 0) pushLine(pending);
+      }
     }
   } finally {
     reader.releaseLock();
   }
-  const totalLines = stoppedEarly ? lineNo : lineNo;
-  void sawMoreAfterEnd;
-  return { lines: collected, totalLines, exactTotal: !stoppedEarly };
+  return { lines: collected, totalLines: lineNo, exactTotal: !stoppedEarly };
 }
 
 function takeUtf8Budget(lines: string[], maxBytes: number): { lines: string[]; truncated: boolean } {
@@ -174,8 +199,9 @@ export async function readTool(cwd: string, tuiRoot: string | undefined, input: 
   const allowLarge = asBool(input.allow_large) === true;
   const reqLimit = asNumber(input.limit);
   const limit = reqLimit ?? (allowLarge ? LARGE_LIMIT : DEFAULT_LIMIT);
-  if (info.size > STREAM_PAGE_THRESHOLD_BYTES && reqLimit !== undefined && !allowLarge) {
-    const paged = await readPagedStream(file, startLine, Math.max(0, limit));
+  const wholeFile = asNumber(input.offset) === undefined && reqLimit === undefined && !allowLarge;
+  if (info.size > STREAM_PAGE_THRESHOLD_BYTES && !allowLarge) {
+    const paged = await readPagedStream(file, startLine, Math.max(0, limit), info.size <= EXACT_LINE_COUNT_MAX_BYTES);
     if (paged.exactTotal && startLine > paged.totalLines) {
       return {
         type: "text" as const,
@@ -183,6 +209,8 @@ export async function readTool(cwd: string, tuiRoot: string | undefined, input: 
       };
     }
     const capped = takeUtf8Budget(paged.lines, READ_CONTENT_BYTE_CAP);
+    const truncatedByTokenCap =
+      capped.truncated || (wholeFile && startLine === 1 && (!paged.exactTotal || paged.lines.length < paged.totalLines));
     return {
       type: "text" as const,
       file: {
@@ -191,7 +219,7 @@ export async function readTool(cwd: string, tuiRoot: string | undefined, input: 
         numLines: capped.lines.length,
         startLine,
         totalLines: paged.totalLines,
-        ...(capped.truncated ? { truncatedByTokenCap: true as const } : {}),
+        ...(truncatedByTokenCap ? { truncatedByTokenCap: true as const } : {}),
       },
     };
   }
@@ -207,7 +235,6 @@ export async function readTool(cwd: string, tuiRoot: string | undefined, input: 
   }
   const slice = lines.slice(startLine - 1, startLine - 1 + Math.max(0, limit)).map(clipLine);
   const capped = takeUtf8Budget(slice, READ_CONTENT_BYTE_CAP);
-  const wholeFile = asNumber(input.offset) === undefined && asNumber(input.limit) === undefined && !allowLarge;
   const truncatedByTokenCap =
     capped.truncated || (wholeFile && startLine === 1 && slice.length < lines.length);
   return {

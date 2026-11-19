@@ -5,7 +5,8 @@ import { asBool, asString, mapWritePath } from "./paths.js";
 import { structuredPatch } from "./patch.js";
 
 const EDIT_DIFF_BYTE_CAP = 512 * 1024;
-const EDIT_ECHO_BYTE_CAP = 1_500_000;
+/** Cap oldString and newString echoes so combined JSON stays comfortably under Mods' ~4 MiB join limit. */
+const EDIT_ECHO_BYTE_CAP = 750_000;
 
 function capUtf8(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
@@ -42,7 +43,18 @@ export async function editTool(cwd: string, tuiRoot: string | undefined, input: 
   if (oldString === "") throw new Error("Cannot create new file - file already exists.");
 
   const originalFile = await Bun.file(path).text();
-  const parts = originalFile.split(oldString);
+  let matchOld = oldString;
+  let matchNew = newString;
+  let parts = originalFile.split(matchOld);
+  if (parts.length - 1 === 0 && originalFile.includes("\r\n") && !oldString.includes("\r\n")) {
+    const crlfOld = oldString.replaceAll("\n", "\r\n");
+    const crlfParts = originalFile.split(crlfOld);
+    if (crlfParts.length - 1 > 0) {
+      matchOld = crlfOld;
+      matchNew = newString.includes("\r\n") ? newString : newString.replaceAll("\n", "\r\n");
+      parts = crlfParts;
+    }
+  }
   const matches = parts.length - 1;
   if (matches === 0) throw new Error(`String to replace not found in file.\nString: ${oldString}`);
   if (matches > 1 && !replaceAll) {
@@ -50,7 +62,7 @@ export async function editTool(cwd: string, tuiRoot: string | undefined, input: 
       `Found ${matches} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: ${oldString}`,
     );
   }
-  const next = replaceAll ? parts.join(newString) : parts[0] + newString + parts.slice(1).join(oldString);
+  const next = replaceAll ? parts.join(matchNew) : parts[0] + matchNew + parts.slice(1).join(matchOld);
   await Bun.write(path, next);
   const keepDiff = Buffer.byteLength(originalFile, "utf8") + Buffer.byteLength(next, "utf8") <= EDIT_DIFF_BYTE_CAP;
   return {

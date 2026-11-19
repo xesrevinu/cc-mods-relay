@@ -121,7 +121,7 @@ export function startTranscriptSync(opts: TranscriptSyncOpts): TranscriptSync {
     const size = fileSize(rel);
     if (size === undefined) return;
     const have = sent.get(rel) ?? cursorOffsetFor(cursors, rel, size);
-    if (have >= size) {
+    if (have === size) {
       sent.set(rel, have);
       return;
     }

@@ -160,7 +160,7 @@ function expandRemoteHome(path: string, tuiRoot?: string): string {
   const remote = remoteHome(tuiRoot) ?? localHome();
   if (path === "~" || path === "$HOME") return remote;
   if (path.startsWith("~/")) return remote + path.slice(1);
-  if (path.startsWith("$HOME")) return remote + path.slice("$HOME".length);
+  if (path.startsWith("$HOME/") || path.startsWith("$HOME\\")) return remote + path.slice("$HOME".length);
   return path;
 }
 

@@ -79,6 +79,7 @@ export async function applyModEvent(
 
   if (event.type === "tool_finished" && typeof event.toolUseId === "string") {
     const started = ctx.tools.get(event.toolUseId);
+    ctx.tools.delete(event.toolUseId);
     const isError = event.isError === true;
     const out = started?.tool === "Bash" || started?.tool === "PowerShell" ? bashText(event.result) : undefined;
     const terminal = Boolean(out && ctx.supportsTerminal);
@@ -151,7 +152,6 @@ export async function applyModEvent(
           : {}),
       },
     });
-    ctx.tools.delete(event.toolUseId);
     return;
   }
 

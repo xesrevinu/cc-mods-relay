@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { configDir } from "./config.js";
@@ -210,9 +210,19 @@ function loadSyncCache(): Record<string, UrlSync> {
   return {};
 }
 
+let syncTmpSeq = 0;
+
 function saveSyncCache(cache: Record<string, UrlSync>): void {
   mkdirSync(configDir(), { recursive: true, mode: 0o700 });
-  writeFileSync(syncCachePath(), `${JSON.stringify(cache)}\n`, { mode: 0o600 });
+  const dest = syncCachePath();
+  const tmp = `${dest}.tmp-${process.pid}-${++syncTmpSeq}`;
+  writeFileSync(tmp, `${JSON.stringify(cache)}\n`, { mode: 0o600 });
+  try {
+    renameSync(tmp, dest);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+    throw error;
+  }
 }
 
 export type SyncSelection = {

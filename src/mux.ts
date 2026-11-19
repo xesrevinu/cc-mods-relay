@@ -3,7 +3,6 @@ import { ndJsonStream } from "@agentclientprotocol/sdk/unstable";
 export type MuxKind = "acp" | "ctrl";
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 
 export function classify(msg: unknown): MuxKind | undefined {
   if (!msg || typeof msg !== "object") return undefined;
@@ -22,6 +21,7 @@ export function createAcpByteDuplex(send: (msg: unknown) => void) {
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   let closed = false;
   let buffer = "";
+  const decoder = new TextDecoder();
 
   const readable = new ReadableStream<Uint8Array>({
     start(c) {
@@ -92,6 +92,7 @@ export async function readNdjsonStream(
   input: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string | Buffer>,
   onObj: (msg: unknown) => void,
 ): Promise<void> {
+  const decoder = new TextDecoder();
   let buffer = "";
   const feed = (chunk: string) => {
     buffer += chunk;

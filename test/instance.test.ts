@@ -477,3 +477,257 @@ test("client with reconnectGraceMs survives abnormal WS close and reattaches", a
     await server.stop();
   }
 });
+
+test("instance.attach replays in-flight pendingCalls lost across an abrupt disconnect", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-replay-call-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const ws1 = await openWs(server.sessionUrl);
+    ws1.send(JSON.stringify({ v: 1, type: "hello", token: "secret" }));
+    expect((await nextJson(ws1)).ok).toBe(true);
+    ws1.send(JSON.stringify({ v: 1, type: "instance.start", cwd: dir, reconnectGraceMs: 5_000 }));
+    const ready = await nextJson(ws1);
+
+    const inst = server.instances.get(String(ready.instanceId))!;
+    const plugin = await openWs(server.toolsUrl);
+    plugin.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await nextJson(plugin)).ok).toBe(true);
+
+    // Send a call BEFORE ws1 disconnects (simulating half-open TCP drop before result returns).
+    const firstDelivery = nextJson(ws1);
+    plugin.send(JSON.stringify({
+      v: 1, type: "call", id: "half1", callId: "half-open-1", tool: "Read",
+      input: { file_path: join(dir, "a.txt") },
+    }));
+    expect((await firstDelivery).callId).toBe("half-open-1");
+
+    ws1.close(4000, "blip");
+    await Bun.sleep(30);
+
+    const ws2 = await openWs(server.sessionUrl);
+    const q2: any[] = [];
+    const wait2: ((m: any) => void)[] = [];
+    ws2.addEventListener("message", (e) => {
+      const m = JSON.parse(String(e.data));
+      const w = wait2.shift();
+      if (w) w(m);
+      else q2.push(m);
+    });
+    const pull2 = () => new Promise<any>((r) => (q2.length ? r(q2.shift()) : wait2.push(r)));
+    ws2.send(JSON.stringify({ v: 1, type: "hello", token: "secret" }));
+    expect((await pull2()).ok).toBe(true);
+    ws2.send(JSON.stringify({
+      v: 1, type: "instance.attach", instanceId: inst.id, resumeToken: ready.resumeToken,
+    }));
+    expect((await pull2()).reattached).toBe(true);
+    const replayed = await pull2();
+    expect(replayed.type).toBe("call");
+    expect(replayed.callId).toBe("half-open-1");
+
+    const pluginResult = nextJson(plugin);
+    ws2.send(JSON.stringify({
+      v: 1, type: "result", id: "half1", callId: "half-open-1", ok: true,
+      result: { type: "text", file: { content: "recovered" } },
+    }));
+    expect((await pluginResult).result.file.content).toBe("recovered");
+
+    ws2.close(1000, "done");
+    plugin.close();
+  } finally {
+    await server.stop();
+  }
+});
+
+test("closing an old plugin socket does not cancel a callId rebound to a new plugin socket", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-rebind-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const { ws, started } = await startClient(server, dir);
+    const inst = server.instances.get(started.instanceId)!;
+    const p1 = await openWs(server.toolsUrl);
+    p1.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await nextJson(p1)).ok).toBe(true);
+
+    const p2 = await openWs(server.toolsUrl);
+    p2.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await nextJson(p2)).ok).toBe(true);
+
+    const cancels: any[] = [];
+    ws.addEventListener("message", (e) => {
+      const m = JSON.parse(String(e.data));
+      if (m.type === "cancel") cancels.push(m);
+    });
+
+    p1.send(JSON.stringify({ v: 1, type: "call", id: "r1", callId: "rebind-c1", tool: "Bash", input: { command: "echo 1" } }));
+    await Bun.sleep(20);
+    // p2 retries the same callId before p1 finishes closing
+    p2.send(JSON.stringify({ v: 1, type: "call", id: "r1", callId: "rebind-c1", tool: "Bash", input: { command: "echo 1" } }));
+    await Bun.sleep(20);
+    p1.close();
+    await Bun.sleep(50);
+    expect(cancels).toEqual([]);
+
+    const res = nextJson(p2);
+    ws.send(JSON.stringify({ v: 1, type: "result", id: "r1", callId: "rebind-c1", ok: true, result: { stdout: "1", stderr: "", interrupted: false } }));
+    expect((await res).ok).toBe(true);
+
+    ws.close(1000, "done");
+    p2.close();
+  } finally {
+    await server.stop();
+  }
+});
+
+test("CALL_ID_CONFLICT on an in-flight callId rejects the conflicting socket without clobbering the original caller", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-conflict-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const { ws, started } = await startClient(server, dir);
+    const inst = server.instances.get(started.instanceId)!;
+    const p1 = await openWs(server.toolsUrl);
+    p1.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await nextJson(p1)).ok).toBe(true);
+
+    const p2 = await openWs(server.toolsUrl);
+    p2.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await nextJson(p2)).ok).toBe(true);
+
+    const clientCall = nextJson(ws);
+    p1.send(JSON.stringify({ v: 1, type: "call", id: "c1", callId: "same-id", tool: "Bash", input: { command: "echo legit" } }));
+    expect((await clientCall).callId).toBe("same-id");
+
+    // p2 reuses the same callId with DIFFERENT input
+    const p2Reply = nextJson(p2);
+    p2.send(JSON.stringify({ v: 1, type: "call", id: "c2", callId: "same-id", tool: "Bash", input: { command: "echo evil" } }));
+    const conflict = await p2Reply;
+    expect(conflict.ok).toBe(false);
+    expect(conflict.error.code).toBe("CALL_ID_CONFLICT");
+
+    // p1's legitimate result must still be delivered to p1
+    const p1Reply = nextJson(p1);
+    ws.send(JSON.stringify({ v: 1, type: "result", id: "c1", callId: "same-id", ok: true, result: { stdout: "legit", stderr: "", interrupted: false } }));
+    const ok = await p1Reply;
+    expect(ok.ok).toBe(true);
+    expect(ok.result.stdout).toBe("legit");
+
+    ws.close(1000, "done");
+    p1.close();
+    p2.close();
+  } finally {
+    await server.stop();
+  }
+});
+
+test("closing the persistent listen socket does not immediately cancel in-flight calls so one-shot fallback can take over", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-listen-drop-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const { ws, started } = await startClient(server, dir);
+    const inst = server.instances.get(started.instanceId)!;
+    const listener = await openWs(server.toolsUrl);
+    listener.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await nextJson(listener)).ok).toBe(true);
+    listener.send(JSON.stringify({ v: 1, type: "listen" }));
+    await Bun.sleep(20);
+
+    const cancels: any[] = [];
+    ws.addEventListener("message", (e) => {
+      const m = JSON.parse(String(e.data));
+      if (m.type === "cancel") cancels.push(m);
+    });
+
+    const firstCall = nextJson(ws);
+    listener.send(JSON.stringify({ v: 1, type: "call", id: "l1", callId: "listen-c1", tool: "Bash", input: { command: "sleep 1" } }));
+    expect((await firstCall).callId).toBe("listen-c1");
+
+    listener.close();
+    await Bun.sleep(80);
+    expect(cancels).toEqual([]);
+
+    // One-shot fallback takes over ownership with the same callId & input
+    const fallback = await openWs(server.toolsUrl);
+    fallback.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await nextJson(fallback)).ok).toBe(true);
+    fallback.send(JSON.stringify({ v: 1, type: "call", id: "l1", callId: "listen-c1", tool: "Bash", input: { command: "sleep 1" } }));
+    await Bun.sleep(20);
+
+    const fbReply = nextJson(fallback);
+    ws.send(JSON.stringify({ v: 1, type: "result", id: "l1", callId: "listen-c1", ok: true, result: { stdout: "done", stderr: "", interrupted: false } }));
+    expect((await fbReply).result.stdout).toBe("done");
+
+    ws.close(1000, "done");
+    fallback.close();
+  } finally {
+    await server.stop();
+  }
+});
+
+test("seqReplay replays missed ACP and ctrl frames after half-open disconnect and ping trims acked entries", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-seq-"));
+  const server = startServer({ token: "secret", hostname: "127.0.0.1", port: 0, boot: false });
+  try {
+    const ws1 = await openWs(server.sessionUrl);
+    ws1.send(JSON.stringify({ v: 1, type: "hello", token: "secret" }));
+    expect((await nextJson(ws1)).ok).toBe(true);
+    ws1.send(JSON.stringify({ v: 1, type: "instance.start", cwd: dir, reconnectGraceMs: 5_000, seqReplay: true }));
+    const ready = await nextJson(ws1);
+    const inst = server.instances.get(String(ready.instanceId))!;
+
+    const plugin = await openWs(server.toolsUrl);
+    plugin.send(JSON.stringify({ v: 1, type: "hello", token: inst.pluginToken, cwd: dir, tuiRoot: dir }));
+    expect((await nextJson(plugin)).ok).toBe(true);
+
+    // Frame seq=1 arrives on ws1
+    const first = nextJson(ws1);
+    plugin.send(JSON.stringify({ v: 1, type: "call", id: "s1", callId: "seq-c1", tool: "Read", input: { file_path: join(dir, "a.txt") } }));
+    const got1 = await first;
+    expect(got1.seq).toBe(1);
+    expect(got1.callId).toBe("seq-c1");
+
+    // Ping acks seq=1 and gets pong
+    const pong = nextJson(ws1);
+    ws1.send(JSON.stringify({ v: 1, type: "ping", ts: 12345, ack: 1 }));
+    const gotPong = await pong;
+    expect(gotPong).toEqual({ v: 1, type: "pong", ts: 12345 });
+
+    // Deliver seq=1 result so seq-c1 is no longer pending
+    ws1.send(JSON.stringify({ v: 1, type: "result", id: "s1", callId: "seq-c1", ok: true, result: { type: "text", file: { content: "ok" } } }));
+    await nextJson(plugin);
+
+    // Simulate half-open drop: server sends seq=2 (ACP response) while ws1 drops before receiving it
+    ws1.close(4000, "tailscale-derp-blip");
+    await Bun.sleep(30);
+    // Push an ACP JSON-RPC response through inst.mux writable (same path as ACP agent responses)
+    const writer = inst.mux!.writable.getWriter();
+    await writer.write(new TextEncoder().encode(`${JSON.stringify({ jsonrpc: "2.0", id: 9, result: { stopReason: "end_turn" } })}\n`));
+    writer.releaseLock();
+    await Bun.sleep(20);
+
+    // Client reattaches with lastSeq: 1 -> must receive seq=2 wrapped ACP response!
+    const ws2 = await openWs(server.sessionUrl);
+    const q2: any[] = [];
+    const wait2: ((m: any) => void)[] = [];
+    ws2.addEventListener("message", (e) => {
+      const m = JSON.parse(String(e.data));
+      const w = wait2.shift();
+      if (w) w(m);
+      else q2.push(m);
+    });
+    const pull2 = () => new Promise<any>((r) => (q2.length ? r(q2.shift()) : wait2.push(r)));
+    ws2.send(JSON.stringify({ v: 1, type: "hello", token: "secret" }));
+    expect((await pull2()).ok).toBe(true);
+    ws2.send(JSON.stringify({
+      v: 1, type: "instance.attach", instanceId: inst.id, resumeToken: ready.resumeToken, lastSeq: 1,
+    }));
+    expect((await pull2()).reattached).toBe(true);
+    const replayed = await pull2();
+    expect(replayed.type).toBe("acp");
+    expect(replayed.seq).toBe(2);
+    expect(replayed.msg).toEqual({ jsonrpc: "2.0", id: 9, result: { stopReason: "end_turn" } });
+
+    ws2.close(1000, "done");
+    plugin.close();
+  } finally {
+    await server.stop();
+  }
+});

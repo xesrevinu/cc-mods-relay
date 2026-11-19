@@ -20,6 +20,9 @@ function extraTag(extra: string): string {
   return createHash("sha256").update(extra).digest("hex").slice(0, 8);
 }
 
+/** Keep raw hydrated bytes <= 2.5 MiB so base64 JSON stays under Mods' ~4 MiB limit. */
+export const HYDRATE_MAX_BYTES = Math.floor(2.5 * 1024 * 1024);
+
 export async function hydrateTool(
   cwd: string,
   tuiRoot: string | undefined,
@@ -30,6 +33,10 @@ export async function hydrateTool(
   const abs = mapReadPath(cwd, tuiRoot, asString(input.file_path), extraDirs, project);
   const file = Bun.file(abs);
   if (!(await file.exists())) throw new Error(`File does not exist: ${abs}`);
+  const st = await file.stat();
+  if (st.size > HYDRATE_MAX_BYTES) {
+    throw new Error(`File is ${st.size} bytes; hydrate limit is ${HYDRATE_MAX_BYTES} bytes`);
+  }
   const buf = Buffer.from(await file.arrayBuffer());
   return {
     path: abs,

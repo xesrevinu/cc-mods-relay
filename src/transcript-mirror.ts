@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, posix, sep } from "node:path";
 import { configDir } from "./config.js";
 import { claudeConfigDir } from "./jsonl.js";
@@ -61,9 +61,19 @@ export function loadTranscriptCursors(dir = configDir()): TranscriptCursors {
   }
 }
 
+let cursorTmpSeq = 0;
+
 export function saveTranscriptCursors(cursors: TranscriptCursors, dir = configDir()): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(cursorsPath(dir), `${JSON.stringify(cursors)}\n`, { mode: 0o600 });
+  const dest = cursorsPath(dir);
+  const tmp = `${dest}.tmp-${process.pid}-${++cursorTmpSeq}`;
+  writeFileSync(tmp, `${JSON.stringify(cursors)}\n`, { mode: 0o600 });
+  try {
+    renameSync(tmp, dest);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+    throw error;
+  }
 }
 
 export function rememberTranscriptCursor(
@@ -89,6 +99,15 @@ export function writeTranscriptSidecar(jsonlPath: string, sidecar: TranscriptSid
   writeFileSync(sidecarPath(jsonlPath), `${JSON.stringify(sidecar)}\n`);
 }
 
+function writeAllSync(fd: number, bytes: Uint8Array, offset: number): void {
+  let written = 0;
+  while (written < bytes.length) {
+    const n = writeSync(fd, bytes, written, bytes.length - written, offset + written);
+    if (n <= 0) break;
+    written += n;
+  }
+}
+
 /**
  * Write `bytes` at `offset` under `projectsRoot/<rel>`. Skips a gap (offset past EOF)
  * so a later offset-0 pass can rebuild the file.
@@ -103,16 +122,17 @@ export function applyTranscriptChunk(
   if (!isSafeTranscriptRel(rel) || !Number.isFinite(offset) || offset < 0) return undefined;
   const dest = join(projectsRoot, rel.split("/").join(sep));
   mkdirSync(dirname(dest), { recursive: true });
-  const fd = openSync(dest, "a+");
+  const fd = openSync(dest, constants.O_RDWR | constants.O_CREAT, 0o644);
   try {
     const size = fstatSync(fd).size;
     if (offset === 0) {
       ftruncateSync(fd, 0);
-      writeSync(fd, bytes, 0, bytes.length, 0);
+      writeAllSync(fd, bytes, 0);
     } else if (offset > size) {
       return undefined;
     } else {
-      writeSync(fd, bytes, 0, bytes.length, offset);
+      writeAllSync(fd, bytes, offset);
+      if (offset + bytes.length < size) ftruncateSync(fd, offset + bytes.length);
     }
     const next = offset + bytes.length;
     const sessionId = sessionIdFromRel(rel);

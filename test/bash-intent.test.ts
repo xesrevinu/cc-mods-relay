@@ -190,3 +190,26 @@ test("stripRedundantCd also drops a newline-separated leading cd onto cwd", asyn
   expect(ran.result.stdout).toBe("nl-ok");
   expect(ran.result.stderr).toContain("Already in the working directory");
 });
+
+test("classifyBashIntent preserves quoted patterns with spaces across sequential stages", () => {
+  const cwd = "/Users/me/proj";
+  const got = classifyBashIntent(
+    `cd ${cwd}; rg -n "fn Core::upsert|fn Core::remove" host/core.mbt`,
+    cwd,
+  );
+  expect(got).toEqual({
+    action: "prefer",
+    tool: "Grep",
+    message: "Use the Grep tool with pattern: fn Core::upsert|fn Core::remove instead of rg.",
+  });
+
+  const regex = classifyBashIntent(`rg -n "foo\\s+bar\\.ts" src/`, cwd);
+  expect(regex).toEqual({
+    action: "prefer",
+    tool: "Grep",
+    message: "Use the Grep tool with pattern: foo\\s+bar\\.ts instead of rg.",
+  });
+
+  const kept = classifyBashIntent("find . -name '*.ts' 2>/dev/null | head -n 5", cwd);
+  expect(kept).toEqual({ action: "run", command: "find . -name '*.ts' 2>/dev/null | head -n 5" });
+});

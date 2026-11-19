@@ -9,6 +9,10 @@ type State = { originalCwd: string; worktreePath: string; worktreeBranch?: strin
 
 const states = new Map<string, State>();
 
+function stateKey(sessionId: string, agentId?: string): string {
+  return agentId ? `${sessionId}:${agentId}` : sessionId;
+}
+
 async function git(cwd: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, code] = await Promise.all([
@@ -56,6 +60,7 @@ export async function enterWorktreeTool(
   extraDirs: string[] = [],
 ): Promise<EnterWorktreeOutput> {
   const sessionId = frame.sessionId || "";
+  const key = stateKey(sessionId, frame.agentId);
   const roots = mergeRoots(extraDirs);
   const named = asString(input.name);
   const pathIn = asString(input.path);
@@ -69,7 +74,7 @@ export async function enterWorktreeTool(
     const hit = trees.find((t) => real(t.path) === abs);
     if (!hit) throw new Error(`Path is not in git worktree list: ${abs}`);
     persistCwd(workspace, sessionId, abs, roots, true, frame.agentId);
-    states.set(sessionId, { originalCwd: workspace, worktreePath: abs, worktreeBranch: hit.branch, created: false });
+    states.set(key, { originalCwd: workspace, worktreePath: abs, worktreeBranch: hit.branch, created: false });
     return {
       worktreePath: abs,
       worktreeBranch: hit.branch,
@@ -86,7 +91,7 @@ export async function enterWorktreeTool(
     throw new Error((ran.stderr || ran.stdout || "git worktree add failed").trim());
   }
   persistCwd(workspace, sessionId, dest, roots, true, frame.agentId);
-  states.set(sessionId, { originalCwd: workspace, worktreePath: dest, created: true });
+  states.set(key, { originalCwd: workspace, worktreePath: dest, created: true });
   return { worktreePath: dest, message: `Created and entered worktree ${dest}` };
 }
 
@@ -96,9 +101,10 @@ export async function exitWorktreeTool(
   input: Record<string, unknown>,
 ): Promise<ExitWorktreeOutput> {
   const sessionId = frame.sessionId || "";
+  const key = stateKey(sessionId, frame.agentId);
   const action = asString(input.action);
   if (action !== "keep" && action !== "remove") throw new Error('action must be "keep" or "remove"');
-  const state = states.get(sessionId);
+  const state = states.get(key);
   const current = sessionCwd(frame, workspace);
   const worktreePath = state?.worktreePath ?? current;
   if (action === "remove") {
@@ -112,7 +118,7 @@ export async function exitWorktreeTool(
     if (removed.code !== 0) throw new Error((removed.stderr || removed.stdout || "git worktree remove failed").trim());
   }
   resetSessionCwd(sessionId, frame.agentId);
-  states.delete(sessionId);
+  states.delete(key);
   return {
     action,
     originalCwd: state?.originalCwd ?? workspace,

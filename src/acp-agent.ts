@@ -400,7 +400,9 @@ type Session = {
   compactionLive?: { id: string; tokensBefore?: number; startedAt: number };
   /** Mid-turn `x.ai/interject` texts to skip as duplicate user_message_chunk. */
   pendingInterjectTexts?: string[];
-  permissionAbort?: AbortController;
+  permissionAborts?: Set<AbortController>;
+  /** Cancel timer for `cancel()`'s Escape escalation so it never interrupts the next prompt. */
+  cancelEscalationStop?: () => void;
   /** Overlapping `session/prompt` RPCs waiting for the in-flight turn to finish. */
   queuedPrompts?: QueuedPrompt[];
 };
@@ -1367,6 +1369,7 @@ export class ClaudeAcpAgent {
   private readonly modChannel?: AgentDeps["modChannel"];
   private readonly engines: Map<string, SessionEngine> = new Map();
   private readonly unsubMod: () => void;
+  private modEventQueue: Promise<void> = Promise.resolve();
 
   constructor(
     client: AcpClient,
@@ -1424,7 +1427,13 @@ export class ClaudeAcpAgent {
     this.renameStoredSession =
       deps.renameStoredSession ?? ((sessionId, title, options) => renameSession(sessionId, title, options));
     this.unsubMod = (deps.modChannel?.onEvent ?? onModEvent)((event) => {
-      void this.handleModEvent(event).catch((error) => this.logger.error("[mod-live]", error));
+      if (event.type === "permission_request" || event.type === "ask_question") {
+        void this.handleModEvent(event).catch((error) => this.logger.error("[mod-live]", error));
+        return;
+      }
+      this.modEventQueue = this.modEventQueue
+        .then(() => this.handleModEvent(event))
+        .catch((error) => this.logger.error("[mod-live]", error));
     });
   }
 
@@ -1868,10 +1877,12 @@ export class ClaudeAcpAgent {
       logger: this.logger,
       settleMs: this.turnSettleMs,
       onTurnResolved: () => {
-        void this.closeOpenRepl(params.sessionId);
+        this.enqueueModWork(() => this.closeOpenRepl(params.sessionId));
         void this.emitSessionTitleUpdate(params.sessionId);
       },
     });
+    sessionRecord.cancelEscalationStop?.();
+    sessionRecord.cancelEscalationStop = undefined;
     sessionRecord.turnDetector = detector;
     sessionRecord.turnCancel = cancel;
     detector.beginTurn();
@@ -2051,10 +2062,12 @@ export class ClaudeAcpAgent {
       logger: this.logger,
       settleMs: this.turnSettleMs,
       onTurnResolved: () => {
-        void this.closeOpenRepl(sessionId);
+        this.enqueueModWork(() => this.closeOpenRepl(sessionId));
         void this.emitSessionTitleUpdate(sessionId);
       },
     });
+    session.cancelEscalationStop?.();
+    session.cancelEscalationStop = undefined;
     session.turnDetector = detector;
     session.turnCancel = cancel;
     detector.beginTurn();
@@ -2107,10 +2120,14 @@ export class ClaudeAcpAgent {
       return;
     }
 
-    const hadInFlightTurn = sessionRecord.turnCancel !== undefined;
+    const cancelledTurn = sessionRecord.turnCancel;
     sessionRecord.cancelled = true;
-    sessionRecord.turnCancel?.();
-    sessionRecord.permissionAbort?.abort();
+    cancelledTurn?.();
+    if (sessionRecord.permissionAborts) {
+      for (const abort of sessionRecord.permissionAborts) abort.abort();
+      sessionRecord.permissionAborts.clear();
+    }
+    this.enqueueModWork(() => this.closeOpenRepl(params.sessionId));
 
     if (sessionRecord.compactionLive) {
       await this.publishGrokExt(grokAutoCompactCancelled(params.sessionId));
@@ -2127,7 +2144,12 @@ export class ClaudeAcpAgent {
       sessionRecord.compactionLive = undefined;
     }
 
-    if (!hadInFlightTurn) {
+    if (!cancelledTurn) {
+      return;
+    }
+    // If another prompt started while awaiting compaction updates above, do not
+    // interrupt the newer turn or arm a stale Escape escalation on it.
+    if (!sessionRecord.cancelled || (sessionRecord.turnCancel !== undefined && sessionRecord.turnCancel !== cancelledTurn)) {
       return;
     }
     const engine = sessionRecord.engine;
@@ -2135,7 +2157,9 @@ export class ClaudeAcpAgent {
       return;
     }
     engine.interrupt();
-    this.schedule(() => {
+    sessionRecord.cancelEscalationStop?.();
+    sessionRecord.cancelEscalationStop = this.schedule(() => {
+      sessionRecord.cancelEscalationStop = undefined;
       if (engine.isDisposed) return;
       engine.escape();
     }, this.cancelEscalationMs);
@@ -2152,6 +2176,8 @@ export class ClaudeAcpAgent {
       item.reject(RequestError.resourceNotFound(sessionId));
     }
     await this.cancel({ sessionId });
+    session.cancelEscalationStop?.();
+    session.cancelEscalationStop = undefined;
     cleanupMaterializedImages(session.turnTempImagePaths);
     session.turnTempImagePaths = undefined;
     session.subagentWatcher?.stop();
@@ -3204,6 +3230,12 @@ export class ClaudeAcpAgent {
     }
   }
 
+  private enqueueModWork(work: () => Promise<void>): void {
+    this.modEventQueue = this.modEventQueue
+      .then(work)
+      .catch((error) => this.logger.error("[mod-live]", error));
+  }
+
   private async closeOpenRepl(sessionId: string): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session?.modTools) return;
@@ -3222,7 +3254,9 @@ export class ClaudeAcpAgent {
   }
 
   async handleModEvent(event: ModEvent): Promise<void> {
+    const explicitId = typeof event.sessionId === "string" && this.sessions[event.sessionId] ? event.sessionId : undefined;
     const sessionId =
+      explicitId ??
       Object.entries(this.sessions).find(([, session]) => session.turnDetector)?.[0] ??
       Object.keys(this.sessions)[0];
     if (!sessionId) return;
@@ -3304,6 +3338,9 @@ export class ClaudeAcpAgent {
       if (used !== undefined) session.lastContextUsed = used;
     }
     if (kind === "turn_started") {
+      session.cancelEscalationStop?.();
+      session.cancelEscalationStop = undefined;
+      await this.closeOpenRepl(sessionId);
       session.liveFromMod = true;
       if (typeof event.turnId === "string" && event.turnId) session.modTurnId = event.turnId;
       session.turnDetector?.noteActivity();
@@ -3312,7 +3349,10 @@ export class ClaudeAcpAgent {
       const turnId = typeof event.turnId === "string" ? event.turnId : undefined;
       const aborted = event.reason === "aborted" || event.isAborted === true;
       if (aborted) {
+        session.cancelEscalationStop?.();
+        session.cancelEscalationStop = undefined;
         if (!turnId || turnId !== session.modTurnId) return;
+        await this.closeOpenRepl(sessionId);
         session.turnCancel?.();
       } else if (turnId && session.modTurnId && turnId !== session.modTurnId) {
         return;
@@ -3335,7 +3375,7 @@ export class ClaudeAcpAgent {
       return;
     }
     const abort = new AbortController();
-    session.permissionAbort = abort;
+    (session.permissionAborts ??= new Set()).add(abort);
     try {
       if (abort.signal.aborted) {
         decision = "reject";
@@ -3368,7 +3408,7 @@ export class ClaudeAcpAgent {
     } catch (err) {
       this.logger.error("[mod-live] request_permission failed:", err);
     } finally {
-      if (session.permissionAbort === abort) session.permissionAbort = undefined;
+      session.permissionAborts?.delete(abort);
     }
     (this.modChannel ?? { answerPermission }).answerPermission(requestId, decision);
   }

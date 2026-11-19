@@ -1,10 +1,10 @@
 import type { BashOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import { appendFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawnEnv, withDirenv } from "./direnv.js";
 import { pinTuiLocale, workspaceSpawnEnv } from "./workspace-env.js";
-import { cancelCall, finishJob, registerJob, wasCancelled } from "./jobs.js";
+import { cancelCall, finishJob, getJobOutputFile, promoteJobToBackground, registerJob, wasCancelled } from "./jobs.js";
 import { classifyBashIntent, droppedRedundantCd, REDUNDANT_CD_HINT } from "./bash-intent.js";
 import { asBool, asNumber, asString, encodeClaudeDir, insideWriteRoot, mapCwd, mergeRoots, rewriteRemoteText } from "./paths.js";
 import { abortedShellResult, clampTimeout, killTree, type Send, type ToolFrame } from "./runtime.js";
@@ -17,9 +17,27 @@ const FG_TIMEOUT_MAX = 600_000;
 const BG_TIMEOUT_DEFAULT = 1_800_000;
 const BG_TIMEOUT_MAX = 7_200_000;
 const DRAIN_AFTER_TIMEOUT_MS = 2_000;
+const POST_EXIT_DRAIN_MS = 250;
 const cwdBySession = new Map<string, string>();
 const CWD_BUILTIN = /\b(?:cd|pushd|popd|chdir)\b/;
+/** Standalone `sleep N` is never auto-backgrounded (matches native Claude Code); compound commands (`sleep 2;cmd`) may auto-background. */
+const PURE_SLEEP = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*sleep\s+(?:\d+(?:\.\d+)?[smhd]?|infinity)\s*$/i;
+const SAFE_TASK_ID = /^[A-Za-z0-9._-]{1,120}$/;
 const CWD_HINT_TAIL = "directory changes made by the backgrounded command do not apply to subsequent commands.";
+
+export type BashExitMeta = { exitCode: number; rawStderr: string };
+const exitMetaByResult = new WeakMap<object, BashExitMeta>();
+
+export function getBashExitMeta(result: unknown): BashExitMeta | undefined {
+  return result && typeof result === "object" ? exitMetaByResult.get(result) : undefined;
+}
+
+function attachExitMeta(result: BashOutput, exitCode: number, rawStderr: string): BashOutput {
+  if (exitCode > 0 && exitCode <= 255) {
+    exitMetaByResult.set(result, { exitCode, rawStderr });
+  }
+  return result;
+}
 
 type StreamBuffer = {
   text: string;
@@ -76,9 +94,9 @@ function startTaskTee(
   buffers: { stdout: StreamBuffer; stderr: StreamBuffer },
 ): () => void {
   if (!path) return () => {};
-  mkdirSync(dirname(path), { recursive: true });
   let pending = `${streamSnapshot(buffers.stdout)}${buffers.stderr.tail ? `\n${streamSnapshot(buffers.stderr)}` : ""}`;
   try {
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, pending);
     pending = "";
   } catch {
@@ -151,13 +169,14 @@ export function persistCwd(
   }
 }
 
-export function resetSessionCwd(sessionId: string, agentId?: string): void {
+export function resetSessionCwd(sessionId: string, agentId?: string, opts: { allAgents?: boolean } = {}): void {
   if (!sessionId) return;
   if (agentId) {
     cwdBySession.delete(cwdKey(sessionId, agentId));
     return;
   }
   cwdBySession.delete(sessionId);
+  if (!opts.allAgents) return;
   const prefix = `${sessionId}:`;
   for (const key of cwdBySession.keys()) {
     if (key.startsWith(prefix)) cwdBySession.delete(key);
@@ -203,16 +222,58 @@ function abortRunning(
   return abortedResult(stdout, stderr);
 }
 
-async function pump(stream: ReadableStream<Uint8Array> | undefined, into: StreamBuffer): Promise<void> {
-  if (!stream) return;
+export function aliasTaskOutput(callId: string, taskId: string): void {
+  if (!callId || !SAFE_TASK_ID.test(taskId)) return;
+  const outputFile = getJobOutputFile(callId);
+  if (!outputFile) return;
+  const targetName = `${taskId}.output`;
+  if (basename(outputFile) === targetName) return;
+  const alias = join(dirname(outputFile), targetName);
+  try {
+    mkdirSync(dirname(alias), { recursive: true });
+    if (existsSync(alias)) {
+      const st = lstatSync(alias);
+      if (!st.isFile() || st.size > 0) return;
+      const tmp = `${alias}.ln-${process.pid}-${Date.now()}`;
+      symlinkSync(outputFile, tmp);
+      try {
+        renameSync(tmp, alias);
+      } catch {
+        try { unlinkSync(tmp); } catch { /* ignore */ }
+      }
+      return;
+    }
+    symlinkSync(outputFile, alias);
+  } catch {
+    /* best-effort */
+  }
+}
+
+type StreamPump = { promise: Promise<void>; cancel: () => void };
+
+function pump(stream: ReadableStream<Uint8Array> | undefined, into: StreamBuffer): StreamPump {
+  if (!stream) return { promise: Promise.resolve(), cancel: () => {} };
   const reader = stream.getReader();
   const decoder = new TextDecoder();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    appendStream(into, decoder.decode(value, { stream: true }));
-  }
-  appendStream(into, decoder.decode());
+  let stopped = false;
+  const cancel = () => {
+    if (stopped) return;
+    stopped = true;
+    void reader.cancel().catch(() => {});
+  };
+  const promise = (async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || stopped) break;
+        appendStream(into, decoder.decode(value, { stream: true }));
+      }
+      if (!stopped) appendStream(into, decoder.decode());
+    } catch {
+      /* cancelled or pipe closed */
+    }
+  })();
+  return { promise, cancel };
 }
 
 function waitWithTimeout<T>(ms: number, task: Promise<T>): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
@@ -264,15 +325,18 @@ function watchBackground(
   notify: Send,
   remainingMs: number,
   workspace: string,
+  pwdFile?: string,
 ): void {
   const callId = frame.callId ?? "";
   const outputFile = taskOutputPath(frame, workspace, proc.pid);
+  promoteJobToBackground(callId, outputFile);
   const stopTee = startTaskTee(outputFile, buffers);
   const timer = setTimeout(() => killTree(proc.pid), remainingMs);
   proc.unref();
   void finished.then(async () => {
     clearTimeout(timer);
     stopTee();
+    if (pwdFile) void Bun.file(pwdFile).delete().catch(() => {});
     const aborted = finishJob(callId);
     const code = typeof proc.exitCode === "number" ? proc.exitCode : await proc.exited;
     notifyExit(
@@ -307,7 +371,11 @@ export async function bashTool(
   if (wasCancelled(callId)) return abortedResult();
   const env = pinTuiLocale(await withDirenv(cwd, workspaceSpawnEnv(process.env, frame.tuiEnv)), frame.tuiEnv);
   if (wasCancelled(callId)) return abortedResult();
+  const bgDisabled =
+    env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS === "1" ||
+    process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS === "1";
   if (asBool(input.run_in_background)) {
+    if (bgDisabled) throw new Error("Background tasks are disabled (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1)");
     return withRedundantCdHint(
       background(frame, command, cwd, env, notify, clampTimeout(asNumber(input.timeout), BG_TIMEOUT_DEFAULT, 1, BG_TIMEOUT_MAX)),
       noteRedundantCd,
@@ -335,15 +403,69 @@ export async function bashTool(
 
   const stdout = makeStreamBuffer();
   const stderrBuf = makeStreamBuffer();
-  const finished = Promise.all([pump(proc.stdout, stdout), pump(proc.stderr, stderrBuf), proc.exited]);
-  const raced = await waitWithTimeout(timeoutMs, finished);
+  const stdoutPump = pump(proc.stdout, stdout);
+  const stderrPump = pump(proc.stderr, stderrBuf);
+  const pumpsDone = Promise.all([stdoutPump.promise, stderrPump.promise]);
+  // Resolve promptly once the shell itself exits; a detached child (`cmd &`)
+  // may inherit stdout/stderr pipes and hold them open long after `proc.exited`.
+  const settledAfterExit = proc.exited.then(async (code) => {
+    const drained = await waitWithTimeout(POST_EXIT_DRAIN_MS, pumpsDone);
+    if (drained.timedOut) {
+      stdoutPump.cancel();
+      stderrPump.cancel();
+    }
+    return code;
+  });
+  const raced = await waitWithTimeout(timeoutMs, settledAfterExit);
 
   if (raced.timedOut) {
-    if (wasCancelled(callId)) return abortRunning(proc, callId, pwdFile, stdout.text, stderrBuf.text);
-    await waitWithTimeout(DRAIN_AFTER_TIMEOUT_MS, finished);
-    if (wasCancelled(callId)) return abortRunning(proc, callId, pwdFile, stdout.text, stderrBuf.text);
-    watchBackground(proc, finished, frame, { stdout, stderr: stderrBuf }, notify, BG_TIMEOUT_DEFAULT, workspace);
-    await Bun.file(pwdFile).delete().catch(() => {});
+    if (wasCancelled(callId)) {
+      stdoutPump.cancel();
+      stderrPump.cancel();
+      return abortRunning(proc, callId, pwdFile, stdout.text, stderrBuf.text);
+    }
+    if (bgDisabled || PURE_SLEEP.test(command)) {
+      killTree(proc.pid);
+      await waitWithTimeout(POST_EXIT_DRAIN_MS, pumpsDone);
+      stdoutPump.cancel();
+      stderrPump.cancel();
+      const aborted = finishJob(callId);
+      await Bun.file(pwdFile).delete().catch(() => {});
+      let stderr = clip(stderrBuf.text);
+      stderr = append(stderr, aborted ? "Command was aborted before completion" : `Command timed out after ${timeoutMs}ms`);
+      return withRedundantCdHint({
+        stdout: clip(stdout.text.trimEnd()),
+        stderr: stderr.trimEnd(),
+        interrupted: aborted,
+        ...sandbox,
+      }, noteRedundantCd);
+    }
+    const drained = await waitWithTimeout(DRAIN_AFTER_TIMEOUT_MS, settledAfterExit);
+    if (wasCancelled(callId)) {
+      stdoutPump.cancel();
+      stderrPump.cancel();
+      return abortRunning(proc, callId, pwdFile, stdout.text, stderrBuf.text);
+    }
+    if (!drained.timedOut) {
+      const aborted = finishJob(callId);
+      const nextCwd = (await Bun.file(pwdFile).text().catch(() => "")).trim();
+      if (nextCwd) persistCwd(workspace, sessionId, nextCwd, extraDirs, false, frame.agentId);
+      await Bun.file(pwdFile).delete().catch(() => {});
+      const code = drained.value;
+      const rawStderr = clip(stderrBuf.text);
+      let stderr = rawStderr;
+      if (aborted) stderr = append(stderr, "Command was aborted before completion");
+      else if (code !== 0) stderr = append(stderr, `Exit code ${code}`);
+      const res = withRedundantCdHint({
+        stdout: clip(stdout.text.trimEnd()),
+        stderr: stderr.trimEnd(),
+        interrupted: aborted,
+        ...sandbox,
+      }, noteRedundantCd);
+      return aborted ? res : attachExitMeta(res, code, noteRedundantCd ? append(rawStderr, REDUNDANT_CD_HINT).trimEnd() : rawStderr.trimEnd());
+    }
+    const finished = Promise.all([pumpsDone, proc.exited]);
+    watchBackground(proc, finished, frame, { stdout, stderr: stderrBuf }, notify, BG_TIMEOUT_DEFAULT, workspace, pwdFile);
     return withRedundantCdHint({
       stdout: clip(stdout.text.trimEnd()),
       stderr: clip(stderrBuf.text.trimEnd()),
@@ -359,16 +481,18 @@ export async function bashTool(
   const nextCwd = (await Bun.file(pwdFile).text().catch(() => "")).trim();
   if (nextCwd) persistCwd(workspace, sessionId, nextCwd, extraDirs, false, frame.agentId);
   await Bun.file(pwdFile).delete().catch(() => {});
-  const code = raced.value[2];
-  let stderr = clip(stderrBuf.text);
+  const code = raced.value;
+  const rawStderr = clip(stderrBuf.text);
+  let stderr = rawStderr;
   if (aborted) stderr = append(stderr, "Command was aborted before completion");
   else if (code !== 0) stderr = append(stderr, `Exit code ${code}`);
-  return withRedundantCdHint({
+  const res = withRedundantCdHint({
     stdout: clip(stdout.text.trimEnd()),
     stderr: stderr.trimEnd(),
     interrupted: aborted,
     ...sandbox,
   }, noteRedundantCd);
+  return aborted ? res : attachExitMeta(res, code, noteRedundantCd ? append(rawStderr, REDUNDANT_CD_HINT).trimEnd() : rawStderr.trimEnd());
 }
 
 function withRedundantCdHint(result: BashOutput, dropped: boolean): BashOutput {
@@ -407,7 +531,7 @@ function background(
   const sessionId = frame.sessionId || "";
   const id = String(proc.pid);
   const output = taskDir ? join(taskDir, `${id}.output`) : staging;
-  registerJob(callId, sessionId, () => killTree(proc.pid), frame.agentId);
+  registerJob(callId, sessionId, () => killTree(proc.pid), frame.agentId, { background: true, outputFile: output });
   const timer = setTimeout(() => killTree(proc.pid), timeoutMs);
   proc.unref();
   void proc.exited.then(async (exitCode) => {

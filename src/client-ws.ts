@@ -17,17 +17,41 @@ export type ClientWsOpts = {
   tuiRoot?: string;
   extraDirs?: string[];
   env?: NodeJS.ProcessEnv;
+  heartbeatMs?: number;
 };
 
 function send(ws: WebSocket, msg: unknown) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function waitOpen(ws: WebSocket): Promise<void> {
+/** Force-tear down a half-open / blackholed TCP WebSocket without waiting for a Close frame. */
+function forceClose(ws: WebSocket, code = 4000, reason = "reconnect") {
+  try {
+    const bunWs = ws as WebSocket & { terminate?: () => void };
+    if (typeof bunWs.terminate === "function") {
+      bunWs.terminate();
+      return;
+    }
+    ws.close(code, reason);
+  } catch {
+    /* already closed */
+  }
+}
+
+function waitOpen(ws: WebSocket, timeoutMs = 10_000): Promise<void> {
   if (ws.readyState === WebSocket.OPEN) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    ws.addEventListener("open", () => resolve(), { once: true });
-    ws.addEventListener("error", () => reject(new Error("websocket failed")), { once: true });
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch { /* ignore */ }
+      reject(new Error("websocket connect timed out"));
+    }, timeoutMs);
+    const done = (fn: () => void) => {
+      clearTimeout(timer);
+      fn();
+    };
+    ws.addEventListener("open", () => done(resolve), { once: true });
+    ws.addEventListener("error", () => done(() => reject(new Error("websocket failed"))), { once: true });
+    ws.addEventListener("close", () => done(() => reject(new Error("websocket closed"))), { once: true });
   });
 }
 
@@ -70,21 +94,31 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
   const cwd = opts.cwd ?? process.cwd();
   const env = opts.env ?? process.env;
   let activeWs = new WebSocket(opts.url);
+  let attachingWs: WebSocket | undefined;
   const executor = createToolExecutor();
   executor.bind("", cwd, opts.tuiRoot ?? cwd, opts.extraDirs ?? []);
   const pendingOutbound: unknown[] = [];
   let reconnecting = false;
   let stdinEnded = false;
+  let lastServerSeq = 0;
+  let lastRecvAt = Date.now();
+  const heartbeatMs = opts.heartbeatMs ?? 10_000;
 
   const enqueueOutbound = (msg: unknown) => {
-    if (activeWs.readyState === WebSocket.OPEN) {
+    if (!reconnecting && activeWs.readyState === WebSocket.OPEN) {
       send(activeWs, msg);
       return;
     }
-    if (!reconnecting || stdinEnded) return;
+    if (stdinEnded) return;
     const kind = (msg as { type?: string } | null)?.type;
     if (kind === "transcript.flush") return;
-    if (pendingOutbound.length >= 256) pendingOutbound.shift();
+    if (pendingOutbound.length >= 1024) {
+      const dropIdx = pendingOutbound.findIndex((item) => {
+        const t = (item as { type?: string } | null)?.type;
+        return t !== "result" && t !== "notify";
+      });
+      pendingOutbound.splice(dropIdx >= 0 ? dropIdx : 0, 1);
+    }
     pendingOutbound.push(msg);
   };
 
@@ -127,6 +161,8 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
 
   const wireMessages = (ws: WebSocket) => {
     ws.addEventListener("message", (event) => {
+      if (ws !== activeWs && ws !== attachingWs) return;
+      lastRecvAt = Date.now();
       let msg: unknown;
       try {
         msg = parseWsJson(String(event.data));
@@ -138,13 +174,28 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
         process.stdout.write(`${JSON.stringify(msg)}\n`);
         return;
       }
-      const frame = msg as { type?: string; rel?: unknown; offset?: unknown; data?: unknown };
+      const frame = msg as { type?: string; seq?: unknown; msg?: unknown; rel?: unknown; offset?: unknown; data?: unknown };
+      if (frame.type === "pong") return;
+      if (typeof frame.seq === "number" && Number.isFinite(frame.seq)) {
+        if (frame.seq <= lastServerSeq) return;
+        lastServerSeq = frame.seq;
+      }
+      if (frame.type === "acp") {
+        if (frame.msg !== undefined) process.stdout.write(`${JSON.stringify(frame.msg)}\n`);
+        return;
+      }
       if (frame.type === "transcript.append") {
         const applied = applyTranscriptFrame(frame);
         if (!applied && typeof frame.offset === "number" && frame.offset > 0) requestFlush(0);
         return;
       }
-      if (frame.type === "call" || frame.type === "cancel" || frame.type === "turn.start" || frame.type === "turn.complete") {
+      if (
+        frame.type === "call" ||
+        frame.type === "cancel" ||
+        frame.type === "aliasTask" ||
+        frame.type === "turn.start" ||
+        frame.type === "turn.complete"
+      ) {
         executor.handle(frame, outbound, broadcast);
       }
     });
@@ -165,7 +216,8 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
     home,
     tuiRoot: opts.tuiRoot,
     extraDirs: opts.extraDirs ?? [],
-    reconnectGraceMs: 30_000,
+    reconnectGraceMs: 60_000,
+    seqReplay: true,
     env: collectForwardedEnv(env),
     git: readClientGit(cwd),
     transcriptCursors: loadTranscriptCursors(),
@@ -177,7 +229,7 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
   const instanceId = typeof started.instanceId === "string" ? started.instanceId : "";
   const resumeToken = typeof started.resumeToken === "string" ? started.resumeToken : "";
   const tuiRoot = typeof started.tuiRoot === "string" && started.tuiRoot ? started.tuiRoot : opts.tuiRoot ?? cwd;
-  executor.bind("", cwd, tuiRoot, opts.extraDirs ?? []);
+  executor.bind(instanceId, cwd, tuiRoot, opts.extraDirs ?? []);
   if (host) {
     void backfillTranscripts({ host })
       .then(() => requestFlush(0))
@@ -203,34 +255,56 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
   const tryReattach = async (): Promise<boolean> => {
     if (!instanceId || !resumeToken || stdinEnded) return false;
     reconnecting = true;
-    const delays = [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000];
-    const deadline = Date.now() + 25_000;
+    forceClose(activeWs, 4000, "reattach");
+    const delays = [250, 500, 1_000, 2_000, 3_000, 5_000, 5_000, 5_000, 5_000, 5_000, 5_000, 5_000, 5_000];
+    const deadline = Date.now() + 55_000;
     for (const delay of delays) {
       if (stdinEnded || Date.now() >= deadline) break;
       await Bun.sleep(delay);
       if (stdinEnded) break;
       const candidate = new WebSocket(opts.url);
+      attachingWs = candidate;
       try {
-        await waitOpen(candidate);
+        await waitOpen(candidate, 5_000);
         wireMessages(candidate);
         const h = waitCtrl(candidate, "hello", 5_000);
         send(candidate, { v: 1, type: "hello", token: opts.token });
         await h;
         const att = waitCtrl(candidate, "instance.ready", 10_000);
-        send(candidate, { v: 1, type: "instance.attach", instanceId, resumeToken });
+        send(candidate, { v: 1, type: "instance.attach", instanceId, resumeToken, lastSeq: lastServerSeq });
         await att;
         activeWs = candidate;
+        attachingWs = undefined;
+        lastRecvAt = Date.now();
         reconnecting = false;
-        while (pendingOutbound.length) send(activeWs, pendingOutbound.shift());
+        while (pendingOutbound.length && activeWs.readyState === WebSocket.OPEN) {
+          send(activeWs, pendingOutbound[0]);
+          pendingOutbound.shift();
+        }
         requestFlush(0);
         return true;
       } catch {
+        if (attachingWs === candidate) attachingWs = undefined;
         try { candidate.close(); } catch { /* ignore */ }
       }
     }
     reconnecting = false;
     return false;
   };
+
+  // Tailscale / WAN silent blackhole detector + seq ack trimmer.
+  const heartbeat = heartbeatMs > 0
+    ? setInterval(() => {
+        if (stdinEnded || reconnecting || activeWs.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - lastRecvAt > heartbeatMs * 2.5) {
+          console.error("cc-mods-relay: session heartbeat timed out; reconnecting");
+          forceClose(activeWs, 4000, "heartbeat-timeout");
+          return;
+        }
+        send(activeWs, { v: 1, type: "ping", ts: Date.now(), ack: lastServerSeq });
+      }, heartbeatMs)
+    : undefined;
+  heartbeat?.unref?.();
 
   for (;;) {
     const closed = waitClosed(activeWs);
@@ -242,6 +316,7 @@ export async function runClientWs(opts: ClientWsOpts): Promise<void> {
     if (!(await tryReattach())) break;
   }
 
+  if (heartbeat) clearInterval(heartbeat);
   if (idleFlush) clearTimeout(idleFlush);
   requestFlush(0);
   executor.cancelAll();

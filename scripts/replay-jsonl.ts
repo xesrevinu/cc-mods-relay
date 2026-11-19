@@ -452,6 +452,41 @@ const checks: Check[] = [
     input: { file_path: "/usr/share/cc-mods-replay-nope.txt", content: "nope\n" },
     expect: (c) => (/PATH_DENIED/i.test(blob(c)) ? undefined : `toolchain write not denied: ${blob(c).slice(0, 160)}`),
   },
+  {
+    id: toolId("BashDetachPipe"),
+    live: "Bash `rm && nohup ... &` returns promptly instead of hanging on inherited pipes",
+    name: "Bash",
+    input: { command: `rm -f '${tmpHabit}.bg' && nohup bash -c "sleep 2; printf ok > '${tmpHabit}.bg'" >/dev/null 2>&1 &`, timeout: 5_000 },
+    expect: (c) => {
+      const t = blob(c);
+      if (/timedOutAfterMs|running in background|run_in_background is not available/i.test(t)) {
+        return `detached nohup auto-backgrounded or failed: ${t.slice(0, 160)}`;
+      }
+      return;
+    },
+  },
+  {
+    id: toolId("BashRgQuoted"),
+    live: "Bash `rg -n \"fn foo|fn bar\"` keeps intact quoted pattern in prefer-Grep hint",
+    name: "Bash",
+    input: { command: `rg -n "line-1 |line-2 " '${join(iso.tui, "src", "lib.ts")}'` },
+    expect: (c) => {
+      const t = blob(c);
+      if (!t.includes("pattern: line-1 |line-2 ")) return `pattern mangled: ${t.slice(0, 160)}`;
+      return;
+    },
+  },
+  {
+    id: toolId("GrepMultiGlob"),
+    live: "Grep space-separated glob (`*.ts *.md`) matches both extensions",
+    name: "Grep",
+    input: { pattern: "line-1|use bun", path: iso.tui, glob: "*.ts *.md" },
+    expect: (c) => {
+      const t = blob(c);
+      if (!t.includes("lib.ts") || !t.includes("CLAUDE.md")) return `multi-glob missed: ${t.slice(0, 160)}`;
+      return;
+    },
+  },
 ];
 
 const grouped: Check[][] = [
@@ -478,6 +513,7 @@ const grouped: Check[][] = [
   [checks[27]!],
   [checks[28]!],
   [checks[29]!, checks[30]!],
+  [checks[31]!, checks[32]!, checks[33]!],
 ];
 
 const turns: ScriptedTurn[] = [
@@ -523,7 +559,7 @@ function cleanup(): void {
   for (const dir of [worktree, join(home, ".claude", "projects", "-cc-mods-replay"), refs, sibling, iso.root]) {
     if (dir.includes("cc-mods-replay") && existsSync(dir)) rmSync(dir, { recursive: true, force: true });
   }
-  for (const file of [tmpHabit, privateTmp]) {
+  for (const file of [tmpHabit, `${tmpHabit}.bg`, privateTmp]) {
     if (existsSync(file)) rmSync(file, { force: true });
   }
 }

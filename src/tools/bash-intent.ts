@@ -57,7 +57,7 @@ export function droppedRedundantCd(command: string, cwd: string): boolean {
   return stripRedundantCd(command, cwd) !== command;
 }
 
-/** Split on quote-aware `&&` / `;`. `||`, pipes, substitutions → undefined (keep Bash). */
+/** Split on quote-aware `&&` / `;`. Preserves quotes so tokenizers keep grouped args. */
 function splitSequential(command: string): string[] | undefined {
   const stages: string[] = [];
   let cur = "";
@@ -70,12 +70,18 @@ function splitSequential(command: string): string[] | undefined {
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!;
     if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < command.length) {
+        cur += ch + command[i + 1]!;
+        i += 1;
+        continue;
+      }
       if (ch === quote) quote = undefined;
-      else cur += ch;
+      cur += ch;
       continue;
     }
     if (ch === "'" || ch === '"') {
       quote = ch;
+      cur += ch;
       continue;
     }
     if (ch === "\\") {
@@ -112,12 +118,27 @@ function tokens(command: string): string[] {
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!;
     if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < command.length) {
+        const next = command[i + 1]!;
+        if (next === '"' || next === "\\" || next === "$" || next === "`" || next === "\n") {
+          cur += next;
+        } else {
+          cur += ch + next;
+        }
+        i += 1;
+        continue;
+      }
       if (ch === quote) quote = undefined;
       else cur += ch;
       continue;
     }
     if (ch === "'" || ch === '"') {
       quote = ch;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < command.length) {
+      cur += command[i + 1]!;
+      i += 1;
       continue;
     }
     if (/\s/.test(ch)) {
@@ -376,10 +397,12 @@ function joinPrefers(prefers: Extract<BashIntent, { action: "prefer" }>[]): Bash
  * Pipes, `||`, substitutions, and any non-native stage stay Bash.
  */
 export function classifyBashIntent(command: string, cwd: string): BashIntent {
-  const stripped = stripRedundantCd(stripIgnorableRedirects(command.trim()), cwd);
-  if (!stripped) return { action: "run", command: "true" };
-  const stages = splitSequential(stripped);
-  if (!stages) return { action: "run", command: stripped };
+  const runnable = stripRedundantCd(command.trim(), cwd);
+  if (!runnable) return { action: "run", command: "true" };
+  const inspected = stripRedundantCd(stripIgnorableRedirects(command.trim()), cwd);
+  if (!inspected) return { action: "run", command: runnable };
+  const stages = splitSequential(inspected);
+  if (!stages) return { action: "run", command: runnable };
   const prefers: Extract<BashIntent, { action: "prefer" }>[] = [];
   for (const stage of stages) {
     if (ignorable(stage)) continue;
@@ -389,9 +412,9 @@ export function classifyBashIntent(command: string, cwd: string): BashIntent {
       continue;
     }
     const prefer = preferNative(stage);
-    if (!prefer) return { action: "run", command: stripped };
+    if (!prefer) return { action: "run", command: runnable };
     prefers.push(prefer);
   }
-  if (prefers.length === 0) return { action: "run", command: stripped };
+  if (prefers.length === 0) return { action: "run", command: runnable };
   return joinPrefers(prefers);
 }

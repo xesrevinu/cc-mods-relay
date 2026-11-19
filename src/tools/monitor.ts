@@ -96,6 +96,8 @@ function armTimeout(ms: number, onFire: () => void): () => void {
   return () => clearTimeout(timer);
 }
 
+let wsMonitorSeq = 0;
+
 function startWsMonitor(
   frame: ToolFrame,
   url: string,
@@ -136,7 +138,7 @@ function startWsMonitor(
     } catch {
       /* already gone */
     }
-  }, frame.agentId);
+  }, frame.agentId, { background: true });
   ws.addEventListener("message", (event) => {
     events += 1;
     if (typeof event.data === "string") notifyLine(notify, frame, event.data);
@@ -151,7 +153,7 @@ function startWsMonitor(
   ws.addEventListener("error", () => {
     end(timedOut ? "expired" : "exited", { exitCode: 1, timeoutMs: timedOut ? ms : undefined });
   });
-  return startedResult("ws", ms, persistent);
+  return startedResult(`ws-${++wsMonitorSeq}`, ms, persistent);
 }
 
 async function startCommandMonitor(
@@ -186,7 +188,7 @@ async function startCommandMonitor(
   registerJob(callId, frame.sessionId || "", () => {
     stop();
     killTree(proc.pid);
-  }, frame.agentId);
+  }, frame.agentId, { background: true });
   const onLine = (line: string) => {
     events += 1;
     notifyLine(notify, frame, line);

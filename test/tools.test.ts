@@ -2,9 +2,13 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { cancelAgent, cancelCall, execute } from "../src/exec.js";
+import { cancelAgent, cancelCall, cancelSession, execute } from "../src/exec.js";
 import { createSubagentWatcher } from "../src/subagent-watcher.js";
+import { createToolExecutor } from "../src/tool-executor.js";
 import { IMAGE_MAX_OUTPUT_BYTES } from "../src/tools/image-compress.js";
+import { GREP_CONTENT_BYTE_CAP } from "../src/tools/grep.js";
+import { HYDRATE_MAX_BYTES } from "../src/tools/hydrate.js";
+import { structuredPatch } from "../src/tools/patch.js";
 import {
   applyModEvent,
   isReplDispatchResult,
@@ -14,7 +18,7 @@ import {
   withReplParent,
 } from "../src/mod-live.js";
 import { toolInfoFromToolUse } from "../src/tools.js";
-import { encodeClaudeTaskDir, persistCwd, sessionCwd } from "../src/tools/bash.js";
+import { aliasTaskOutput, encodeClaudeTaskDir, persistCwd, sessionCwd } from "../src/tools/bash.js";
 import { REDUNDANT_CD_HINT } from "../src/tools/bash-intent.js";
 import { mapPath, mapReadPath, mapWritePath, rewriteRemoteText } from "../src/tools/paths.js";
 import { READ_CONTENT_BYTE_CAP } from "../src/tools/read.js";
@@ -1117,4 +1121,368 @@ test("subagent-watcher stops polling after all spawned subagents complete and re
   } finally {
     watcher.stop();
   }
+});
+
+test("Bash returns promptly when a backgrounded subshell inherits pipes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-bg-pipe-"));
+  const sentinel = join(dir, "done.txt");
+  const started = Date.now();
+  try {
+    const res = await run(dir, "Bash", {
+      command: `rm -f '${sentinel}' && nohup bash -c "sleep 2; echo ok > '${sentinel}'" >/dev/null 2>&1 &`,
+      timeout: 5_000,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.result.backgroundTaskId).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(1_500);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bash never auto-backgrounds leading sleep and respects CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-no-autobg-"));
+  try {
+    const slept = await run(dir, "Bash", { command: "sleep 5", timeout: 150 });
+    expect(slept.ok).toBe(true);
+    expect(slept.result.backgroundTaskId).toBeUndefined();
+    expect(slept.result.stderr).toMatch(/timed out after 150ms/i);
+
+    const prev = process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+    process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
+    try {
+      const disabled = await run(dir, "Bash", { command: "echo hi; sleep 5", timeout: 150 });
+      expect(disabled.ok).toBe(true);
+      expect(disabled.result.backgroundTaskId).toBeUndefined();
+      expect(disabled.result.stderr).toMatch(/timed out after 150ms/i);
+
+      const explicitBg = await run(dir, "Bash", { command: "echo hi", run_in_background: true });
+      expect(explicitBg.ok).toBe(false);
+      expect(explicitBg.error.message).toMatch(/Background tasks are disabled/i);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+      else process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = prev;
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("turn-scoped cancel kills foreground Bash while keeping background Bash alive and aliasing output", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-turn-cancel-"));
+  const sessionId = `turn-cancel-${Date.now()}`;
+  const notes: any[] = [];
+  const bgDone = new Promise<any>((resolve) => {
+    const send = (frame: any) => {
+      if (frame.type === "notify") {
+        notes.push(frame);
+        resolve(frame);
+      }
+    };
+    void execute(
+      {
+        tool: "Bash",
+        input: { command: "sleep 0.35; echo bg-survived", run_in_background: true },
+        cwd: dir,
+        tuiRoot: dir,
+        callId: "bg-keep",
+        sessionId,
+        claudeSessionId: "00000000-0000-0000-0000-000000000099",
+        tuiUid: 99999,
+      },
+      () => {},
+      send,
+    );
+  });
+
+  const fgPromise = new Promise<any>((resolve) => {
+    void execute(
+      {
+        tool: "Bash",
+        input: { command: "sleep 8" },
+        cwd: dir,
+        tuiRoot: dir,
+        callId: "fg-kill",
+        sessionId,
+      },
+      (frame) => resolve(frame),
+    );
+  });
+
+  await Bun.sleep(100);
+  aliasTaskOutput("bg-keep", "mini-task-77");
+  cancelSession(sessionId, { includeBackground: false });
+
+  const fg = await fgPromise;
+  expect(fg.ok).toBe(true);
+  expect(fg.result.interrupted).toBe(true);
+
+  const note = await bgDone;
+  expect(note.interrupted).toBe(false);
+  expect(note.exitCode).toBe(0);
+  expect(note.output).toContain("bg-survived");
+  if (typeof note.outputFile === "string") {
+    const aliasPath = join(note.outputFile, "..", "mini-task-77.output");
+    expect(existsSync(aliasPath)).toBe(true);
+    expect(readFileSync(aliasPath, "utf8")).toContain("bg-survived");
+    rmSync(join("/tmp", "claude-99999"), { recursive: true, force: true });
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("structuredPatch emits contextual hunks without phantom trailing empty lines", () => {
+  const before = Array.from({ length: 20 }, (_, i) => `line-${i + 1}`).join("\n") + "\n";
+  const after = before.replace("line-10", "line-10-changed");
+  const hunks = structuredPatch(before, after);
+  expect(hunks).toHaveLength(1);
+  expect(hunks[0]!.oldStart).toBe(7);
+  expect(hunks[0]!.oldLines).toBe(7);
+  expect(hunks[0]!.newLines).toBe(7);
+  expect(hunks[0]!.lines).toContain("-line-10");
+  expect(hunks[0]!.lines).toContain("+line-10-changed");
+  expect(hunks[0]!.lines).not.toContain("-line-1");
+
+  const eofEdit = structuredPatch("a\nb\n", "a\nc\n");
+  expect(eofEdit).toEqual([{ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2, lines: [" a", "-b", "+c"] }]);
+
+  const created = structuredPatch("", "a\nb\n");
+  expect(created).toEqual([{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 2, lines: ["+a", "+b"] }]);
+});
+
+test("Grep supports multi-glob, caps huge output, and omits undefined optional keys", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-grep-multi-"));
+  try {
+    writeFileSync(join(dir, "a.ts"), "needle-ts\n");
+    writeFileSync(join(dir, "b.md"), "needle-md\n");
+    writeFileSync(join(dir, "c.txt"), "needle-txt\n");
+    const multi = await run(dir, "Grep", { pattern: "needle", path: dir, glob: "*.ts *.md", head_limit: 0 });
+    expect(multi.ok).toBe(true);
+    expect(multi.result.filenames.sort()).toEqual([join(dir, "a.ts"), join(dir, "b.md")].sort());
+    expect("appliedLimit" in multi.result).toBe(false);
+    expect("appliedOffset" in multi.result).toBe(false);
+
+    const bigLine = `hit-${"x".repeat(400)}\n`;
+    writeFileSync(join(dir, "huge.log"), bigLine.repeat(5000));
+    const capped = await run(dir, "Grep", {
+      pattern: "hit-",
+      path: join(dir, "huge.log"),
+      output_mode: "content",
+      head_limit: 0,
+    });
+    expect(capped.ok).toBe(true);
+    expect(Buffer.byteLength(capped.result.content, "utf8")).toBeLessThanOrEqual(GREP_CONTENT_BYTE_CAP + 256);
+    expect(capped.result.content).toContain("truncated");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Read paged stream reports accurate totalLines on large files", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-read-total-"));
+  const file = join(dir, "big.txt");
+  try {
+    const body = Array.from({ length: 3000 }, (_, i) => `L${String(i + 1).padStart(4, "0")} ${"x".repeat(100)}`).join("\n") + "\n";
+    writeFileSync(file, body);
+    const res = await run(dir, "Read", { file_path: file, offset: 5, limit: 10 });
+    expect(res.ok).toBe(true);
+    expect(res.result.file.numLines).toBe(10);
+    expect(res.result.file.startLine).toBe(5);
+    expect(res.result.file.totalLines).toBe(3000);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hydrate rejects files exceeding HYDRATE_MAX_BYTES", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-hydrate-cap-"));
+  const file = join(dir, "huge.bin");
+  try {
+    writeFileSync(file, Buffer.alloc(HYDRATE_MAX_BYTES + 16, 65));
+    const res = await run(dir, "hydrate", { file_path: file });
+    expect(res.ok).toBe(false);
+    expect(res.error.message).toMatch(/hydrate limit/i);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tool-executor serializes relative+absolute Edits and rejects inflight CALL_ID_CONFLICT", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-exec-ser-"));
+  const abs = join(dir, "f.txt");
+  writeFileSync(abs, "alpha\nbeta\n");
+  const exec = createToolExecutor();
+  exec.bind("s-ser", dir, dir);
+  try {
+    const out: any[] = [];
+    const done = new Promise<void>((resolve) => {
+      const send = (m: any) => {
+        out.push(m);
+        if (out.length === 2) resolve();
+      };
+      exec.handle({ type: "call", callId: "ed-rel", tool: "Edit", input: { file_path: "f.txt", old_string: "alpha", new_string: "ALPHA" } }, send, send);
+      exec.handle({ type: "call", callId: "ed-abs", tool: "Edit", input: { file_path: abs, old_string: "beta", new_string: "BETA" } }, send, send);
+    });
+    await done;
+    expect(readFileSync(abs, "utf8")).toBe("ALPHA\nBETA\n");
+
+    const conflict: any[] = [];
+    const slowDone = new Promise<void>((resolve) => {
+      exec.handle(
+        { type: "call", callId: "dup-1", tool: "Bash", input: { command: "sleep 0.2; echo ok" } },
+        (m) => { conflict.push(m); if (conflict.length >= 2) resolve(); },
+        () => {},
+      );
+      exec.handle(
+        { type: "call", callId: "dup-1", tool: "Bash", input: { command: "echo different" } },
+        (m) => { conflict.push(m); if (conflict.length >= 2) resolve(); },
+        () => {},
+      );
+    });
+    await slowDone;
+    expect(conflict.some((m) => m.ok === false && m.error?.code === "CALL_ID_CONFLICT")).toBe(true);
+    expect(conflict.some((m) => m.ok === true)).toBe(true);
+  } finally {
+    exec.cancelAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("aliasTaskOutput still symlinks after a fast-exiting background Bash finishes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-fast-alias-"));
+  const callId = `fast-bg-${Date.now()}`;
+  try {
+    const exited = new Promise<any>((resolve) => {
+      void execute(
+        {
+          tool: "Bash",
+          input: { command: "echo fast-done", run_in_background: true },
+          cwd: dir,
+          tuiRoot: dir,
+          callId,
+          sessionId: "s-fast",
+          claudeSessionId: "00000000-0000-0000-0000-000000000088",
+          tuiUid: 99998,
+        },
+        () => {},
+        (frame) => {
+          if (frame.type === "notify") resolve(frame);
+        },
+      );
+    });
+    const note = await exited;
+    aliasTaskOutput(callId, "mini-late-88");
+    const aliasPath = join(note.outputFile, "..", "mini-late-88.output");
+    expect(existsSync(aliasPath)).toBe(true);
+    expect(readFileSync(aliasPath, "utf8")).toContain("fast-done");
+  } finally {
+    rmSync(join("/tmp", "claude-99998"), { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("main-session resetSessionCwd does not wipe active subagent cwd", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "cc-sub-cwd-")));
+  const sub = join(dir, "sub");
+  mkdirSync(sub);
+  const sid = `sess-sub-iso-${Date.now()}`;
+  try {
+    persistCwd(dir, sid, sub, [], true, "agent-sub-1");
+    persistCwd(dir, sid, sub, [], true);
+    expect(sessionCwd({ sessionId: sid, agentId: "agent-sub-1", cwd: dir }, dir)).toBe(sub);
+    // Calling resetSessionCwd without allAgents only resets main session
+    const { resetSessionCwd } = require("../src/tools/bash.js");
+    resetSessionCwd(sid);
+    expect(sessionCwd({ sessionId: sid, cwd: dir }, dir)).toBe(dir);
+    expect(sessionCwd({ sessionId: sid, agentId: "agent-sub-1", cwd: dir }, dir)).toBe(sub);
+    resetSessionCwd(sid, undefined, { allAgents: true });
+    expect(sessionCwd({ sessionId: sid, agentId: "agent-sub-1", cwd: dir }, dir)).toBe(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Edit matches LF old_string against CRLF files and preserves CRLF", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-edit-crlf-"));
+  const file = join(dir, "win.txt");
+  writeFileSync(file, "line1\r\nline2\r\nline3\r\n");
+  try {
+    const res = await run(dir, "Edit", {
+      file_path: file,
+      old_string: "line1\nline2",
+      new_string: "line1\nline2-edited",
+    });
+    expect(res.ok).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe("line1\r\nline2-edited\r\nline3\r\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Grep hyphenated dir with -n:false context and *.gitignore glob keep clean filenames and skip .git", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-grep-dash-dir-"));
+  try {
+    mkdirSync(join(dir, ".git"), { recursive: true });
+    writeFileSync(join(dir, ".git", "config"), "needle-in-git\n");
+    writeFileSync(join(dir, "sample.txt"), "before\nneedle-hit\nafter\n");
+
+    const dash = await run(dir, "Grep", {
+      pattern: "needle-hit",
+      path: dir,
+      output_mode: "content",
+      "-n": false,
+      "-C": 1,
+    });
+    expect(dash.ok).toBe(true);
+    expect(dash.result.filenames).toEqual([join(dir, "sample.txt")]);
+    expect(dash.result.numFiles).toBe(1);
+
+    // Before- and after-context lines containing `:` must not be misparsed as filenames when -n:false.
+    writeFileSync(join(dir, "typed.ts"), "const before: number = 1;\nconst target = 2;\nconst after: string = 'x';\n");
+    const colonCtx = await run(dir, "Grep", {
+      pattern: "const target = 2",
+      path: dir,
+      output_mode: "content",
+      "-n": false,
+      "-C": 1,
+    });
+    expect(colonCtx.ok).toBe(true);
+    expect(colonCtx.result.filenames).toEqual([join(dir, "typed.ts")]);
+    expect(colonCtx.result.numFiles).toBe(1);
+
+    const gitignoreGlob = await run(dir, "Grep", {
+      pattern: "needle",
+      path: dir,
+      glob: "*.gitignore *.txt",
+    });
+    expect(gitignoreGlob.ok).toBe(true);
+    expect(gitignoreGlob.result.filenames).toEqual([join(dir, "sample.txt")]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Glob pattern containing 'build' substring still respects .gitignore", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-glob-sub-"));
+  try {
+    mkdirSync(join(dir, "ignored"), { recursive: true });
+    mkdirSync(join(dir, "src"), { recursive: true });
+    writeFileSync(join(dir, ".gitignore"), "ignored/\n");
+    writeFileSync(join(dir, "ignored", "rebuild.ts"), "no\n");
+    writeFileSync(join(dir, "src", "rebuild.ts"), "yes\n");
+    const res = await run(dir, "Glob", { pattern: "**/*build*.ts", path: dir });
+    expect(res.ok).toBe(true);
+    expect(res.result.filenames).toEqual([join(dir, "src", "rebuild.ts")]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rewriteRemotePath does not corrupt $HOMEBREW_PREFIX", () => {
+  expect(rewriteRemoteText("$HOMEBREW_PREFIX/bin/bun", "/Users/me/proj", "/Users/mini/proj")).toBe(
+    "$HOMEBREW_PREFIX/bin/bun",
+  );
+  const { rewriteRemotePath } = require("../src/tools/paths.js");
+  expect(rewriteRemotePath("$HOMEBREW_PREFIX/bin/bun", "/Users/me/proj", "/Users/mini/proj")).toBe(
+    "$HOMEBREW_PREFIX/bin/bun",
+  );
 });

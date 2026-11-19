@@ -380,7 +380,5 @@ Token comes from the config file, never argv, so it does not show up in `ps`.
 
 ## Known leftovers
 
-- NotebookEdit still uses the strict path mapper, not the write-mapper-plus-memory exception.
 - `$.clock.after` will not fire if the Mods clock does not.
-- Hydrate failure still lets the TUI builtin run against a missing copy.
 - Debug logging on the TUI host is easy to leave on after a live investigation.

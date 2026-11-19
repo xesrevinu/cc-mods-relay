@@ -442,3 +442,45 @@ test("startTranscriptSync pauses under backpressure and resumes on flush", () =>
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("startTranscriptSync resets to offset 0 when a transcript file truncates", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-trunc-"));
+  const folder = join(dir, "projects", "-p");
+  mkdirSync(folder, { recursive: true });
+  const file = join(folder, "s.jsonl");
+  writeFileSync(file, "0123456789");
+  const sent: any[] = [];
+  const sync = startTranscriptSync({
+    claudeConfigDir: dir,
+    watch: false,
+    idleMs: 0,
+    send: (frame) => sent.push(frame),
+  });
+  try {
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.offset).toBe(0);
+    writeFileSync(file, "abc");
+    sync.flush();
+    expect(sent).toHaveLength(2);
+    expect(sent[1]!.offset).toBe(0);
+    expect(Buffer.from(sent[1]!.data, "base64").toString("utf8")).toBe("abc");
+  } finally {
+    sync.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("applyTranscriptChunk truncates stale trailing bytes on non-zero shrinking write", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-mods-shrink-"));
+  const cfg = mkdtempSync(join(tmpdir(), "cc-mods-shrink-cfg-"));
+  const rel = "-p/s.jsonl";
+  try {
+    applyTranscriptChunk(dir, rel, 0, Buffer.from("0123456789"), { configDir: cfg });
+    const res = applyTranscriptChunk(dir, rel, 2, Buffer.from("XY"), { configDir: cfg });
+    expect(res?.size).toBe(4);
+    expect(readFileSync(join(dir, "-p", "s.jsonl"), "utf8")).toBe("01XY");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(cfg, { recursive: true, force: true });
+  }
+});

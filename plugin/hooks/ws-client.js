@@ -237,13 +237,18 @@ function runListener() {
     for (const [callId, entry] of calls) {
       if (entry.frame || entry.error) continue;
       entry.error = err;
+      const hadWaiters = entry.waiters.length > 0;
       while (entry.waiters.length) entry.waiters.shift().reject(err);
-      const timer = setTimeout(() => calls.delete(callId), 30_000);
-      timer.unref?.();
+      if (!hadWaiters) {
+        const timer = setTimeout(() => {
+          if (calls.get(callId) === entry) calls.delete(callId);
+        }, 30_000);
+        timer.unref?.();
+      }
     }
   };
 
-  const waitSlice = async (callId, entry) => {
+  const waitSlice = async (callId, entry, sliceMs = RPC_SLICE_MS) => {
     if (entry.frame) {
       calls.delete(callId);
       return entry.frame;
@@ -252,6 +257,7 @@ function runListener() {
       calls.delete(callId);
       throw entry.error;
     }
+    const waitMs = Math.max(200, Math.min(RPC_SLICE_MS, Number.isFinite(sliceMs) && sliceMs > 0 ? sliceMs : RPC_SLICE_MS));
     return new Promise((resolve, reject) => {
       const waiter = {
         resolve(frame) {
@@ -269,7 +275,7 @@ function runListener() {
         const idx = entry.waiters.indexOf(waiter);
         if (idx >= 0) entry.waiters.splice(idx, 1);
         resolve({ pending: true, callId });
-      }, RPC_SLICE_MS);
+      }, waitMs);
       timer.unref?.();
       entry.waiters.push(waiter);
     });
@@ -296,7 +302,7 @@ function runListener() {
             );
           }
           try {
-            return Response.json(await waitSlice(callId, entry));
+            return Response.json(await waitSlice(callId, entry, Number(body.sliceMs)));
           } catch (error) {
             return Response.json(
               {
@@ -315,12 +321,14 @@ function runListener() {
           return Response.json({ ok: false, error: { code: "NO_CONNECTION", message: "listener reconnecting" } }, { status: 503 });
         }
         const kind = body.type || "call";
-        if (kind === "turn.complete" || kind === "turn.start" || kind === "cancel") {
+        if (kind === "turn.complete" || kind === "turn.start" || kind === "cancel" || kind === "aliasTask") {
           try {
             active.send({
               v: 1,
               type: kind,
               callId: body.callId,
+              taskId: body.taskId,
+              scope: body.scope,
               sessionId: body.sessionId,
               agentId: body.agentId,
               answer: body.answer,
@@ -332,9 +340,21 @@ function runListener() {
           }
         }
         const callId = typeof body.callId === "string" ? body.callId : typeof body.id === "string" ? body.id : "";
+        const sig = JSON.stringify({ tool: body.tool, input: body.input });
         let entry = callId ? calls.get(callId) : undefined;
+        if (entry && entry.sig !== sig) {
+          return Response.json({
+            v: 1,
+            type: "result",
+            id: body.id,
+            callId,
+            sessionId: body.sessionId,
+            ok: false,
+            error: { code: "CALL_ID_CONFLICT", message: "callId reused with different input" },
+          });
+        }
         if (!entry) {
-          entry = { waiters: [] };
+          entry = { sig, waiters: [] };
           if (callId) calls.set(callId, entry);
           try {
             active.send({
@@ -359,7 +379,7 @@ function runListener() {
           }
         }
         try {
-          return Response.json(await waitSlice(callId, entry));
+          return Response.json(await waitSlice(callId, entry, Number(body.sliceMs)));
         } catch (error) {
           return Response.json(
             {
@@ -401,9 +421,14 @@ function runListener() {
             const entry = calls.get(frame.callId);
             if (entry) {
               entry.frame = frame;
+              const hadWaiters = entry.waiters.length > 0;
               while (entry.waiters.length) entry.waiters.shift().resolve(frame);
-              const timer = setTimeout(() => calls.delete(frame.callId), 30_000);
-              timer.unref?.();
+              if (!hadWaiters) {
+                const timer = setTimeout(() => {
+                  if (calls.get(frame.callId) === entry) calls.delete(frame.callId);
+                }, 30_000);
+                timer.unref?.();
+              }
             }
           }
         }
@@ -435,8 +460,18 @@ if (msg.type === "hello") {
   process.exit(0);
 }
 
-if (msg.type === "turn.complete" || msg.type === "turn.start" || msg.type === "cancel") {
-  session.send({ v: 1, type: msg.type, callId: msg.callId, sessionId: msg.sessionId, agentId: msg.agentId, answer: msg.answer, isAborted: msg.isAborted });
+if (msg.type === "turn.complete" || msg.type === "turn.start" || msg.type === "cancel" || msg.type === "aliasTask") {
+  session.send({
+    v: 1,
+    type: msg.type,
+    callId: msg.callId,
+    taskId: msg.taskId,
+    scope: msg.scope,
+    sessionId: msg.sessionId,
+    agentId: msg.agentId,
+    answer: msg.answer,
+    isAborted: msg.isAborted,
+  });
   session.ws.close();
   process.exit(0);
 }

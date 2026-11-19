@@ -20,7 +20,34 @@ function failResult(message) {
 
 /** User/transport/jail refusal — not a completed tool. Missing files must not go through here. */
 function permissionDenied(code) {
-  return code === "CANCELLED" || code === "UNAUTHORIZED" || code === "CALL_ID_CONFLICT" || code === "PATH_DENIED";
+  return (
+    code === "CANCELLED" ||
+    code === "UNAUTHORIZED" ||
+    code === "CALL_ID_CONFLICT" ||
+    code === "PATH_DENIED" ||
+    code === "EXECUTOR_DISCONNECTED" ||
+    code === "NO_INSTANCE" ||
+    code === "NO_CONNECTION"
+  );
+}
+
+/** Claude Code writes persisted oversized tool outputs on Mini under tool-results/. */
+function isMiniArtifactPath(path) {
+  if (typeof path !== "string" || !path) return false;
+  const norm = path.replaceAll("\\", "/");
+  if (/(^|\/)\.\.(\/|$)/.test(norm)) return false;
+  return /\/\.claude\/projects\/[^/]+\/[^/]+\/tool-results(\/|$)/.test(norm);
+}
+
+/** Code Mode async REPL forbids `run_in_background: true` on inner Bash calls. */
+function isReplInnerCall(id) {
+  return typeof id === "string" && id.startsWith("repl_");
+}
+
+function rpcTimeoutMs(tool) {
+  // Bash foreground max is 600s + 2s drain + direnv overhead; keep RPC timeout safely above it.
+  if (tool === "Bash" || tool === "PowerShell") return 660_000;
+  return 120_000;
 }
 
 function resultPath(input) {
@@ -168,15 +195,83 @@ function waiterScript(callId) {
   const id = waiterId(callId);
   const done = shellQuote(waiterDonePath(id));
   const out = shellQuote(waiterOutPath(id));
-  return "mkdir -p /tmp/cc-mods-wait; while [ ! -f " + done + " ]; do sleep 0.2; done; cat " + out + " 2>/dev/null; IFS= read -r cc_mods_ex < " + done + " || cc_mods_ex=0; exit \"$cc_mods_ex\"";
+  return "mkdir -p /tmp/cc-mods-wait; while [ ! -f " + done + " ]; do sleep 0.2; done; cat " + out + " 2>/dev/null; IFS= read -r cc_mods_ex < " + done + " || [ -n \"$cc_mods_ex\" ] || cc_mods_ex=0; rm -f " + out + " " + done + "; exit \"$cc_mods_ex\"";
+}
+
+function waiterDescription(e) {
+  if (typeof e.description === "string" && e.description) return e.description;
+  if (e.tool_input && typeof e.tool_input.description === "string" && e.tool_input.description) return e.tool_input.description;
+  const orig = typeof e.command === "string" ? e.command : (e.tool_input && typeof e.tool_input.command === "string" ? e.tool_input.command : "");
+  return orig ? orig.replace(/\s+/g, " ").trim().slice(0, 120) : "";
 }
 
 function waiterEvent(e, script) {
-  const patched = { ...e, command: script, run_in_background: true };
+  const desc = waiterDescription(e);
+  const patched = { ...e, command: script, run_in_background: true, ...(desc ? { description: desc } : {}) };
+  delete patched.timeout;
   if (e.tool_input && typeof e.tool_input === "object") {
-    patched.tool_input = { ...e.tool_input, command: script, run_in_background: true };
+    const nextInput = { ...e.tool_input, command: script, run_in_background: true, ...(desc ? { description: desc } : {}) };
+    delete nextInput.timeout;
+    patched.tool_input = nextInput;
   }
   return patched;
+}
+
+/**
+ * Code Mode async REPL rejects `run_in_background: true`, but auto-backgrounds a
+ * foreground Bash when its `timeout` elapses. Handing the waiter script a short
+ * timeout lets Mini's builtin own the pid so completion is native `task-notification`
+ * even when the main session is idle.
+ */
+function replWaiterEvent(e, script) {
+  const desc = waiterDescription(e);
+  const patched = { ...e, command: script, timeout: 500, ...(desc ? { description: desc } : {}) };
+  delete patched.run_in_background;
+  if (e.tool_input && typeof e.tool_input === "object") {
+    const nextInput = { ...e.tool_input, command: script, timeout: 500, ...(desc ? { description: desc } : {}) };
+    delete nextInput.run_in_background;
+    patched.tool_input = nextInput;
+  }
+  return patched;
+}
+
+function exitStubEvent(e, script) {
+  const patched = { ...e, command: script };
+  delete patched.run_in_background;
+  delete patched.timeout;
+  if (e.tool_input && typeof e.tool_input === "object") {
+    const nextInput = { ...e.tool_input, command: script };
+    delete nextInput.run_in_background;
+    delete nextInput.timeout;
+    patched.tool_input = nextInput;
+  }
+  return patched;
+}
+
+async function runExitStub($, e, next, callId, exitCode, stdoutText, stderrText) {
+  const id = waiterId(callId) || String(Date.now());
+  const outPath = "/tmp/cc-mods-wait/ex-" + id + ".out";
+  const errPath = "/tmp/cc-mods-wait/ex-" + id + ".err";
+  const parts = [];
+  if (stdoutText) {
+    const outBody = stderrText && !stdoutText.endsWith("\n") ? stdoutText + "\n" : stdoutText;
+    const w = await $.process.run(["/bin/bash", "-c", "mkdir -p /tmp/cc-mods-wait && cat > " + shellQuote(outPath)], {
+      stdin: outBody,
+      timeoutMs: 5_000,
+    });
+    if (w.exitCode !== 0) throw new Error("exit stub write failed");
+    parts.push("cat " + shellQuote(outPath) + " 2>/dev/null; rm -f " + shellQuote(outPath));
+  }
+  if (stderrText) {
+    const w = await $.process.run(["/bin/bash", "-c", "mkdir -p /tmp/cc-mods-wait && cat > " + shellQuote(errPath)], {
+      stdin: stderrText,
+      timeoutMs: 5_000,
+    });
+    if (w.exitCode !== 0) throw new Error("exit stub write failed");
+    parts.push("cat " + shellQuote(errPath) + " >&2 2>/dev/null; rm -f " + shellQuote(errPath));
+  }
+  parts.push("exit " + String(exitCode));
+  return next(exitStubEvent(e, parts.join("; ")));
 }
 
 function isBackgroundResult(result) {
@@ -192,7 +287,7 @@ async function writeWaiterFiles($, frame) {
     stdin: text,
     timeoutMs: 5_000,
   });
-  await $.process.run(["/bin/bash", "-c", "printf %s " + shellQuote(code) + " > " + shellQuote(waiterDonePath(id))], {
+  await $.process.run(["/bin/bash", "-c", "printf '%s\\n' " + shellQuote(code) + " > " + shellQuote(waiterDonePath(id))], {
     timeoutMs: 5_000,
   });
 }
@@ -210,9 +305,12 @@ async function deliverBackground($, frame, busy) {
 }
 
 async function miniHasPath($, path) {
-  if (!path) return false;
+  if (!path || typeof path !== "string") return false;
   try {
-    const ran = await $.process.run(["test", "-e", path], { timeoutMs: 2_000 });
+    const argv = path === "~" || path.startsWith("~/")
+      ? ["/bin/sh", "-c", 'test -e "$HOME$1"', "_", path.slice(1)]
+      : ["test", "-e", path];
+    const ran = await $.process.run(argv, { timeoutMs: 2_000 });
     return ran.exitCode === 0;
   } catch {
     return false;
@@ -240,6 +338,9 @@ function dropCallMappings(callId) {
   if (!callId) return;
   for (const [taskId, cid] of waiterTasks) {
     if (cid === callId) waiterTasks.delete(taskId);
+  }
+  for (const [taskId, cid] of replBgTasks) {
+    if (cid === callId) replBgTasks.delete(taskId);
   }
   for (const [taskId, cid] of monitorTasks) {
     if (cid === callId) monitorTasks.delete(taskId);
@@ -360,35 +461,41 @@ let rpcSocket = "";
 let rpcSeq = 0;
 
 async function rpc($, frame, timeoutMs) {
+  const budget = timeoutMs || 60_000;
+  const deadline = Date.now() + budget;
   if (rpcSocket && frame.type !== "hello") {
-    const deadline = Date.now() + (timeoutMs || 60_000);
     try {
       let res = await $.http.fetch("http://tools/rpc", {
         socketPath: rpcSocket,
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: payload(frame),
+        body: payload({ ...frame, sliceMs: Math.min(20_000, budget) }),
       });
-      if (res.status === 200 || res.status === 502) {
+      if (res.status === 200) {
         let parsed = JSON.parse(res.text);
         while (parsed && parsed.pending === true) {
-          if (Date.now() >= deadline) throw new Error("RPC timed out");
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error("RPC timed out");
           res = await $.http.fetch("http://tools/wait", {
             socketPath: rpcSocket,
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ callId: parsed.callId || frame.callId || frame.id }),
+            body: JSON.stringify({ callId: parsed.callId || frame.callId || frame.id, sliceMs: Math.min(20_000, remaining) }),
           });
-          if (res.status !== 200 && res.status !== 502) throw new Error("wait HTTP " + res.status);
+          if (res.status === 502) break;
+          if (res.status !== 200) throw new Error("wait HTTP " + res.status);
           parsed = JSON.parse(res.text);
         }
-        return parsed;
+        if (res.status === 200) return parsed;
       }
+      // On 502/503 (listener WS dropped or reconnecting), fall through to one-shot
+      // helper; Client tool-executor dedupes by callId so retrying the call is safe.
     } catch (error) {
       if (error && String(error.message) === "RPC timed out") throw error;
     }
   }
-  const ran = await $.process.run(helperArgv(), { stdin: payload(frame), timeoutMs });
+  const remaining = Math.max(5_000, deadline - Date.now());
+  const ran = await $.process.run(helperArgv(), { stdin: payload(frame), timeoutMs: remaining });
   const text = (ran.stdout || "").trim();
   if (!text) throw new Error(ran.stderr || `helper exit ${ran.exitCode}`);
   const lines = text.split("\n").filter(Boolean);
@@ -464,10 +571,13 @@ async function pumpEvents($, socketPath) {
   }
 }
 
+let activeSessionId = "";
+
 function emit($, socketPath, event) {
   if (!socketPath || !event) return;
-  emitQueue.push(event);
-  if (event.type === "chunk") {
+  const stamped = activeSessionId && !event.sessionId ? { ...event, sessionId: activeSessionId } : event;
+  emitQueue.push(stamped);
+  if (stamped.type === "chunk") {
     if (!emitBusy && !emitScheduled) {
       emitScheduled = true;
       void after($, 16).then(() => {
@@ -482,9 +592,20 @@ function emit($, socketPath, event) {
 
 const pending = [];
 const waiters = new Set();
+const waiterActive = new Set();
 const skippedNotify = new Map();
+const bgDelivered = new Set();
+const stoppedCalls = new Set();
 const waiterTasks = new Map();
+const replBgTasks = new Map();
 const monitorTasks = new Map();
+
+function rememberStopped(callId) {
+  if (!callId) return;
+  stoppedCalls.add(callId);
+  if (stoppedCalls.size > 200) stoppedCalls.delete(stoppedCalls.values().next().value);
+}
+let listenGen = 0;
 let flushing = false;
 const mainInflight = new Set();
 const replStack = [];
@@ -638,11 +759,18 @@ export function register(on) {
     emitQueue.length = 0;
     emitScheduled = false;
     waiters.clear();
+    waiterActive.clear();
     skippedNotify.clear();
+    bgDelivered.clear();
+    stoppedCalls.clear();
     waiterTasks.clear();
+    replBgTasks.clear();
     monitorTasks.clear();
+    spawnToolUse.clear();
     replStack.length = 0;
+    const myListenGen = ++listenGen;
     claudeSessionId = await sessionIdOf($, e);
+    activeSessionId = claudeSessionId;
     tuiUid = await tuiUidOf($);
     socket = await modSocket($);
     if (socket) {
@@ -659,42 +787,76 @@ export function register(on) {
       extraDirs = Array.isArray(ENDPOINT.extraDirs) ? ENDPOINT.extraDirs : [];
     }
     try {
-      rpcSocket = "/tmp/cc-mods-rpc-" + String(Date.now()).slice(-7) + "-" + String(++rpcSeq) + ".sock";
       await rpcRetry($, { type: "hello" }, 8_000, 8);
       void (async () => {
-        const listen = $.process.spawn({ argv: helperArgv(), input: payload({ type: "listen", rpcSocket }) });
-        let buf = "";
-        for await (const chunk of listen) {
-          if (chunk.stream !== "stdout") continue;
-          buf += chunk.text;
-          let nl;
-          while ((nl = buf.indexOf("\n")) >= 0) {
-            const line = buf.slice(0, nl);
-            buf = buf.slice(nl + 1);
-            if (!line) continue;
-            const frame = JSON.parse(line);
-            if (frame.type === "notify" && frame.kind === "background" && frame.status === "exited") {
-              const callId = String(frame.callId || "");
-              dropCallMappings(callId);
-              try { await writeWaiterFiles($, frame); } catch { /* waiter may still be starting */ }
-              if (callId && waiters.has(callId)) {
-                waiters.delete(callId);
-                skippedNotify.set(callId, frame);
-                continue;
+        while (myListenGen === listenGen) {
+          const nextSock = "/tmp/cc-mods-rpc-" + String(Date.now()).slice(-7) + "-" + String(++rpcSeq) + ".sock";
+          rpcSocket = nextSock;
+          try {
+            const listen = $.process.spawn({ argv: helperArgv(), input: payload({ type: "listen", rpcSocket: nextSock }) });
+            let buf = "";
+            for await (const chunk of listen) {
+              if (myListenGen !== listenGen) break;
+              if (chunk.stream !== "stdout") continue;
+              buf += chunk.text;
+              let nl;
+              while ((nl = buf.indexOf("\n")) >= 0) {
+                const line = buf.slice(0, nl);
+                buf = buf.slice(nl + 1);
+                if (!line) continue;
+                let frame;
+                try { frame = JSON.parse(line); } catch { continue; }
+                if (frame.type === "notify" && frame.kind === "background" && frame.status === "exited") {
+                  const callId = String(frame.callId || "");
+                  dropCallMappings(callId);
+                  const stoppedByUser = !!(callId && stoppedCalls.has(callId));
+                  const suppressed = frame.interrupted === true || stoppedByUser;
+                  if (callId) stoppedCalls.delete(callId);
+                  if (callId && waiterActive.has(callId)) {
+                    waiterActive.delete(callId);
+                    if (!stoppedByUser) {
+                      try { await writeWaiterFiles($, frame); } catch { /* waiter may already be gone */ }
+                    }
+                    continue;
+                  }
+                  if (callId && waiters.has(callId)) {
+                    waiters.delete(callId);
+                    if (!suppressed) skippedNotify.set(callId, frame);
+                    if (!stoppedByUser) {
+                      try { await writeWaiterFiles($, frame); } catch { /* waiter may still be starting */ }
+                    }
+                    continue;
+                  }
+                  if (suppressed) continue;
+                  if (callId) {
+                    bgDelivered.add(callId);
+                    if (bgDelivered.size > 200) bgDelivered.delete(bgDelivered.values().next().value);
+                  }
+                  await deliverBackground($, frame, mainBusy);
+                }
+                if (frame.type === "notify" && frame.kind === "monitor") {
+                  const callId = String(frame.callId || "");
+                  if (frame.status === "exited" || frame.status === "expired") dropCallMappings(callId);
+                  if (frame.interrupted === true || (callId && stoppedCalls.has(callId))) {
+                    if (callId && (frame.status === "exited" || frame.status === "expired")) stoppedCalls.delete(callId);
+                    continue;
+                  }
+                  if (frame.agentId) await flushPending($, frame.agentId);
+                  const text = monitorNotification(frame);
+                  if (frame.agentId) {
+                    if (await deliverTaskText($, text, frame.agentId) === "retry") enqueue($, text, frame.agentId);
+                  } else if (await deliverTaskText($, text) === "retry") {
+                    enqueue($, text);
+                  }
+                }
               }
-              await deliverBackground($, frame, mainBusy);
             }
-            if (frame.type === "notify" && frame.kind === "monitor") {
-              if (frame.status === "exited" || frame.status === "expired") dropCallMappings(String(frame.callId || ""));
-              if (frame.agentId) await flushPending($, frame.agentId);
-              const text = monitorNotification(frame);
-              if (frame.agentId) {
-                if (await deliverTaskText($, text, frame.agentId) === "retry") enqueue($, text, frame.agentId);
-              } else if (await deliverTaskText($, text) === "retry") {
-                enqueue($, text);
-              }
-            }
+          } catch {
+            /* listener exited; respawn below */
           }
+          if (rpcSocket === nextSock) rpcSocket = "";
+          if (myListenGen !== listenGen) break;
+          await after($, 500);
         }
       })();
     } catch (error) {
@@ -806,13 +968,16 @@ export function register(on) {
     try {
     if (isLocalTool(e.tool)) {
       let frame;
-      if (e.tool === "Bash" && input.run_in_background === true && typeof toolUseId === "string" && toolUseId) {
+      if (e.tool === "Bash" && input.run_in_background === true && typeof toolUseId === "string" && toolUseId && !isReplInnerCall(toolUseId)) {
         waiters.add(toolUseId);
       }
       try {
         if (!claudeSessionId) {
           const liveSession = await sessionIdOf($, e);
-          if (liveSession) claudeSessionId = liveSession;
+          if (liveSession) {
+            claudeSessionId = liveSession;
+            activeSessionId = liveSession;
+          }
         }
         frame = await rpc($, {
           type: "call",
@@ -823,7 +988,7 @@ export function register(on) {
           agentId: e.agentId,
           claudeSessionId,
           tuiUid,
-        }, 600_000);
+        }, rpcTimeoutMs(e.tool));
       } catch (error) {
         if (typeof toolUseId === "string" && toolUseId) waiters.delete(toolUseId);
         try { await rpc($, { type: "cancel", callId: toolUseId }, 5_000); } catch { /* already gone */ }
@@ -840,12 +1005,22 @@ export function register(on) {
           return failResult(`${code}: ${message}`);
         }
         // Mac already confirmed ENOENT. Let Mini's builtin Read set core isError,
-        // unless Mini still has a stale file at that path (synced CLAUDE.md, /tmp, ~/.claude).
+        // unless Mini still has a stale file at that path — except Mini-owned
+        // Claude runtime artifacts (`~/.claude/projects/.../tool-results/...`),
+        // which only exist on Mini and must fall through to Mini's builtin.
         if (e.tool === "Read" && /File does not exist:/i.test(message)) {
           const path = typeof input.file_path === "string" ? input.file_path : "";
-          if (!(await miniHasPath($, path))) {
+          if (isMiniArtifactPath(path) || !(await miniHasPath($, path))) {
             const ran = await next(e);
             finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result, message);
+            return ran;
+          }
+        }
+        if (e.tool === "Grep" && /No such file or directory|File does not exist/i.test(message)) {
+          const path = typeof input.path === "string" ? input.path : "";
+          if (isMiniArtifactPath(path) && (await miniHasPath($, path))) {
+            const ran = await next(e);
+            finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result, ran.deny);
             return ran;
           }
         }
@@ -859,27 +1034,89 @@ export function register(on) {
         finish(true, result, "empty tool result");
         return { result };
       }
-      if (e.tool === "Bash" && isBackgroundResult(frame.result) && typeof toolUseId === "string" && toolUseId) {
-        waiters.add(toolUseId);
+      if (
+        e.tool === "Bash" &&
+        isBackgroundResult(frame.result) &&
+        typeof toolUseId === "string" &&
+        toolUseId &&
+        !bgDelivered.has(toolUseId)
+      ) {
+        const isRepl = isReplInnerCall(toolUseId);
+        const alreadyExited = skippedNotify.has(toolUseId);
+        if (!alreadyExited) waiters.add(toolUseId);
         try {
-          const ran = await next(waiterEvent(e, waiterScript(toolUseId)));
+          const ran = isRepl
+            ? await next(replWaiterEvent(e, waiterScript(toolUseId)))
+            : await next(waiterEvent(e, waiterScript(toolUseId)));
           if (ran && ran.deny === undefined) {
-            skippedNotify.delete(toolUseId);
-            const merged = mergeBackgroundResult(frame.result, ran);
-            const miniId = merged.result && merged.result.backgroundTaskId != null ? String(merged.result.backgroundTaskId) : "";
-            if (miniId) waiterTasks.set(miniId, toolUseId);
-            finish(merged.isError === true, merged.result, merged.deny);
-            return merged;
+            const exitedDuringStart = alreadyExited || skippedNotify.has(toolUseId);
+            if (ran.isError !== true && (!isRepl || isBackgroundResult(ran.result))) {
+              skippedNotify.delete(toolUseId);
+              waiters.delete(toolUseId);
+              const merged = mergeBackgroundResult(frame.result, ran);
+              const miniId = merged.result && merged.result.backgroundTaskId != null ? String(merged.result.backgroundTaskId) : "";
+              if (!exitedDuringStart) {
+                waiterActive.add(toolUseId);
+                if (miniId) waiterTasks.set(miniId, toolUseId);
+              }
+              if (miniId) {
+                try { await rpc($, { type: "aliasTask", callId: toolUseId, taskId: miniId }, 2_000); } catch { /* best-effort */ }
+              }
+              finish(merged.isError === true, merged.result, merged.deny);
+              return merged;
+            }
+            // Waiter completed before its short REPL timeout because Mac job already finished
+            // (including non-zero exit codes).
+            if (isRepl && exitedDuringStart && !isBackgroundResult(ran.result)) {
+              skippedNotify.delete(toolUseId);
+              waiters.delete(toolUseId);
+              finish(ran.isError === true, ran.result, ran.deny);
+              return ran;
+            }
           }
-        } catch { /* fall back to plugin prompt */ }
+        } catch { /* fall back to plugin prompt / replBgTasks */ }
         waiters.delete(toolUseId);
+        if (isRepl) {
+          replBgTasks.set(String(frame.result.backgroundTaskId), toolUseId);
+        }
         const skipped = skippedNotify.get(toolUseId);
         if (skipped) {
           skippedNotify.delete(toolUseId);
           try { await deliverBackground($, skipped, mainBusy); } catch { /* retry timer */ }
         }
       } else if (typeof toolUseId === "string" && toolUseId) {
+        if (e.tool === "Bash" && isBackgroundResult(frame.result) && isReplInnerCall(toolUseId)) {
+          replBgTasks.set(String(frame.result.backgroundTaskId), toolUseId);
+        }
         waiters.delete(toolUseId);
+        waiterActive.delete(toolUseId);
+        skippedNotify.delete(toolUseId);
+        bgDelivered.delete(toolUseId);
+      }
+      if (
+        e.tool === "Bash" &&
+        !isBackgroundResult(frame.result) &&
+        frame.result &&
+        typeof frame.result === "object" &&
+        frame.result.interrupted !== true &&
+        typeof frame.exitCode === "number" &&
+        Number.isInteger(frame.exitCode) &&
+        frame.exitCode > 0 &&
+        frame.exitCode <= 255
+      ) {
+        try {
+          const outText = typeof frame.result.stdout === "string" ? frame.result.stdout : "";
+          const errText = typeof frame.rawStderr === "string"
+            ? frame.rawStderr
+            : typeof frame.result.stderr === "string"
+              ? frame.result.stderr
+              : "";
+          const ran = await runExitStub($, e, next, toolUseId, frame.exitCode, outText, errText);
+          if (ran && ran.deny === undefined) {
+            finish(ran.isError === true, ran.result, ran.deny);
+            return ran;
+          }
+        } catch { /* fall back to object result */ }
       }
       if (e.tool === "Monitor" && frame.result && typeof frame.result === "object" && frame.result.taskId && typeof toolUseId === "string" && toolUseId) {
         monitorTasks.set(String(frame.result.taskId), toolUseId);
@@ -898,14 +1135,27 @@ export function register(on) {
       if (taskId && waiterTasks.has(taskId)) {
         const callId = waiterTasks.get(taskId);
         waiterTasks.delete(taskId);
+        waiterActive.delete(callId);
+        waiters.delete(callId);
+        rememberStopped(callId);
         try { await rpc($, { type: "cancel", callId }, 5_000); } catch { /* already exited */ }
         const ran = await next(e);
         finish(ran.deny !== undefined || ran.isError === true, ran.deny !== undefined ? undefined : ran.result, ran.deny);
         return ran;
       }
+      if (taskId && replBgTasks.has(taskId)) {
+        const callId = replBgTasks.get(taskId);
+        replBgTasks.delete(taskId);
+        rememberStopped(callId);
+        try { await rpc($, { type: "cancel", callId }, 5_000); } catch { /* already exited */ }
+        const result = { message: "Stopped task " + taskId, task_id: taskId, task_type: "local_bash", command: "" };
+        finish(false, result);
+        return { result };
+      }
       if (taskId && monitorTasks.has(taskId)) {
         const callId = monitorTasks.get(taskId);
         monitorTasks.delete(taskId);
+        rememberStopped(callId);
         try { await rpc($, { type: "cancel", callId }, 5_000); } catch { /* already exited */ }
         const result = { message: "Stopped monitor task " + taskId, task_id: taskId, task_type: "monitor", command: "" };
         finish(false, result);
@@ -916,13 +1166,27 @@ export function register(on) {
     if (HYDRATE_TOOLS.has(e.tool) && typeof input.file_path === "string" && input.file_path) {
       try {
         const frame = await rpc($, { type: "call", id: toolUseId, callId: toolUseId, tool: "hydrate", input: { file_path: input.file_path } }, 60_000);
-        if (frame.ok && frame.result && frame.result.base64 && frame.result.relative) {
+        if (!frame || !frame.ok) {
+          const code = frame && frame.error && frame.error.code ? String(frame.error.code) : "ERROR";
+          const message = frame && frame.error && frame.error.message ? String(frame.error.message) : "Hydrate failed";
+          const detail = permissionDenied(code) ? `${code}: ${message}` : message;
+          finish(true, undefined, detail);
+          return failResult(detail);
+        }
+        if (frame.result && frame.result.base64 && frame.result.relative) {
           const dest = String(ENDPOINT.tuiRoot).replace(/\/$/, "") + "/" + frame.result.relative;
           const writer = String(ENDPOINT.helper).replace(/ws-client\.js$/, "write-file.js");
-          await $.process.run(["bun", writer], { stdin: JSON.stringify({ path: dest, base64: frame.result.base64 }), timeoutMs: 30_000 });
+          const wrote = await $.process.run(["bun", writer], { stdin: JSON.stringify({ path: dest, base64: frame.result.base64 }), timeoutMs: 30_000 });
+          if (wrote.exitCode !== 0) {
+            const detail = (wrote.stderr || wrote.stdout || `hydrate write failed (${wrote.exitCode})`).trim();
+            finish(true, undefined, detail);
+            return failResult(detail);
+          }
         }
-      } catch {
-        /* native tool still runs; Mini may miss the file */
+      } catch (error) {
+        const detail = error && error.message ? String(error.message) : String(error);
+        finish(true, undefined, detail);
+        return failResult(detail);
       }
     }
 
@@ -943,13 +1207,27 @@ export function register(on) {
       }
     }
   }).catch(async ($, e, next) => {
-    if (!e.agentId && typeof e.tool_use_id === "string" && e.tool_use_id) mainInflight.delete(e.tool_use_id);
-    if (e.tool === "REPL" && replStack.length && replStack[replStack.length - 1] === e.tool_use_id) {
+    const toolUseId = e.tool_use_id;
+    const nested = e.tool !== "REPL" && replStack.length ? replStack[replStack.length - 1] : undefined;
+    const parent = e.agentId ? spawnToolUse.get(e.agentId) : nested;
+    if (!e.agentId && typeof toolUseId === "string" && toolUseId) mainInflight.delete(toolUseId);
+    if (e.tool === "REPL" && replStack.length && replStack[replStack.length - 1] === toolUseId) {
       replStack.pop();
     }
-    if (typeof e.tool_use_id === "string" && e.tool_use_id) waiters.delete(e.tool_use_id);
+    if (typeof toolUseId === "string" && toolUseId) {
+      waiters.delete(toolUseId);
+      waiterActive.delete(toolUseId);
+      skippedNotify.delete(toolUseId);
+      emit($, socket, {
+        type: "tool_finished",
+        toolUseId,
+        isError: true,
+        error: "Tool call was cancelled",
+        ...(parent ? { parentToolUseId: parent } : {}),
+      });
+    }
     if (isLocalTool(e.tool) && !next.called) {
-      try { await rpc($, { type: "cancel", callId: e.tool_use_id }, 5_000); } catch { /* already gone */ }
+      try { await rpc($, { type: "cancel", callId: toolUseId }, 5_000); } catch { /* already gone */ }
       return failResult("Tool call was cancelled");
     }
     return next(e);
@@ -957,14 +1235,9 @@ export function register(on) {
 
   on("turn.complete", async ($, e, next) => {
     if (e.isAborted) {
-      if (!e.agentId) {
-        waiters.clear();
-        skippedNotify.clear();
-        waiterTasks.clear();
-        monitorTasks.clear();
-      }
+      // Turn abort stops in-flight foreground tools; background Bash/Monitor keep running.
       try {
-        await rpc($, e.agentId ? { type: "cancel", agentId: e.agentId } : { type: "cancel" }, 5_000);
+        await rpc($, e.agentId ? { type: "cancel", agentId: e.agentId, scope: "turn" } : { type: "cancel", scope: "turn" }, 5_000);
       } catch { /* already gone */ }
     }
     try {

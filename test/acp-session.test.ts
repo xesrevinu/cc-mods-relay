@@ -860,10 +860,19 @@ test("close keeps forked and resumed sessions even without a new prompt", async 
 });
 
 test("session/cancel settles an in-flight prompt as cancelled", async () => {
-  const { agent, cwd } = harness({ immediate: true });
+  const writes: string[] = [];
+  const { agent, cwd } = harness({ writes });
   live.push(agent);
   await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
   const created = await agent.newSession({ cwd, mcpServers: [] });
+  let interrupts = 0;
+  let escapes = 0;
+  agent.sessions[created.sessionId]!.engine = {
+    isDisposed: false,
+    interrupt: () => { interrupts += 1; },
+    escape: () => { escapes += 1; },
+    kill: () => {},
+  } as never;
   const pending = agent.prompt({
     sessionId: created.sessionId,
     prompt: [{ type: "text", text: "keep going" }],
@@ -871,6 +880,18 @@ test("session/cancel settles an in-flight prompt as cancelled", async () => {
   await waitForTurn(agent, created.sessionId);
   await agent.cancel({ sessionId: created.sessionId });
   expect(await pending).toEqual({ stopReason: "cancelled" });
+  expect(interrupts).toBe(1);
+  expect(agent.sessions[created.sessionId]!.cancelEscalationStop).toBeDefined();
+  // Starting a follow-up prompt must clear cancelEscalationStop so escape never fires on it.
+  const followUp = agent.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: "text", text: "next" }],
+  });
+  await waitForTurn(agent, created.sessionId);
+  expect(agent.sessions[created.sessionId]!.cancelEscalationStop).toBeUndefined();
+  expect(escapes).toBe(0);
+  await agent.cancel({ sessionId: created.sessionId });
+  await followUp;
 });
 
 test("x.ai/interject injects into the live Claude TUI turn", async () => {

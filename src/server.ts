@@ -39,6 +39,10 @@ type CtrlFrame = {
   extraDirs?: unknown;
   tuiEnv?: unknown;
   reconnectGraceMs?: unknown;
+  seqReplay?: unknown;
+  lastSeq?: unknown;
+  ack?: unknown;
+  ts?: unknown;
   instanceId?: unknown;
   resumeToken?: unknown;
   env?: unknown;
@@ -47,12 +51,31 @@ type CtrlFrame = {
   git?: unknown;
   transcriptCursors?: unknown;
   callId?: string;
+  taskId?: string;
+  scope?: string;
   id?: string;
   sessionId?: string;
   agentId?: string;
   tool?: string;
   input?: unknown;
 };
+
+type PendingCall = {
+  ws: ServerWebSocket<SocketData>;
+  sig: string;
+  frame: Record<string, unknown>;
+  orphanCancel?: ReturnType<typeof setTimeout>;
+};
+
+type ReplayEntry = {
+  seq: number;
+  envelope: Record<string, unknown>;
+  bytes: number;
+  callId?: string;
+};
+
+const REPLAY_LOG_MAX = 1024;
+const REPLAY_LOG_MAX_BYTES = 8 * 1024 * 1024;
 
 type Instance = {
   id: string;
@@ -63,11 +86,15 @@ type Instance = {
   tuiEnv?: Record<string, string>;
   reconnectGraceMs?: number;
   resumeToken?: string;
+  seqReplay?: boolean;
+  nextSeq: number;
+  replayLog: ReplayEntry[];
+  replayLogBytes: number;
   graceTimer?: ReturnType<typeof setTimeout>;
   outboundBuffer?: unknown[];
   client: ServerWebSocket<SocketData>;
   pluginSockets: Set<ServerWebSocket<SocketData>>;
-  pendingCalls: Map<string, ServerWebSocket<SocketData>>;
+  pendingCalls: Map<string, PendingCall>;
   mux?: ReturnType<typeof acpStreamFromWs>;
   dispose?: () => Promise<void>;
   transcript?: TranscriptSync;
@@ -158,16 +185,61 @@ export function startServer(opts: ServeOpts) {
   const byPluginToken = new Map<string, string>();
   const lifetimes = new Set<Promise<void>>();
 
+  const trimReplayLog = (inst: Instance, ack: number) => {
+    if (!Number.isFinite(ack) || ack <= 0 || inst.replayLog.length === 0) return;
+    let drop = 0;
+    while (drop < inst.replayLog.length && inst.replayLog[drop]!.seq <= ack) {
+      inst.replayLogBytes -= inst.replayLog[drop]!.bytes;
+      drop += 1;
+    }
+    if (drop > 0) inst.replayLog.splice(0, drop);
+  };
+
+  const recordReplay = (inst: Instance, envelope: Record<string, unknown>, seq: number, callId?: string) => {
+    const bytes = JSON.stringify(envelope).length;
+    if (bytes > REPLAY_LOG_MAX_BYTES / 2) return;
+    while (
+      inst.replayLog.length >= REPLAY_LOG_MAX ||
+      (inst.replayLog.length > 0 && inst.replayLogBytes + bytes > REPLAY_LOG_MAX_BYTES)
+    ) {
+      const oldest = inst.replayLog.shift();
+      if (oldest) inst.replayLogBytes -= oldest.bytes;
+    }
+    inst.replayLog.push({ seq, envelope, bytes, callId });
+    inst.replayLogBytes += bytes;
+  };
+
   const sendClient = (inst: Instance, msg: unknown) => {
+    const kind = (msg as { type?: string } | null)?.type;
+    if (inst.seqReplay && kind !== "transcript.append") {
+      const seq = inst.nextSeq++;
+      const envelope: Record<string, unknown> =
+        classify(msg) === "acp"
+          ? { v: 1, type: "acp", seq, msg }
+          : { ...(msg as Record<string, unknown>), seq };
+      const callId = kind === "call" && typeof (msg as { callId?: unknown }).callId === "string"
+        ? (msg as { callId: string }).callId
+        : undefined;
+      recordReplay(inst, envelope, seq, callId);
+      if (inst.client.data?.alive !== false && inst.client.readyState === 1) {
+        sendJson(inst.client, envelope);
+      }
+      return;
+    }
     if (inst.client.data?.alive !== false && inst.client.readyState === 1) {
       sendJson(inst.client, msg);
       return;
     }
     if (inst.graceTimer && !inst.closing) {
-      const kind = (msg as { type?: string } | null)?.type;
       if (kind === "transcript.append") return;
       const buf = (inst.outboundBuffer ??= []);
-      if (buf.length >= 256) buf.shift();
+      if (buf.length >= 1024) {
+        const dropIdx = buf.findIndex((item) => {
+          const t = (item as { type?: string } | null)?.type;
+          return t !== "call" && t !== "cancel";
+        });
+        buf.splice(dropIdx >= 0 ? dropIdx : 0, 1);
+      }
       buf.push(msg);
     }
   };
@@ -182,6 +254,8 @@ export function startServer(opts: ServeOpts) {
       inst.graceTimer = undefined;
     }
     inst.outboundBuffer = undefined;
+    inst.replayLog.length = 0;
+    inst.replayLogBytes = 0;
     instances.delete(inst.id);
     byPluginToken.delete(inst.pluginToken);
     if (inst.client.data.instanceId === inst.id) inst.client.data.instanceId = undefined;
@@ -193,6 +267,9 @@ export function startServer(opts: ServeOpts) {
         /* already closed */
       }
     }
+    for (const pending of inst.pendingCalls.values()) {
+      if (pending.orphanCancel) clearTimeout(pending.orphanCancel);
+    }
     inst.pluginSockets.clear();
     inst.pendingCalls.clear();
     try {
@@ -202,15 +279,17 @@ export function startServer(opts: ServeOpts) {
       /* best-effort */
     }
     debug("instance teardown", { instanceId: inst.id });
-    inst.closed = (async () => {
+    const closed = (async () => {
       try {
         await inst.dispose?.();
       } catch (error) {
         console.error(error);
       }
     })();
-    lifetimes.add(inst.closed);
-    return inst.closed;
+    inst.closed = closed;
+    lifetimes.add(closed);
+    void closed.finally(() => lifetimes.delete(closed));
+    return closed;
   };
 
   let server: ReturnType<typeof Bun.serve<SocketData>>;
@@ -242,6 +321,7 @@ export function startServer(opts: ServeOpts) {
       ? Math.max(0, Math.min(60_000, frame.reconnectGraceMs))
       : 0;
     const resumeToken = rawGrace > 0 ? randomUUID() : undefined;
+    const seqReplay = frame.seqReplay === true;
     const inst: Instance = {
       id,
       pluginToken,
@@ -249,6 +329,10 @@ export function startServer(opts: ServeOpts) {
       tuiRoot,
       extraDirs,
       ...(rawGrace > 0 ? { reconnectGraceMs: rawGrace, resumeToken } : {}),
+      ...(seqReplay ? { seqReplay: true } : {}),
+      nextSeq: 1,
+      replayLog: [],
+      replayLogBytes: 0,
       client: ws,
       pluginSockets: new Set(),
       pendingCalls: new Map(),
@@ -401,8 +485,29 @@ export function startServer(opts: ServeOpts) {
         resumeToken: inst.resumeToken,
         reattached: true,
       });
-      const queued = inst.outboundBuffer?.splice(0) ?? [];
-      for (const item of queued) sendJson(ws, item);
+      const queuedCalls = new Set<string>();
+      if (inst.seqReplay) {
+        const lastSeq = typeof frame.lastSeq === "number" && Number.isFinite(frame.lastSeq) ? Math.max(0, Math.floor(frame.lastSeq)) : 0;
+        trimReplayLog(inst, lastSeq);
+        for (const entry of inst.replayLog) {
+          if (entry.seq <= lastSeq) continue;
+          if (entry.callId) queuedCalls.add(entry.callId);
+          sendJson(ws, entry.envelope);
+        }
+      } else {
+        const queued = inst.outboundBuffer?.splice(0) ?? [];
+        for (const item of queued) {
+          const row = item as { type?: string; callId?: string } | null;
+          if (row?.type === "call" && typeof row.callId === "string") queuedCalls.add(row.callId);
+          sendJson(ws, item);
+        }
+      }
+      // Replay still-pending tool calls whose request or result may have been lost
+      // during a half-open TCP drop. Client tool-executor dedupes by callId.
+      for (const [callId, entry] of inst.pendingCalls) {
+        if (queuedCalls.has(callId)) continue;
+        sendJson(ws, entry.frame);
+      }
       inst.transcript?.flush();
       return;
     }
@@ -411,13 +516,19 @@ export function startServer(opts: ServeOpts) {
       sendJson(ws, { v: 1, type: "instance.error", error: { code: "NO_INSTANCE", message: "instance.start required" } });
       return;
     }
+    if (frame.type === "ping") {
+      if (typeof frame.ack === "number") trimReplayLog(inst, frame.ack);
+      sendJson(ws, { v: 1, type: "pong", ...(typeof frame.ts === "number" ? { ts: frame.ts } : {}) });
+      return;
+    }
     if (frame.type === "result") {
       const callId = typeof frame.callId === "string" ? frame.callId : undefined;
-      const plugin = callId ? inst.pendingCalls.get(callId) : undefined;
-      if (plugin && callId) {
+      const pending = callId ? inst.pendingCalls.get(callId) : undefined;
+      if (pending && callId) {
+        if (pending.orphanCancel) clearTimeout(pending.orphanCancel);
         inst.pendingCalls.delete(callId);
-        plugin.data.calls.delete(callId);
-        sendJson(plugin, msg);
+        pending.ws.data.calls.delete(callId);
+        sendJson(pending.ws, msg);
       }
       return;
     }
@@ -468,9 +579,25 @@ export function startServer(opts: ServeOpts) {
     }
     if (frame.type === "call") {
       const callId = typeof frame.callId === "string" ? frame.callId : typeof frame.id === "string" ? frame.id : randomUUID();
-      ws.data.calls.add(callId);
-      inst.pendingCalls.set(callId, ws);
-      sendClient(inst, {
+      const sig = JSON.stringify({ tool: frame.tool, input: frame.input });
+      const prev = inst.pendingCalls.get(callId);
+      if (prev && prev.sig !== sig) {
+        sendJson(ws, {
+          v: 1,
+          type: "result",
+          id: frame.id,
+          callId,
+          sessionId: frame.sessionId || inst.id,
+          ok: false,
+          error: { code: "CALL_ID_CONFLICT", message: "callId reused with different input" },
+        });
+        return;
+      }
+      if (prev) {
+        if (prev.orphanCancel) clearTimeout(prev.orphanCancel);
+        if (prev.ws !== ws) prev.ws.data.calls.delete(callId);
+      }
+      const outbound: Record<string, unknown> = {
         ...(msg as object),
         v: 1,
         type: "call",
@@ -479,6 +606,19 @@ export function startServer(opts: ServeOpts) {
         tuiRoot: frame.tuiRoot || inst.tuiRoot,
         extraDirs: extraDirsOf(frame.extraDirs).length ? extraDirsOf(frame.extraDirs) : inst.extraDirs,
         ...(frame.tuiEnv === undefined && inst.tuiEnv ? { tuiEnv: inst.tuiEnv } : {}),
+        sessionId: frame.sessionId || inst.id,
+      };
+      ws.data.calls.add(callId);
+      inst.pendingCalls.set(callId, { ws, sig, frame: outbound });
+      sendClient(inst, outbound);
+      return;
+    }
+    if (frame.type === "aliasTask") {
+      sendClient(inst, {
+        v: 1,
+        type: "aliasTask",
+        callId: frame.callId,
+        taskId: frame.taskId,
         sessionId: frame.sessionId || inst.id,
       });
       return;
@@ -491,6 +631,7 @@ export function startServer(opts: ServeOpts) {
         callId: frame.callId,
         sessionId: frame.sessionId || inst.id,
         agentId: frame.agentId,
+        ...(typeof frame.scope === "string" ? { scope: frame.scope } : {}),
       });
       return;
     }
@@ -571,9 +712,25 @@ export function startServer(opts: ServeOpts) {
           const inst = instances.get(ws.data.instanceId);
           if (!inst) return;
           inst.pluginSockets.delete(ws);
-          // Only in-flight calls: a result already detached the id so background
-          // Bash/Monitor keep running after the helper closes this socket.
+          // Only in-flight calls still owned by this socket: a result already
+          // detached the id so background Bash/Monitor survive helper close, and
+          // a newer socket retrying the same callId must not be cancelled.
+          // If the persistent listener socket drops, give the plugin's one-shot
+          // 502 fallback a brief grace window to rebind ownership before cancelling.
           for (const callId of ws.data.calls) {
+            const pending = inst.pendingCalls.get(callId);
+            if (!pending || pending.ws !== ws) continue;
+            if (ws.data.listen) {
+              if (pending.orphanCancel) clearTimeout(pending.orphanCancel);
+              pending.orphanCancel = setTimeout(() => {
+                const cur = inst.pendingCalls.get(callId);
+                if (!cur || cur.ws !== ws) return;
+                inst.pendingCalls.delete(callId);
+                sendClient(inst, { v: 1, type: "cancel", callId, sessionId: inst.id });
+              }, 5_000);
+              pending.orphanCancel.unref?.();
+              continue;
+            }
             inst.pendingCalls.delete(callId);
             sendClient(inst, { v: 1, type: "cancel", callId, sessionId: inst.id });
           }

@@ -69,12 +69,20 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).toContain("/tmp/cc-mods-wait/");
   expect(src).toContain("waiterScript");
   expect(src).toContain("waiterEvent");
+  expect(src).toContain("replWaiterEvent");
   expect(src).toContain("writeWaiterFiles");
   expect(src).toContain("isBackgroundResult");
   expect(src).toContain("waiters.add");
   expect(src).toContain("next(waiterEvent(e, waiterScript(toolUseId)))");
   expect(src).toContain("TaskStop");
   expect(src).toContain("miniHasPath");
+  expect(src).toContain("isMiniArtifactPath");
+  expect(src).toContain(String.raw`/(^|\/)\.\.(\/|$)/`);
+  expect(src).toContain("isReplInnerCall");
+  expect(src).toContain("rpcTimeoutMs");
+  expect(src).toContain("EXECUTOR_DISCONNECTED");
+  expect(src).toContain('scope: "turn"');
+  expect(src).toContain('type: "aliasTask"');
   expect(src).toContain("mergeBackgroundResult");
   expect(src).toContain("replDispatchedThisTurn");
   expect(src).toContain("coalesceEvents");
@@ -586,4 +594,17 @@ test("same-file Edits serialize without clobbering while different files run in 
   expect(readFileSync(f2, "utf8")).toBe("X1\n");
   ws.close();
   relay.stop();
+});
+
+test("waiterScript preserves non-zero exit codes with or without trailing newline and cleans up", () => {
+  const id = `cc-wait-exit-${process.pid}-${Date.now()}`;
+  const out = `/tmp/cc-mods-wait/${id}.out`;
+  const done = `/tmp/cc-mods-wait/${id}.done`;
+  const script = `mkdir -p /tmp/cc-mods-wait; while [ ! -f '${done}' ]; do sleep 0.2; done; cat '${out}' 2>/dev/null; IFS= read -r cc_mods_ex < '${done}' || [ -n "$cc_mods_ex" ] || cc_mods_ex=0; rm -f '${out}' '${done}'; exit "$cc_mods_ex"`;
+  Bun.spawnSync(["/bin/bash", "-c", `mkdir -p /tmp/cc-mods-wait && printf 'fail-body' > '${out}' && printf '%s' 42 > '${done}'`]);
+  const ran = Bun.spawnSync(["/bin/bash", "-c", script], { stdout: "pipe", stderr: "pipe" });
+  expect(ran.exitCode).toBe(42);
+  expect(ran.stdout.toString()).toBe("fail-body");
+  expect(existsSync(out)).toBe(false);
+  expect(existsSync(done)).toBe(false);
 });
