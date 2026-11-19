@@ -1486,3 +1486,44 @@ test("rewriteRemotePath does not corrupt $HOMEBREW_PREFIX", () => {
     "$HOMEBREW_PREFIX/bin/bun",
   );
 });
+
+test("REPL Read omits truncatedByTokenCap and reads >2000 lines without triggering hook_parts", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-read-repl-"));
+  const file = join(dir, "emit.mbt");
+  try {
+    const body = Array.from({ length: 2600 }, (_, i) => `fn line_${i + 1}() -> Unit { () }`).join("\n") + "\n";
+    writeFileSync(file, body);
+    const normal = await run(dir, "Read", { file_path: file }, { callId: "toolu_01normal" });
+    expect(normal.ok).toBe(true);
+    expect(normal.result.file.numLines).toBe(2000);
+    expect(normal.result.file.totalLines).toBe(2600);
+    expect(normal.result.file.truncatedByTokenCap).toBe(true);
+
+    const repl = await run(dir, "Read", { file_path: file }, { callId: "repl_01large" });
+    expect(repl.ok).toBe(true);
+    expect(repl.result.file.numLines).toBe(2600);
+    expect(repl.result.file.totalLines).toBe(2600);
+    expect(repl.result.file.truncatedByTokenCap).toBeUndefined();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Grep includes totalFiles and totalLines for native pagination copy", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-grep-totals-"));
+  try {
+    writeFileSync(join(dir, "a.ts"), "match\nmatch\nmatch\n");
+    writeFileSync(join(dir, "b.ts"), "match\n");
+    const filesMode = await run(dir, "Grep", { pattern: "match", path: dir, head_limit: 1 });
+    expect(filesMode.ok).toBe(true);
+    expect(filesMode.result.numFiles).toBe(1);
+    expect(filesMode.result.totalFiles).toBe(2);
+
+    const contentMode = await run(dir, "Grep", { pattern: "match", path: dir, output_mode: "content", head_limit: 2 });
+    expect(contentMode.ok).toBe(true);
+    expect(contentMode.result.numLines).toBe(2);
+    expect(contentMode.result.totalLines).toBe(4);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

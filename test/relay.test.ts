@@ -98,6 +98,10 @@ test("Mods plugin source stays inside the sandbox", () => {
   expect(src).toContain("extra-dirs.json");
   expect(src).not.toContain("CC_MODS_EXTRA_DIRS");
   expect(src).toContain('on("turn.step"');
+  expect(src).toContain('on("session.end"');
+  expect(src).toContain('$.env.get("CC_MODS_SOCKET")');
+  expect(src).toContain("$.fs.exists");
+  expect(src).toContain("$.fs.write");
   expect(src).toContain("rpcRetry");
   expect(src).toContain('type: "cancel"');
   expect(src).toContain("plugin_error");

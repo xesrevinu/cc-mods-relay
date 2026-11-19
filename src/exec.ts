@@ -54,7 +54,7 @@ export async function execute(frame: ToolFrame, send: Send, notify: Send = send)
       if (shell) return ok(reply, frame, abortedShellResult());
       return fail(reply, frame, "CANCELLED", "Tool call was cancelled");
     }
-    if (frame.tool === "Read") return ok(reply, frame, await readTool(cwd, tuiRoot, input, extraDirs, workspace));
+    if (frame.tool === "Read") return ok(reply, frame, await readTool(cwd, tuiRoot, input, extraDirs, workspace, frame.callId));
     if (frame.tool === "Write") return ok(reply, frame, await writeTool(cwd, tuiRoot, input, extraDirs, workspace));
     if (frame.tool === "Edit") return ok(reply, frame, await editTool(cwd, tuiRoot, input, extraDirs, workspace));
     if (frame.tool === "Glob") return ok(reply, frame, await globTool(cwd, tuiRoot, input, extraDirs, workspace, frame.callId, frame.sessionId, frame.agentId));

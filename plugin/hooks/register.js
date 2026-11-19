@@ -248,6 +248,20 @@ function exitStubEvent(e, script) {
   return patched;
 }
 
+async function writeTextFile($, path, text) {
+  try {
+    await $.fs.write(path, text);
+    return;
+  } catch {
+    /* fallback to bash if $.fs.write is unavailable or text exceeds $.fs limit */
+  }
+  const w = await $.process.run(["/bin/bash", "-c", "mkdir -p /tmp/cc-mods-wait && cat > " + shellQuote(path)], {
+    stdin: text,
+    timeoutMs: 5_000,
+  });
+  if (w.exitCode !== 0) throw new Error("temp file write failed");
+}
+
 async function runExitStub($, e, next, callId, exitCode, stdoutText, stderrText) {
   const id = waiterId(callId) || String(Date.now());
   const outPath = "/tmp/cc-mods-wait/ex-" + id + ".out";
@@ -255,19 +269,11 @@ async function runExitStub($, e, next, callId, exitCode, stdoutText, stderrText)
   const parts = [];
   if (stdoutText) {
     const outBody = stderrText && !stdoutText.endsWith("\n") ? stdoutText + "\n" : stdoutText;
-    const w = await $.process.run(["/bin/bash", "-c", "mkdir -p /tmp/cc-mods-wait && cat > " + shellQuote(outPath)], {
-      stdin: outBody,
-      timeoutMs: 5_000,
-    });
-    if (w.exitCode !== 0) throw new Error("exit stub write failed");
+    await writeTextFile($, outPath, outBody);
     parts.push("cat " + shellQuote(outPath) + " 2>/dev/null; rm -f " + shellQuote(outPath));
   }
   if (stderrText) {
-    const w = await $.process.run(["/bin/bash", "-c", "mkdir -p /tmp/cc-mods-wait && cat > " + shellQuote(errPath)], {
-      stdin: stderrText,
-      timeoutMs: 5_000,
-    });
-    if (w.exitCode !== 0) throw new Error("exit stub write failed");
+    await writeTextFile($, errPath, stderrText);
     parts.push("cat " + shellQuote(errPath) + " >&2 2>/dev/null; rm -f " + shellQuote(errPath));
   }
   parts.push("exit " + String(exitCode));
@@ -283,13 +289,8 @@ async function writeWaiterFiles($, frame) {
   if (!id) return;
   const code = Number.isFinite(Number(frame.exitCode)) ? String(Number(frame.exitCode)) : "0";
   const text = typeof frame.output === "string" ? frame.output : "";
-  await $.process.run(["/bin/bash", "-c", "mkdir -p /tmp/cc-mods-wait && cat > " + shellQuote(waiterOutPath(id))], {
-    stdin: text,
-    timeoutMs: 5_000,
-  });
-  await $.process.run(["/bin/bash", "-c", "printf '%s\\n' " + shellQuote(code) + " > " + shellQuote(waiterDonePath(id))], {
-    timeoutMs: 5_000,
-  });
+  await writeTextFile($, waiterOutPath(id), text);
+  await writeTextFile($, waiterDonePath(id), code + "\n");
 }
 
 async function deliverBackground($, frame, busy) {
@@ -306,6 +307,18 @@ async function deliverBackground($, frame, busy) {
 
 async function miniHasPath($, path) {
   if (!path || typeof path !== "string") return false;
+  try {
+    let target = path;
+    if (path === "~" || path.startsWith("~/")) {
+      const home = await $.env.get("HOME");
+      if (typeof home === "string" && home) target = home + path.slice(1);
+    }
+    if (target.startsWith("/")) {
+      return (await $.fs.exists(target)) === true;
+    }
+  } catch {
+    /* fall back to test -e */
+  }
   try {
     const argv = path === "~" || path.startsWith("~/")
       ? ["/bin/sh", "-c", 'test -e "$HOME$1"', "_", path.slice(1)]
@@ -517,7 +530,28 @@ async function rpcRetry($, frame, timeoutMs, attempts) {
 
 async function modSocket($) {
   try {
+    const fromEnv = await $.env.get("CC_MODS_SOCKET");
+    if (typeof fromEnv === "string" && fromEnv.trim()) return fromEnv.trim();
+  } catch {
+    /* fall back to printenv */
+  }
+  try {
     return ((await $.process.run(["printenv", "CC_MODS_SOCKET"], { timeoutMs: 2_000 })).stdout || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function readExtraDirs($, file) {
+  if (!file || file === String(ENDPOINT.helper)) return "";
+  try {
+    const text = await $.fs.read(file);
+    if (typeof text === "string") return text.trim();
+  } catch {
+    /* fall back to cat */
+  }
+  try {
+    return ((await $.process.run(["cat", file], { timeoutMs: 2_000 })).stdout || "").trim();
   } catch {
     return "";
   }
@@ -778,9 +812,7 @@ export function register(on) {
     }
     try {
       const file = extraDirsFile();
-      const raw = file && file !== String(ENDPOINT.helper)
-        ? ((await $.process.run(["cat", file], { timeoutMs: 2_000 })).stdout || "").trim()
-        : "";
+      const raw = await readExtraDirs($, file);
       const parsed = raw ? JSON.parse(raw) : ENDPOINT.extraDirs;
       extraDirs = Array.isArray(parsed) ? parsed.filter((d) => typeof d === "string") : [];
     } catch {
@@ -1256,6 +1288,22 @@ export function register(on) {
       if (e.isAborted) flushTurnComplete($, socket);
       else settleTurnComplete($, socket);
     }
+    return next(e);
+  });
+
+  on("session.end", async ($, e, next) => {
+    listenGen++;
+    rpcSocket = "";
+    resetPendingComplete();
+    waiters.clear();
+    waiterActive.clear();
+    skippedNotify.clear();
+    waiterTasks.clear();
+    replBgTasks.clear();
+    monitorTasks.clear();
+    try {
+      await rpc($, { type: "cancel" }, 2_000);
+    } catch { /* already gone */ }
     return next(e);
   });
 }
