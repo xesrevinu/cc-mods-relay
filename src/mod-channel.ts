@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -120,6 +120,11 @@ export function startModChannel() {
       }
       questionWaiters.clear();
       server.stop(true);
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* already gone */
+      }
     },
   };
 }

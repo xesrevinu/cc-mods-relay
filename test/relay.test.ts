@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { withPlugin } from "../src/compose.js";
 import { mapPath } from "../src/exec.js";
 import { createBunPtySpawn } from "../src/bun-pty-backend.js";
@@ -138,9 +138,11 @@ test("bun PTY spawn presents a TTY", async () => {
 
 test("mod-channel delivers events, not prompts", async () => {
   const channel = startModChannel();
+  const dir = dirname(channel.path);
   const seen: unknown[] = [];
   const stop = channel.onEvent((event) => seen.push(event));
   try {
+    expect(existsSync(dir)).toBe(true);
     const hello = await fetch("http://adapter/hello", { method: "POST", unix: channel.path, body: "{}" });
     expect(hello.ok).toBe(true);
     const posted = await fetch("http://adapter/events", {
@@ -155,6 +157,7 @@ test("mod-channel delivers events, not prompts", async () => {
   } finally {
     stop();
     channel.stop();
+    expect(existsSync(dir)).toBe(false);
   }
 });
 
